@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+    "core",
+    "stats",
+    "sources",
+    "cli",
+    "encoding/capnp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Errors / utilities
+anyhow = "1"
+thiserror = "2.0.18"
+hex = "0.4"
+bytes = "1"
+ahash = "0.8"
+hashbrown = { version = "0.17.1", features = ["serde"] }
+
+# HTTP / RPC
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+urlencoding = "2"
+postcard = { version = "1", features = ["alloc"] }
+
+# Bitcoin
+bitcoin = { version = "0.32", features = ["serde"] }
+sha2 = "0.11.0"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Cap'n Proto
+capnp = "0.25.4"
+capnpc = "0.25.3"
+
+# Internal crates
+btc-data-core    = { path = "core" }
+btc-data-stats   = { path = "stats" }
+btc-data-sources = { path = "sources" }
+btc-data-encoding-capnp = { path = "encoding/capnp" }
+btc-data-light-server = {path = "light-server"}
+# btc-data-encoding-json  = { path = "encoding/json" }
+# btc-data-encoding-protobuf = { path = "encoding/protobuf" }
+#btc-data-encoding-avro  = { path = "encoding/avro" }

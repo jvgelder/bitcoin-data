@@ -1,0 +1,22 @@
+[package]
+name = "btc-data-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "btc-data CLI: emits factual block events (RawBlock, Tip, Hash) to sinks. Stats is a separate binary in the stats crate."
+
+[[bin]]
+name = "btc-data"
+path = "src/main.rs"
+
+[dependencies]
+btc-data-core.workspace = true
+btc-data-sources.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+futures.workspace = true
+[features]
+default = []
+ipc = ["btc-data-sources/ipc"]

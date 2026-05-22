@@ -1,0 +1,28 @@
+[package]
+name = "btc-data-sources"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Concrete BlockSource implementations: bitcoind RPC, Esplora HTTP, capnp IPC, multi-source round-robin."
+
+[dependencies]
+btc-data-core.workspace = true
+
+async-trait.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+futures.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+bitcoin-capnp-types = { git = "https://github.com/Sjors/bitcoin-capnp-types", branch = "2026/04/chain-interface", optional = true }
+capnp = { version = "0.25", optional = true }
+capnp-rpc = { version = "0.25", optional = true }
+tokio-util = { version = "0.7.16", features = ["compat"], optional = true }
+bytes = "1.11.1"
+
+[features]
+default = []
+ipc = ["dep:bitcoin-capnp-types", "dep:capnp", "dep:capnp-rpc", "dep:tokio-util", "tokio/net", "tokio/rt", "tokio/sync", "tokio/time"]
