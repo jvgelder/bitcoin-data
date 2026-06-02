@@ -6,6 +6,7 @@ members = [
     "sources",
     "cli",
     "encoding/capnp",
+    "light-server"
 ]
 
 [workspace.package]

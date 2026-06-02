@@ -1,0 +1,261 @@
+use crate::codec::elias_delta::encode_elias_delta_values;
+use crate::light_capnp::{light_block, output_ref, uid_checkpoint, SpentIdCodec, UidSetCodec};
+use crate::profile::Profile;
+use crate::types::{BlockHashBytes, TxTweak};
+use crate::WIRE_VERSION;
+use capnp::message::{Builder, HeapAllocator};
+
+/// Bound used by the tx-tweak index stream. The format is scope-based and uses
+/// one fixed tx-index codec, so carrying a codec selector is unnecessary.
+pub const MAX_TX_TWEAK_INDEX_DOMAIN: u32 = 25_000;
+/// Conservative upper bound for scope outputs in one block.
+pub const MAX_P2TR_OUTPUTS_PER_BLOCK: usize = 25_000;
+/// Scope output IDs should not need more than seven bytes for P2TR-oriented scopes.
+pub const MAX_P2TR_OUTPUT_ID_BYTES: u8 = 7;
+
+#[derive(Debug, Clone)]
+pub struct OutputRefInput {
+    pub tx_index: u32,
+    pub vout: u32,
+    pub uid: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct LightBlockInput {
+    pub height: u64,
+    pub block_hash: BlockHashBytes,
+    pub previous_block_hash: BlockHashBytes,
+    pub block_anchor_last_uid: u64,
+    pub profile: Profile,
+    pub output_id_bytes: u8,
+    pub tx_tweak_indexes: Vec<u32>,
+    pub tx_tweaks: Vec<TxTweak>,
+    pub outputs: Vec<OutputRefInput>,
+    pub output_ids: Vec<u8>,
+    pub spent_uids_sorted: Vec<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UidCheckpointInput {
+    pub height: u64,
+    pub block_hash: BlockHashBytes,
+    pub last_uid: u64,
+    pub profile: Profile,
+    pub unspent_uids_sorted: Vec<u64>,
+}
+
+pub fn encode_spent_uids(block_anchor_last_uid: u64, spent_sorted: &[u64]) -> anyhow::Result<Vec<u8>> {
+    if spent_sorted.is_empty() {
+        return Ok(Vec::new());
+    }
+    validate_sorted_unique(spent_sorted)?;
+    anyhow::ensure!(spent_sorted[0] <= block_anchor_last_uid, "spent uid exceeds block anchor");
+    let mut values = Vec::with_capacity(spent_sorted.len());
+    values.push(block_anchor_last_uid - spent_sorted[0] + 1);
+    for pair in spent_sorted.windows(2) {
+        values.push(pair[1] - pair[0]);
+    }
+    encode_elias_delta_values(&values)
+}
+
+pub fn decode_spent_uids(block_anchor_last_uid: u64, encoded: &[u8], count: usize) -> anyhow::Result<Vec<u64>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let values = crate::codec::elias_delta::decode_elias_delta_values(encoded, count)?;
+    let first = block_anchor_last_uid
+        .checked_sub(values[0] - 1)
+        .ok_or_else(|| anyhow::anyhow!("invalid first spent uid offset"))?;
+    let mut out = Vec::with_capacity(count);
+    out.push(first);
+    for delta in &values[1..] {
+        let next = out.last().unwrap().checked_add(*delta).ok_or_else(|| anyhow::anyhow!("spent uid delta overflow"))?;
+        out.push(next);
+    }
+    Ok(out)
+}
+
+pub fn encode_tx_tweak_indexes(indexes: &[u32]) -> anyhow::Result<Vec<u8>> {
+    if indexes.is_empty() {
+        return Ok(Vec::new());
+    }
+    validate_sorted_unique_u32(indexes)?;
+    for &index in indexes {
+        anyhow::ensure!(index < MAX_TX_TWEAK_INDEX_DOMAIN, "tx tweak index {index} exceeds tx-index domain bound {MAX_TX_TWEAK_INDEX_DOMAIN}");
+    }
+    let mut values = Vec::with_capacity(indexes.len());
+    values.push(indexes[0] as u64 + 1);
+    for pair in indexes.windows(2) {
+        values.push((pair[1] - pair[0]) as u64);
+    }
+    encode_elias_delta_values(&values)
+}
+
+pub fn decode_tx_tweak_indexes(encoded: &[u8], count: usize) -> anyhow::Result<Vec<u32>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let values = crate::codec::elias_delta::decode_elias_delta_values(encoded, count)?;
+    let first = values[0] - 1;
+    anyhow::ensure!(first <= u32::MAX as u64, "tx index overflow");
+    let mut out = Vec::with_capacity(count);
+    anyhow::ensure!((first as u32) < MAX_TX_TWEAK_INDEX_DOMAIN, "tx index exceeds tx-index domain bound");
+    out.push(first as u32);
+    for delta in &values[1..] {
+        let next = u64::from(*out.last().unwrap()) + *delta;
+        anyhow::ensure!(next <= u32::MAX as u64, "tx index overflow");
+        anyhow::ensure!((next as u32) < MAX_TX_TWEAK_INDEX_DOMAIN, "tx index exceeds tx-index domain bound");
+        out.push(next as u32);
+    }
+    Ok(out)
+}
+
+pub fn encode_light_block(input: &LightBlockInput) -> anyhow::Result<Builder<HeapAllocator>> {
+    anyhow::ensure!(input.tx_tweak_indexes.len() == input.tx_tweaks.len(), "tx tweak indexes/tweaks length mismatch");
+    anyhow::ensure!(input.tx_tweaks.len() <= u32::MAX as usize, "too many tweaks");
+    // Each served Silent Payments tweak is a 33-byte compressed public key.
+    // The name intentionally follows Blindbit/light-client terminology: it is
+    // public point input_hash*A, not a 32-byte scalar.
+    anyhow::ensure!(input.outputs.len() <= MAX_P2TR_OUTPUTS_PER_BLOCK, "too many scope outputs in one block");
+    anyhow::ensure!(input.output_id_bytes <= MAX_P2TR_OUTPUT_ID_BYTES, "scope output_id_bytes exceeds configured bound");
+    let output_id_bytes = input.output_id_bytes as usize;
+    anyhow::ensure!(output_id_bytes > 0, "output_id_bytes must be non-zero");
+    anyhow::ensure!(input.output_ids.len() == input.outputs.len() * output_id_bytes, "packed output id length mismatch");
+    for output in &input.outputs {
+        anyhow::ensure!(output.uid <= input.block_anchor_last_uid, "output UID exceeds block anchor");
+        anyhow::ensure!(output.tx_index < MAX_TX_TWEAK_INDEX_DOMAIN, "output tx index exceeds tx-index domain bound");
+    }
+    for &uid in &input.spent_uids_sorted {
+        anyhow::ensure!(uid <= input.block_anchor_last_uid, "spent UID exceeds block anchor");
+    }
+
+    let tx_tweak_indexes = encode_tx_tweak_indexes(&input.tx_tweak_indexes)?;
+    let mut tx_tweaks = Vec::with_capacity(input.tx_tweaks.len() * TxTweak::LEN);
+    for tweak in &input.tx_tweaks {
+        tx_tweaks.extend_from_slice(tweak.as_bytes());
+    }
+    let spent = encode_spent_uids(input.block_anchor_last_uid, &input.spent_uids_sorted)?;
+
+    let mut msg = Builder::new_default();
+    {
+        let mut b = msg.init_root::<light_block::Builder>();
+        b.set_version(WIRE_VERSION);
+        b.set_height(input.height);
+        b.set_block_hash(input.block_hash.as_bytes());
+        b.set_previous_block_hash(input.previous_block_hash.as_bytes());
+        b.set_block_anchor_last_uid(input.block_anchor_last_uid);
+        input.profile.fill_capnp(b.reborrow().init_profile());
+        b.set_output_id_bytes(input.output_id_bytes);
+        b.set_tweak_count(input.tx_tweaks.len() as u32);
+        b.set_tx_tweak_indexes(&tx_tweak_indexes);
+        b.set_tx_tweaks(&tx_tweaks);
+        {
+            let mut outs = b.reborrow().init_outputs(input.outputs.len() as u32);
+            for (i, src) in input.outputs.iter().enumerate() {
+                fill_output_ref(outs.reborrow().get(i as u32), src);
+            }
+        }
+        b.set_output_ids(&input.output_ids);
+        b.set_spent_id_codec(SpentIdCodec::EliasDeltaSorted);
+        b.set_spent_count(input.spent_uids_sorted.len() as u32);
+        b.set_spent_ids(&spent);
+    }
+    Ok(msg)
+}
+
+fn fill_output_ref(mut b: output_ref::Builder<'_>, src: &OutputRefInput) {
+    b.set_tx_index(src.tx_index);
+    b.set_vout(src.vout);
+    b.set_uid(src.uid);
+}
+
+pub fn encode_uid_checkpoint(input: &UidCheckpointInput) -> anyhow::Result<Builder<HeapAllocator>> {
+    validate_sorted_unique(&input.unspent_uids_sorted)?;
+    for &uid in &input.unspent_uids_sorted {
+        anyhow::ensure!(uid <= input.last_uid, "checkpoint UID exceeds last_uid");
+    }
+    let unspent = encode_elias_delta_values(&deltas_first_plus_one(&input.unspent_uids_sorted))?;
+    let mut msg = Builder::new_default();
+    {
+        let mut b = msg.init_root::<uid_checkpoint::Builder>();
+        b.set_version(WIRE_VERSION);
+        b.set_height(input.height);
+        b.set_block_hash(input.block_hash.as_bytes());
+        b.set_last_uid(input.last_uid);
+        input.profile.fill_capnp(b.reborrow().init_profile());
+        b.set_uid_codec(UidSetCodec::EliasDeltaSorted);
+        b.set_unspent_count(input.unspent_uids_sorted.len() as u64);
+        b.set_unspent_uids(&unspent);
+    }
+    Ok(msg)
+}
+
+fn deltas_first_plus_one(values: &[u64]) -> Vec<u64> {
+    if values.is_empty() { return Vec::new(); }
+    let mut out = Vec::with_capacity(values.len());
+    out.push(values[0] + 1);
+    for pair in values.windows(2) {
+        out.push(pair[1] - pair[0]);
+    }
+    out
+}
+
+fn validate_sorted_unique(values: &[u64]) -> anyhow::Result<()> {
+    for pair in values.windows(2) {
+        anyhow::ensure!(pair[0] < pair[1], "values must be sorted ascending and unique");
+    }
+    Ok(())
+}
+
+fn validate_sorted_unique_u32(values: &[u32]) -> anyhow::Result<()> {
+    for pair in values.windows(2) {
+        anyhow::ensure!(pair[0] < pair[1], "values must be sorted ascending and unique");
+    }
+    Ok(())
+}
+
+pub fn to_packed_bytes(msg: &Builder<HeapAllocator>) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    capnp::serialize_packed::write_message(&mut out, msg)?;
+    Ok(out)
+}
+
+pub fn to_bytes(msg: &Builder<HeapAllocator>) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    capnp::serialize::write_message(&mut out, msg)?;
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spent_uid_roundtrip_uses_end_of_block_anchor() {
+        let anchor = 100;
+        let spent = vec![3, 10, 98, 100];
+        let encoded = encode_spent_uids(anchor, &spent).unwrap();
+        let decoded = decode_spent_uids(anchor, &encoded, spent.len()).unwrap();
+        assert_eq!(decoded, spent);
+    }
+
+    #[test]
+    fn tx_tweak_index_roundtrip_fixed_elias_delta() {
+        let indexes = vec![2, 23, 2000];
+        let encoded = encode_tx_tweak_indexes(&indexes).unwrap();
+        let decoded = decode_tx_tweak_indexes(&encoded, indexes.len()).unwrap();
+        assert_eq!(decoded, indexes);
+    }
+}
+
+
+#[cfg(test)]
+mod tx_index_bound_tests {
+    use super::*;
+
+    #[test]
+    fn tx_tweak_index_rejects_out_of_domain_value() {
+        let err = encode_tx_tweak_indexes(&[MAX_TX_TWEAK_INDEX_DOMAIN]).unwrap_err();
+        assert!(err.to_string().contains("exceeds tx-index domain bound"));
+    }
+}
