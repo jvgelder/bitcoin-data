@@ -1,0 +1,18 @@
+[package]
+name = "btc-data-encoding-protobuf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Protobuf adapter. Reads capnp Block/Stats, emits proto messages. Used by gRPC sink."
+build = "src/build.rs"
+
+[dependencies]
+btc-data-core.workspace = true
+btc-data-encoding-capnp.workspace = true
+
+anyhow.workspace = true
+prost = "0.13"
+capnp.workspace = true
+
+[build-dependencies]
+prost-build = "0.13"
