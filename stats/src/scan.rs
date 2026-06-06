@@ -14,9 +14,8 @@ use crate::{
 use bitcoin::Script;
 use btc_data_core::block::RawBlockFrame;
 use btc_data_core::parse::{decode_raw_block, DecodedBlockFrame};
-use btc_data_core::pipeline;
 use btc_data_core::source::BlockSource;
-use futures::{stream, Stream, StreamExt};
+use futures::{stream, StreamExt};
 use ahash::RandomState;
 use hashbrown::{HashMap, HashSet};
 use std::sync::Arc;
@@ -198,73 +197,6 @@ async fn prepare_raw_blocks_blocking(frames: Vec<RawBlockFrame>) -> anyhow::Resu
     })
         .await
         .map_err(|err| anyhow::anyhow!("prepare batch worker task failed: {err}"))?
-}
-
-fn prepared_block_stream(
-    source: Arc<dyn BlockSource>,
-    start_height: u64,
-    hashes: Vec<[u8; 32]>,
-    buffer: usize,
-) -> impl Stream<Item = anyhow::Result<PreparedBlockFrame>> {
-    stream::iter(hashes.into_iter().enumerate())
-        .map(move |(i, hash)| {
-            let source = source.clone();
-            let height = start_height + i as u64;
-            async move {
-                let bytes = source.get_block_raw(hash).await?;
-                prepare_raw_block_blocking(RawBlockFrame { height, hash, bytes }).await
-            }
-        })
-        .buffered(buffer)
-}
-
-fn prepared_block_stream_by_height(
-    source: Arc<dyn BlockSource>,
-    start_height: u64,
-    count: u64,
-    buffer: usize,
-) -> impl Stream<Item = anyhow::Result<PreparedBlockFrame>> {
-    stream::iter(start_height..(start_height + count))
-        .map(move |height| {
-            let source = source.clone();
-            async move {
-                let raw = source.get_block_by_height(height).await?;
-                prepare_raw_block_blocking(raw).await
-            }
-        })
-        .buffered(buffer)
-}
-
-fn prepared_block_stream_by_height_batched(
-    source: Arc<dyn BlockSource>,
-    start_height: u64,
-    count: u64,
-    buffer: usize,
-    batch_size: usize,
-) -> impl Stream<Item = anyhow::Result<PreparedBlockFrame>> {
-    let batch_size = batch_size.max(1) as u64;
-    let batches = if count == 0 { 0 } else { (count + batch_size - 1) / batch_size };
-
-    stream::iter(0..batches)
-        .map(move |batch_idx| {
-            let source = source.clone();
-            let batch_start = start_height + batch_idx * batch_size;
-            let remaining = start_height + count - batch_start;
-            let this_count = remaining.min(batch_size) as usize;
-
-            async move {
-                let frames = source.get_block_range_by_height(batch_start, this_count).await?;
-                prepare_raw_blocks_blocking(frames).await
-            }
-        })
-        .buffered(buffer)
-        .flat_map(|result| {
-            let items: Vec<anyhow::Result<PreparedBlockFrame>> = match result {
-                Ok(frames) => frames.into_iter().map(Ok).collect(),
-                Err(err) => vec![Err(err)],
-            };
-            stream::iter(items)
-        })
 }
 
 
@@ -481,6 +413,50 @@ impl StatsScannerState {
     }
 }
 
+/// Stage 1+2: fetch + stateless-prepare a contiguous run of heights in
+/// parallel, then return them ordered by height for the serial commit.
+///
+/// Stateless per-block work (decode, txid compute, script/p2tr-spend
+/// classification) happens concurrently as blocks arrive. The batch is then
+/// sorted by height so the stateful UTXO commit sees blocks in ascending order.
+async fn fetch_and_prepare_batch(
+    source: Arc<dyn BlockSource>,
+    start_height: u64,
+    count: u64,
+    in_flight: usize,
+) -> anyhow::Result<Vec<PreparedBlockFrame>> {
+    // Native batch path: one source call returns the whole range (e.g. JSON-RPC
+    // batch request, or REST concurrent fan-out). Stateless prepare then runs
+    // on the returned frames in one blocking-pool pass.
+    if source.supports_block_range_batches() {
+        let frames = source
+            .get_block_range_by_height(start_height, count as usize)
+            .await?;
+        return prepare_raw_blocks_blocking(frames).await;
+    }
+
+    // Fallback path: per-height fetch, concurrent via buffer_unordered, then
+    // each block stateless-prepared as it arrives. Used by IPC and any source
+    // without a native range API.
+    let mut prepared: Vec<PreparedBlockFrame> =
+        stream::iter(start_height..(start_height + count))
+            .map(|height| {
+                let source = source.clone();
+                async move {
+                    let raw = source.get_block_by_height(height).await?;
+                    prepare_raw_block_blocking(raw).await
+                }
+            })
+            .buffer_unordered(in_flight)
+            .collect::<Vec<anyhow::Result<PreparedBlockFrame>>>()
+            .await
+            .into_iter()
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+    prepared.sort_by_key(|f| f.height);
+    Ok(prepared)
+}
+
 pub async fn scan(
     source: Arc<dyn BlockSource>,
     sink: Arc<dyn StatsSink>,
@@ -539,240 +515,196 @@ pub async fn scan(
         eprintln!("UTXO hash window: {} blocks", cfg.utxo_hash_window);
     }
 
-    let use_native_batches = cfg.source_batch_size > 1 && source.supports_block_range_batches();
-    let use_direct_height = source.prefers_height_fetch();
+    // batch_size = blocks fetched + stateless-prepared in parallel before each
+    // join + serial commit. in_flight caps concurrent fetches within a batch.
+    let batch_size = (cfg.source_batch_size.max(1)) as u64;
+    let in_flight = cfg.buffer.max(1).min(batch_size as usize);
 
     eprintln!(
-        "Fetch + decode + prepare ({} blocks, in-flight={}, source-batch-size={}, strategy={}) + sequential commit...",
-        scan_blocks,
-        cfg.buffer,
-        cfg.source_batch_size,
-        if use_native_batches {
-            "native-batch"
-        } else if use_direct_height {
-            "direct-height"
-        } else {
-            "hash-prefetch+raw"
-        }
+        "Parallel fetch+stateless-prepare (batch={batch_size}, in-flight={in_flight}) \
+         then join + serial UTXO commit; {scan_blocks} blocks",
     );
-
-    if cfg.source_batch_size > 1 && !use_native_batches {
-        eprintln!(
-            "  note: source-batch-size={} ignored for source '{}'; source has no native batch API",
-            cfg.source_batch_size,
-            source.name()
-        );
-    }
 
     let t1 = Instant::now();
     let mut metrics = ScanMetrics::default();
 
-    let mut stream = if use_native_batches {
-        prepared_block_stream_by_height_batched(
-            source.clone(),
-            scan_start,
-            scan_blocks,
-            cfg.buffer,
-            cfg.source_batch_size,
-        )
-            .boxed()
-    } else if use_direct_height {
-        prepared_block_stream_by_height(
-            source.clone(),
-            scan_start,
-            scan_blocks,
-            cfg.buffer,
-        )
-            .boxed()
-    } else {
-        let prefetch_t = Instant::now();
-        let hashes = pipeline::prefetch_hashes(
-            &source,
-            scan_start,
-            scan_blocks,
-            cfg.buffer,
-        )
-            .await?;
-        metrics.add_fetch_wait(prefetch_t.elapsed());
+    let mut next_height = scan_start;
+    while next_height <= max_end {
+        let remaining = max_end - next_height + 1;
+        let this_count = remaining.min(batch_size);
 
-        prepared_block_stream(
-            source.clone(),
-            scan_start,
-            hashes,
-            cfg.buffer,
-        )
-            .boxed()
-    };
-
-    loop {
+        // ---- Stage 1+2: parallel fetch + stateless stats, joined in order ----
         let fetch_t = Instant::now();
-        let item = stream.next().await;
+        let batch = fetch_and_prepare_batch(source.clone(), next_height, this_count, in_flight).await?;
         metrics.add_fetch_wait(fetch_t.elapsed());
 
-        let Some(item) = item else { break; };
-        let frame = item?;
-        let h = frame.height;
-        let frame_hash = frame.hash;
-        let block_hash_hex = checkpoint::block_hash_hex(&frame_hash);
-        let prepared_txs = frame.txs;
-        metrics.prepare_detail.txid_compute += frame.prepare_metrics.txid_compute;
-        metrics.prepare_detail.output_classify += frame.prepare_metrics.output_classify;
-        metrics.prepare_detail.p2tr_spend_classify += frame.prepare_metrics.p2tr_spend_classify;
+        // ---- Stage 3: serial, ordered UTXO state commit ----
+        for frame in batch {
+            let h = frame.height;
+            let frame_hash = frame.hash;
+            let block_hash_hex = checkpoint::block_hash_hex(&frame_hash);
+            let prepared_txs = frame.txs;
+            metrics.prepare_detail.txid_compute += frame.prepare_metrics.txid_compute;
+            metrics.prepare_detail.output_classify += frame.prepare_metrics.output_classify;
+            metrics.prepare_detail.p2tr_spend_classify += frame.prepare_metrics.p2tr_spend_classify;
 
-        let process_t = Instant::now();
-        let last_id_at_block_start = state.last_id;
-        let mut per_block = PerBlock::default();
+            let process_t = Instant::now();
+            let last_id_at_block_start = state.last_id;
+            let mut per_block = PerBlock::default();
 
-        for tx in prepared_txs {
-            let is_coinbase = tx.is_coinbase;
-            let txid = tx.txid;
-            let last_id_at_tx_start = state.last_id;
+            for tx in prepared_txs {
+                let is_coinbase = tx.is_coinbase;
+                let txid = tx.txid;
+                let last_id_at_tx_start = state.last_id;
 
-            let mut any_sp_eligible_input = false;
-            let mut has_non_p2tr_input = false;
-            let mut p2tr_input_seen = false;
+                let mut any_sp_eligible_input = false;
+                let mut has_non_p2tr_input = false;
+                let mut p2tr_input_seen = false;
 
-            if !is_coinbase {
-                for input in &tx.inputs {
-                    let input_remove_t = Instant::now();
-                    let prevout_entry = state.utxo.remove(&input.previous_output);
-                    metrics.process_detail.input_remove += input_remove_t.elapsed();
+                if !is_coinbase {
+                    for input in &tx.inputs {
+                        let input_remove_t = Instant::now();
+                        let prevout_entry = state.utxo.remove(&input.previous_output);
+                        metrics.process_detail.input_remove += input_remove_t.elapsed();
 
-                    match prevout_entry {
-                        Some(entry) => {
-                            let input_accounting_t = Instant::now();
-                            let prev_id = entry.id();
-                            let prev_script_type = entry.script_type();
-                            let ctx = if prev_id > last_id_at_tx_start {
-                                SpendContext::SameTx
-                            } else if prev_id > last_id_at_block_start {
-                                SpendContext::SameBlock
-                            } else {
-                                SpendContext::Earlier
-                            };
-                            let is_p2tr_spend = matches!(prev_script_type, ScriptType::P2tr);
-                            state.stats.record_spend(ctx);
-                            per_block.record_spend_uid(prev_id, is_p2tr_spend);
-                            state.stats.record_input_script(prev_script_type);
-                            per_block.record_input_script(prev_script_type);
-                            metrics.process_detail.input_accounting += input_accounting_t.elapsed();
+                        match prevout_entry {
+                            Some(entry) => {
+                                let input_accounting_t = Instant::now();
+                                let prev_id = entry.id();
+                                let prev_script_type = entry.script_type();
+                                let ctx = if prev_id > last_id_at_tx_start {
+                                    SpendContext::SameTx
+                                } else if prev_id > last_id_at_block_start {
+                                    SpendContext::SameBlock
+                                } else {
+                                    SpendContext::Earlier
+                                };
+                                let is_p2tr_spend = matches!(prev_script_type, ScriptType::P2tr);
+                                state.stats.record_spend(ctx);
+                                per_block.record_spend_uid(prev_id, is_p2tr_spend);
+                                state.stats.record_input_script(prev_script_type);
+                                per_block.record_input_script(prev_script_type);
+                                metrics.process_detail.input_accounting += input_accounting_t.elapsed();
 
-                            if is_p2tr_spend {
-                                p2tr_input_seen = true;
-                                let p2tr_spend_t = Instant::now();
-                                let class = input.p2tr_spend_class;
-                                if !matches!(class.path, SpendPath::ScriptNums) {
-                                    any_sp_eligible_input = true;
+                                if is_p2tr_spend {
+                                    p2tr_input_seen = true;
+                                    let p2tr_spend_t = Instant::now();
+                                    let class = input.p2tr_spend_class;
+                                    if !matches!(class.path, SpendPath::ScriptNums) {
+                                        any_sp_eligible_input = true;
+                                    }
+                                    state.stats.record_p2tr_spend(class, ctx);
+                                    per_block.record_p2tr_spend(class);
+                                    metrics.process_detail.p2tr_spend += p2tr_spend_t.elapsed();
+                                } else {
+                                    has_non_p2tr_input = true;
                                 }
-                                state.stats.record_p2tr_spend(class, ctx);
-                                per_block.record_p2tr_spend(class);
-                                metrics.process_detail.p2tr_spend += p2tr_spend_t.elapsed();
-                            } else {
-                                has_non_p2tr_input = true;
+                                let utxo_hash_t = Instant::now();
+                                state.utxo_hash.remove_output(prev_id);
+                                metrics.process_detail.utxo_hash += utxo_hash_t.elapsed();
                             }
-                            let utxo_hash_t = Instant::now();
-                            state.utxo_hash.remove_output(prev_id);
-                            metrics.process_detail.utxo_hash += utxo_hash_t.elapsed();
-                        }
-                        None => {
-                            let input_accounting_t = Instant::now();
-                            has_non_p2tr_input = true;
-                            state.missing += 1;
-                            metrics.process_detail.input_accounting += input_accounting_t.elapsed();
+                            None => {
+                                let input_accounting_t = Instant::now();
+                                has_non_p2tr_input = true;
+                                state.missing += 1;
+                                metrics.process_detail.input_accounting += input_accounting_t.elapsed();
+                            }
                         }
                     }
                 }
-            }
 
-            let tx_is_nonsp = !is_coinbase
-                && p2tr_input_seen
-                && !any_sp_eligible_input
-                && !has_non_p2tr_input;
-            if tx_is_nonsp {
-                state.stats.nonsp_txs += 1;
-                per_block.nonsp_txs += 1;
-            }
-
-            for (vout_idx, (&script_type, &xonly_key)) in tx
-                .output_script_types
-                .iter()
-                .zip(tx.output_xonly_keys.iter())
-                .enumerate()
-            {
-                state.last_id += 1;
-                let is_p2tr = matches!(script_type, ScriptType::P2tr);
-
-                let reused = if let Some(k) = xonly_key {
-                    let seen_keys_t = Instant::now();
-                    let reused = !state.seen_keys.insert(k);
-                    metrics.process_detail.seen_keys += seen_keys_t.elapsed();
-                    reused
-                } else {
-                    false
-                };
-
-                let output_accounting_t = Instant::now();
-                state.stats.outputs += 1;
-                state.stats.record_output_script(script_type);
-                per_block.record_output_script(script_type);
-                if is_p2tr {
-                    state.stats.p2tr_outputs += 1;
-                    if reused { state.stats.p2tr_reused += 1; }
-                }
-                per_block.record_output(is_p2tr, reused);
-
+                let tx_is_nonsp = !is_coinbase
+                    && p2tr_input_seen
+                    && !any_sp_eligible_input
+                    && !has_non_p2tr_input;
                 if tx_is_nonsp {
-                    state.stats.nonsp_tx_outputs += 1;
-                    per_block.nonsp_tx_outputs += 1;
+                    state.stats.nonsp_txs += 1;
+                    per_block.nonsp_txs += 1;
                 }
-                metrics.process_detail.output_accounting += output_accounting_t.elapsed();
 
-                let op = bitcoin::OutPoint { txid, vout: vout_idx as u32 };
-                let utxo_insert_t = Instant::now();
-                state.utxo.insert(op, UtxoEntry::new(state.last_id, script_type));
-                metrics.process_detail.utxo_insert += utxo_insert_t.elapsed();
+                for (vout_idx, (&script_type, &xonly_key)) in tx
+                    .output_script_types
+                    .iter()
+                    .zip(tx.output_xonly_keys.iter())
+                    .enumerate()
+                {
+                    state.last_id += 1;
+                    let is_p2tr = matches!(script_type, ScriptType::P2tr);
 
-                let utxo_hash_t = Instant::now();
-                state.utxo_hash.add_output(state.last_id);
-                metrics.process_detail.utxo_hash += utxo_hash_t.elapsed();
+                    let reused = if let Some(k) = xonly_key {
+                        let seen_keys_t = Instant::now();
+                        let reused = !state.seen_keys.insert(k);
+                        metrics.process_detail.seen_keys += seen_keys_t.elapsed();
+                        reused
+                    } else {
+                        false
+                    };
+
+                    let output_accounting_t = Instant::now();
+                    state.stats.outputs += 1;
+                    state.stats.record_output_script(script_type);
+                    per_block.record_output_script(script_type);
+                    if is_p2tr {
+                        state.stats.p2tr_outputs += 1;
+                        if reused { state.stats.p2tr_reused += 1; }
+                    }
+                    per_block.record_output(is_p2tr, reused);
+
+                    if tx_is_nonsp {
+                        state.stats.nonsp_tx_outputs += 1;
+                        per_block.nonsp_tx_outputs += 1;
+                    }
+                    metrics.process_detail.output_accounting += output_accounting_t.elapsed();
+
+                    let op = bitcoin::OutPoint { txid, vout: vout_idx as u32 };
+                    let utxo_insert_t = Instant::now();
+                    state.utxo.insert(op, UtxoEntry::new(state.last_id, script_type));
+                    metrics.process_detail.utxo_insert += utxo_insert_t.elapsed();
+
+                    let utxo_hash_t = Instant::now();
+                    state.utxo_hash.add_output(state.last_id);
+                    metrics.process_detail.utxo_hash += utxo_hash_t.elapsed();
+                }
+            }
+
+            let utxo_hash_t = Instant::now();
+            let utxo_hash_hex = state.utxo_hash.finalize_block();
+            metrics.process_detail.utxo_hash += utxo_hash_t.elapsed();
+
+            let row_build_t = Instant::now();
+            let mut row = BlockStats::new(h);
+            row.block_hash = block_hash_hex;
+            row.last_global_id = state.last_id;
+            row.utxo_hash = utxo_hash_hex;
+            row.utxo_hash_window = cfg.utxo_hash_window;
+            per_block.measure_sorted_uid_encoding(state.last_id, &mut state.stats, &mut row);
+            per_block.drain_into(&mut row);
+            row.output_count = state.last_id - last_id_at_block_start;
+            row.refresh_classes();
+            metrics.process_detail.row_build += row_build_t.elapsed();
+            metrics.add_process(process_t.elapsed());
+
+            let sink_t = Instant::now();
+            sink.emit_block(&row).await?;
+            metrics.add_sink(sink_t.elapsed());
+            metrics.blocks += 1;
+
+            last_committed_height = Some(h);
+            last_committed_hash = Some(frame_hash);
+
+            if checkpoint_writer.on_committed_block() {
+                let checkpoint_t = Instant::now();
+                let checkpoint = make_checkpoint(&cfg, &state, h, frame_hash);
+                checkpoint_writer.write_checkpoint(&checkpoint).await?;
+                metrics.add_checkpoint(checkpoint_t.elapsed());
+            }
+
+            if cfg.progress > 0 && (h - scan_start) % cfg.progress == 0 && h > scan_start {
+                metrics.print_progress(t1.elapsed(), &state, h, scan_start);
             }
         }
 
-        let utxo_hash_t = Instant::now();
-        let utxo_hash_hex = state.utxo_hash.finalize_block();
-        metrics.process_detail.utxo_hash += utxo_hash_t.elapsed();
-
-        let row_build_t = Instant::now();
-        let mut row = BlockStats::new(h);
-        row.block_hash = block_hash_hex;
-        row.last_global_id = state.last_id;
-        row.utxo_hash = utxo_hash_hex;
-        row.utxo_hash_window = cfg.utxo_hash_window;
-        per_block.measure_sorted_uid_encoding(state.last_id, &mut state.stats, &mut row);
-        per_block.drain_into(&mut row);
-        row.output_count = state.last_id - last_id_at_block_start;
-        row.refresh_classes();
-        metrics.process_detail.row_build += row_build_t.elapsed();
-        metrics.add_process(process_t.elapsed());
-
-        let sink_t = Instant::now();
-        sink.emit_block(&row).await?;
-        metrics.add_sink(sink_t.elapsed());
-        metrics.blocks += 1;
-
-        last_committed_height = Some(h);
-        last_committed_hash = Some(frame_hash);
-
-        if checkpoint_writer.on_committed_block() {
-            let checkpoint_t = Instant::now();
-            let checkpoint = make_checkpoint(&cfg, &state, h, frame_hash);
-            checkpoint_writer.write_checkpoint(&checkpoint).await?;
-            metrics.add_checkpoint(checkpoint_t.elapsed());
-        }
-
-        if cfg.progress > 0 && (h - scan_start) % cfg.progress == 0 && h > scan_start {
-            metrics.print_progress(t1.elapsed(), &state, h, scan_start);
-        }
+        next_height += this_count;
     }
 
     if checkpoint_writer.needs_final_flush() {
