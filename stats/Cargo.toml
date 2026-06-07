@@ -3,6 +3,7 @@ name = "btc-data-stats"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+build = "build.rs"
 description = "Stats accumulators (lib) + btc-data-stats CLI binary that runs the scan loop and emits per-block stats to configurable sinks."
 
 [lib]
@@ -28,7 +29,10 @@ serde.workspace = true
 postcard.workspace = true
 ahash.workspace = true
 hashbrown.workspace = true
+capnp = "0.25.4"
 
 [features]
 default = []
 ipc = ["btc-data-sources/ipc"]
+[build-dependencies]
+capnpc.workspace =  true

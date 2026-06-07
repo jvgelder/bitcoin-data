@@ -1,6 +1,6 @@
 //! `bitcoin::Block` → capnp `Block` message.
 
-use crate::block_schema::{block, transaction, tx_in, tx_out};
+use crate::block_capnp::{block, transaction, tx_in, tx_out};
 use btc_data_core::parse::ParsedBlock;
 use capnp::message::{Builder, HeapAllocator};
 

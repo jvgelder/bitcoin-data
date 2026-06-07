@@ -4,15 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Cap'n Proto wire-format adapter. Encodes rust-bitcoin Block and stats accumulators into capnp messages. Schemas owned here. Used by sinks that ship capnp on the wire (ipc, optionally kafka/grpc)."
-build = "src/build.rs"
+build = "build.rs"
 
 [dependencies]
 btc-data-core.workspace = true
-btc-data-stats.workspace = true
 capnp.workspace = true
 anyhow.workspace = true
 bitcoin.workspace = true
-hex.workspace = true
-
 [build-dependencies]
 capnpc.workspace = true

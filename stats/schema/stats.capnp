@@ -1,9 +1,5 @@
 @0xc25cceaa7df522ce;
 # Cap'n Proto schema for stats messages.
-#
-# Owned by `btc-data-encoding-capnp`. Stats accumulators (Rust structs in
-# `btc-data-stats`) are converted to these capnp messages at the sink
-# boundary by the serializer in this crate.
 
 struct Stats {
     block @0 :BlockStats;
