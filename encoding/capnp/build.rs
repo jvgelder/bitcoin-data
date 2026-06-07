@@ -3,8 +3,7 @@
 fn main() {
     capnpc::CompilerCommand::new()
         .src_prefix("schema")
-        .file("schema/bitcoin_block.capnp")
-        .file("schema/bitcoin_stats.capnp")
+        .file("schema/block.capnp")
         .run()
         .expect("capnp schema compilation failed");
 }

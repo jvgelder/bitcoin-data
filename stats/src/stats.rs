@@ -1,7 +1,7 @@
 //! Stats accumulators → capnp Stats messages.
 
-use crate::stats_schema::{block_stats, log2_hist, stats};
-use btc_data_stats::{BlockStats, Log2Hist, Stats};
+use crate::stats_capnp::{block_stats, log2_hist, stats};
+use crate::{BlockStats, Log2Hist, Stats};
 use capnp::message::{Builder, HeapAllocator};
 
 /// Encode the per-block snapshot.
@@ -39,7 +39,8 @@ pub fn encode_stats(
         let mut b = msg.init_root::<stats::Builder>();
         {
             let bs = b.reborrow().init_block();
-            let snap = stats_to_block_snapshot(src, height, last_global_id, utxo_hash, utxo_hash_window);
+            let snap =
+                stats_to_block_snapshot(src, height, last_global_id, utxo_hash, utxo_hash_window);
             fill_block_stats(bs, &snap);
         }
     }
@@ -117,13 +118,17 @@ fn fill_block_stats(mut b: block_stats::Builder<'_>, src: &BlockStats) {
     b.set_sorted_spent_rice_best_k(src.sorted_spent_rice_best_k);
     b.set_sorted_spent_rice_best_bits(u128_to_u64(src.sorted_spent_rice_best_bits));
     b.set_sorted_spent_elias_delta_bits(u128_to_u64(src.sorted_spent_elias_delta_bits));
-    b.set_sorted_spent_ef_bits_with_64bit_base(u128_to_u64(src.sorted_spent_ef_bits_with_64bit_base));
+    b.set_sorted_spent_ef_bits_with64_bit_base(u128_to_u64(
+        src.sorted_spent_ef_bits_with_64bit_base,
+    ));
     b.set_sorted_p2tr_spent_values(src.sorted_p2tr_spent_values);
     b.set_sorted_p2tr_spent_leb128_bytes(u128_to_u64(src.sorted_p2tr_spent_leb128_bytes));
     b.set_sorted_p2tr_spent_rice_best_k(src.sorted_p2tr_spent_rice_best_k);
     b.set_sorted_p2tr_spent_rice_best_bits(u128_to_u64(src.sorted_p2tr_spent_rice_best_bits));
     b.set_sorted_p2tr_spent_elias_delta_bits(u128_to_u64(src.sorted_p2tr_spent_elias_delta_bits));
-    b.set_sorted_p2tr_spent_ef_bits_with_64bit_base(u128_to_u64(src.sorted_p2tr_spent_ef_bits_with_64bit_base));
+    b.set_sorted_p2tr_spent_ef_bits_with64_bit_base(u128_to_u64(
+        src.sorted_p2tr_spent_ef_bits_with_64bit_base,
+    ));
 }
 
 fn fill_log2_hist(mut b: log2_hist::Builder<'_>, src: &Log2Hist) {
