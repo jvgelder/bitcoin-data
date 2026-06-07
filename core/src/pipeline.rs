@@ -126,7 +126,7 @@ pub fn raw_block_stream_by_height_batched(
     let batches = if count == 0 {
         0
     } else {
-        (count + batch_size - 1) / batch_size
+        count.div_ceil(batch_size)
     };
 
     futures::stream::iter(0..batches)

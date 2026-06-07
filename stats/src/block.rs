@@ -99,8 +99,8 @@ impl CodecValueCosts {
 
         let mut escaped_rice_bits = [[0u128; ESCAPED_RICE_K_COUNT]; ESCAPED_RICE_THRESHOLD_COUNT];
         for (threshold_idx, &threshold) in ESCAPED_RICE_THRESHOLDS.iter().enumerate() {
-            for k in 0..ESCAPED_RICE_K_COUNT {
-                escaped_rice_bits[threshold_idx][k] = if value < threshold {
+            for (k, bits) in escaped_rice_bits[threshold_idx].iter_mut().enumerate() {
+                *bits = if value < threshold {
                     1 + rice_bits(value, k as u32) as u128
                 } else {
                     1 + 8 * leb128_bytes
@@ -384,7 +384,7 @@ pub fn elias_fano_bits(universe: u64, n: u64) -> u128 {
 }
 
 pub fn measure_sorted_uid_stream(
-    uids: &mut Vec<u64>,
+    uids: &mut [u64],
     block_anchor_last_uid: u64,
     stats: &mut SortedUidCodecStats,
 ) -> SortedUidBlockEstimate {
