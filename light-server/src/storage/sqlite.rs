@@ -62,6 +62,16 @@ impl ArchiveBackend for SqliteArchive {
             .await?
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(10_000);
+        let finality_depth = self
+            .meta_text("finality_depth")
+            .await?
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(6);
+        let suggested_reorg_cache_depth = self
+            .meta_text("suggested_reorg_cache_depth")
+            .await?
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(144);
 
         let rows = sqlx::query(
             r#"SELECT scope, cutthrough_blocks, served_tip_height, served_tip_hash
@@ -99,6 +109,8 @@ impl ArchiveBackend for SqliteArchive {
             network,
             genesis_hash,
             checkpoint_interval,
+            finality_depth,
+            suggested_reorg_cache_depth,
             max_range_count: DEFAULT_MAX_RANGE_COUNT,
             profiles,
         })

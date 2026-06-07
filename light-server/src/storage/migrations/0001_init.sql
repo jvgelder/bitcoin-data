@@ -10,6 +10,7 @@ INSERT OR IGNORE INTO meta(key, value) VALUES
   ('scope', 'p2tr-sp'),
   ('network', 'mainnet'),
   ('finality_depth', '6'),
+  ('suggested_reorg_cache_depth', '24'),
   ('checkpoint_interval', '10000');
 
 CREATE TABLE IF NOT EXISTS blocks (
@@ -74,12 +75,36 @@ VALUES
   (7, 'ct52560-sp',  'p2tr-sp', 52560,  144),
   (8, 'ct105120-sp', 'p2tr-sp', 105120, 144);
 
+
+-- Canonical-chain UTXO lookup used only by the raw indexer to derive BIP352
+-- transaction scan points. This is intentionally all-output, not P2TR-only:
+-- BIP352 input eligibility can depend on P2WPKH/P2SH/P2PKH/P2TR prevouts.
+-- Rows are valid only for the currently indexed best-work chain; reorg
+-- rollback must disconnect affected block effects before replacement blocks are indexed.
+CREATE TABLE IF NOT EXISTS chain_utxo_lookup (
+  txid BLOB NOT NULL,
+  vout INTEGER NOT NULL,
+  value_sat INTEGER NOT NULL,
+  script_pubkey BLOB NOT NULL,
+  created_height INTEGER NOT NULL,
+  created_block_hash BLOB NOT NULL,
+  created_tx_index INTEGER NOT NULL,
+  PRIMARY KEY(txid, vout)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS chain_utxo_lookup_created_height_idx
+ON chain_utxo_lookup(created_height);
+
 CREATE TABLE IF NOT EXISTS p2tr_outputs (
   uid INTEGER PRIMARY KEY CHECK(uid > 0),
+  txid BLOB NOT NULL,
   created_height INTEGER NOT NULL,
+  created_block_hash BLOB NOT NULL,
   tx_index INTEGER NOT NULL,
   vout INTEGER NOT NULL,
-  value_sat INTEGER,
+  value_sat INTEGER NOT NULL,
+  script_pubkey BLOB NOT NULL,
+  p2tr_xonly_key BLOB NOT NULL,
   is_nums INTEGER NOT NULL DEFAULT 0,
   is_reused INTEGER NOT NULL DEFAULT 0,
   reuse_count_at_creation INTEGER NOT NULL DEFAULT 1,
@@ -90,19 +115,29 @@ CREATE INDEX IF NOT EXISTS p2tr_outputs_created_height_idx
 ON p2tr_outputs(created_height);
 
 CREATE UNIQUE INDEX IF NOT EXISTS p2tr_outputs_location_idx
-ON p2tr_outputs(created_height, tx_index, vout);
+ON p2tr_outputs(created_height, created_block_hash, tx_index, vout);
 
 CREATE TABLE IF NOT EXISTS p2tr_utxo_lookup (
   txid BLOB NOT NULL,
   vout INTEGER NOT NULL,
   uid INTEGER NOT NULL CHECK(uid > 0),
+  value_sat INTEGER NOT NULL,
+  script_pubkey BLOB NOT NULL,
+  p2tr_xonly_key BLOB NOT NULL,
+  created_height INTEGER NOT NULL,
+  created_block_hash BLOB NOT NULL,
+  created_tx_index INTEGER NOT NULL,
   PRIMARY KEY(txid, vout),
   FOREIGN KEY(uid) REFERENCES p2tr_outputs(uid)
 ) WITHOUT ROWID;
 
+CREATE INDEX IF NOT EXISTS p2tr_utxo_lookup_uid_idx
+ON p2tr_utxo_lookup(uid);
+
 CREATE TABLE IF NOT EXISTS p2tr_spends (
   uid INTEGER PRIMARY KEY CHECK(uid > 0),
   spent_height INTEGER NOT NULL,
+  spent_block_hash BLOB NOT NULL,
   spend_tx_index INTEGER NOT NULL,
   FOREIGN KEY(uid) REFERENCES p2tr_outputs(uid),
   FOREIGN KEY(spent_height) REFERENCES blocks(height)

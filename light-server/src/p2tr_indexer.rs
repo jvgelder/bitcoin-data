@@ -26,21 +26,72 @@ pub struct OutPointKey {
 }
 
 #[derive(Debug, Clone)]
+pub struct ScopedUtxoEntry {
+    /// Canonical-chain outpoint key for spend lookup. A tx can appear in
+    /// competing forks, so this row is only valid for the currently indexed
+    /// best-work chain. Reorg rollback must disconnect affected block effects
+    /// before re-indexing the replacement chain.
+    pub outpoint: OutPointKey,
+    pub uid: u64,
+    pub created_height: u64,
+    pub created_block_hash: BlockHashBytes,
+    pub tx_index: u32,
+    pub value_sat: u64,
+    pub script_pubkey: Vec<u8>,
+    /// Required for the p2tr-sp scope: this is the previous-output key needed
+    /// later for BIP352 input scan-point construction.
+    pub p2tr_xonly_key: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
+pub struct CreatedScopedUtxo {
+    pub entry: ScopedUtxoEntry,
+    pub is_nums: bool,
+    pub is_reused: bool,
+    pub reuse_count_at_creation: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpentScopedUtxo {
+    pub entry: ScopedUtxoEntry,
+    pub spent_height: u64,
+    pub spent_block_hash: BlockHashBytes,
+    pub spend_tx_index: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct SeenP2trKey {
+    pub output_key: Vec<u8>,
+    pub first_height: u64,
+    pub last_height: u64,
+    pub seen_count: u64,
+    pub first_uid: Option<u64>,
+    pub last_uid: Option<u64>,
+    pub is_nums: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct TxInputScan {
     pub previous_output: OutPointKey,
+    /// Raw scriptSig bytes from the spending input. Needed by BIP352 input
+    /// eligibility for legacy/P2SH-wrapped input forms.
+    pub script_sig: Vec<u8>,
+    /// Raw witness stack items from the spending input. Needed to extract
+    /// input public keys for SegWit/Taproot forms.
+    pub witness: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct TxOutputScan {
     pub vout: u32,
+    pub value_sat: u64,
+    pub script_pubkey: Vec<u8>,
+    pub p2tr_xonly_key: Option<[u8; 32]>,
     pub is_p2tr: bool,
     /// Input-side NUMS accounting hook. For real Bitcoin output scanning this
     /// should normally be false: BIP352 NUMS handling applies to Taproot
     /// script-path spends, not to P2TR output creation.
     pub is_nums: bool,
-    /// Canonical bytes committed into the served output identifier. For P2TR
-    /// this must be the 32-byte x-only output key.
-    pub identity_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -83,12 +134,15 @@ pub struct BlockScopeStats {
 pub struct AppliedBlock {
     pub light_block: LightBlockInput,
     pub stats: BlockScopeStats,
+    pub created_utxos: Vec<CreatedScopedUtxo>,
+    pub spent_utxos: Vec<SpentScopedUtxo>,
+    pub seen_p2tr_keys: Vec<SeenP2trKey>,
 }
 
 #[derive(Debug, Default)]
 pub struct P2trIndexerState {
     next_uid: u64,
-    outpoint_to_uid: HashMap<OutPointKey, u64>,
+    outpoint_to_entry: HashMap<OutPointKey, ScopedUtxoEntry>,
     live_uids: BTreeSet<u64>,
     seen_p2tr_keys: HashSet<Vec<u8>>,
 }
@@ -96,6 +150,28 @@ pub struct P2trIndexerState {
 impl P2trIndexerState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn restore(
+        last_uid: u64,
+        live_entries: impl IntoIterator<Item = ScopedUtxoEntry>,
+        seen_keys: impl IntoIterator<Item = Vec<u8>>,
+    ) -> Self {
+        let mut state = Self {
+            next_uid: last_uid,
+            outpoint_to_entry: HashMap::new(),
+            live_uids: BTreeSet::new(),
+            seen_p2tr_keys: seen_keys.into_iter().collect(),
+        };
+        for entry in live_entries {
+            state.live_uids.insert(entry.uid);
+            state.outpoint_to_entry.insert(entry.outpoint, entry);
+        }
+        state
+    }
+
+    pub fn live_entries(&self) -> impl Iterator<Item = &ScopedUtxoEntry> {
+        self.outpoint_to_entry.values()
     }
 
     pub fn last_uid(&self) -> u64 {
@@ -144,21 +220,31 @@ impl P2trIndexerState {
             tx_count: block.txs.len() as u32,
             ..Default::default()
         };
+        let mut created_utxos = Vec::<CreatedScopedUtxo>::new();
+        let mut spent_utxos = Vec::<SpentScopedUtxo>::new();
+        let mut seen_p2tr_keys = Vec::<SeenP2trKey>::new();
 
         for tx in &block.txs {
             let mut tx_has_p2tr_output = false;
             let mut tx_has_indexed_output = false;
 
             for input in &tx.inputs {
-                if let Some(uid) = self.outpoint_to_uid.remove(&input.previous_output) {
-                    self.live_uids.remove(&uid);
-                    spent_uids.push(uid);
+                if let Some(entry) = self.outpoint_to_entry.remove(&input.previous_output) {
+                    self.live_uids.remove(&entry.uid);
+                    spent_uids.push(entry.uid);
+                    spent_utxos.push(SpentScopedUtxo {
+                        entry,
+                        spent_height: block.height,
+                        spent_block_hash: block.block_hash,
+                        spend_tx_index: tx.tx_index,
+                    });
                     stats.indexed_spent_count += 1;
                 }
             }
 
             for output in &tx.outputs {
                 stats.output_count_total += 1;
+                let mut is_reused_output = false;
                 if output.is_p2tr {
                     tx_has_p2tr_output = true;
                     stats.p2tr_output_count += 1;
@@ -171,9 +257,20 @@ impl P2trIndexerState {
                     // input-side eligibility determines whether a tx scan point
                     // can be produced.
                     stats.p2tr_sp_candidate_count += 1;
-                    if !self.seen_p2tr_keys.insert(output.identity_bytes.clone()) {
+                    let output_identity = p2tr_output_identity(output, block.height, tx.tx_index)?;
+                    is_reused_output = !self.seen_p2tr_keys.insert(output_identity.clone());
+                    if is_reused_output {
                         stats.p2tr_reused_count += 1;
                     }
+                    seen_p2tr_keys.push(SeenP2trKey {
+                        output_key: output_identity,
+                        first_height: block.height,
+                        last_height: block.height,
+                        seen_count: 1,
+                        first_uid: None,
+                        last_uid: None,
+                        is_nums: output.is_nums,
+                    });
                 }
                 let include = profile.scope.include_output(output.is_p2tr, output.is_nums);
                 if !include {
@@ -182,6 +279,16 @@ impl P2trIndexerState {
                     }
                     continue;
                 }
+
+                let output_identity = output_identity_bytes(output, block.height, tx.tx_index)?;
+                let p2tr_xonly_key = output.p2tr_xonly_key.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "indexed P2TR output at height {} tx_index {} vout {} is missing x-only key",
+                        block.height,
+                        tx.tx_index,
+                        output.vout
+                    )
+                })?;
 
                 tx_has_indexed_output = true;
                 stats.indexed_output_count += 1;
@@ -194,14 +301,30 @@ impl P2trIndexerState {
                     txid: tx.txid,
                     vout: output.vout,
                 };
-                self.outpoint_to_uid.insert(outpoint, uid);
+                let entry = ScopedUtxoEntry {
+                    outpoint,
+                    uid,
+                    created_height: block.height,
+                    created_block_hash: block.block_hash,
+                    tx_index: tx.tx_index,
+                    value_sat: output.value_sat,
+                    script_pubkey: output.script_pubkey.clone(),
+                    p2tr_xonly_key,
+                };
+                self.outpoint_to_entry.insert(outpoint, entry.clone());
                 self.live_uids.insert(uid);
+                created_utxos.push(CreatedScopedUtxo {
+                    entry,
+                    is_nums: output.is_nums,
+                    is_reused: is_reused_output,
+                    reuse_count_at_creation: 1,
+                });
                 outputs.push(OutputRefInput {
                     tx_index: tx.tx_index,
                     vout: output.vout,
                     uid,
                 });
-                full_output_hashes.push(output_identifier_hash(&output.identity_bytes));
+                full_output_hashes.push(output_identifier_hash(&output_identity));
             }
 
             if tx_has_p2tr_output {
@@ -244,7 +367,36 @@ impl P2trIndexerState {
                 spent_uids_sorted: spent_uids,
             },
             stats,
+            created_utxos,
+            spent_utxos,
+            seen_p2tr_keys,
         })
+    }
+}
+
+fn p2tr_output_identity(
+    output: &TxOutputScan,
+    height: u64,
+    tx_index: u32,
+) -> anyhow::Result<Vec<u8>> {
+    let key = output.p2tr_xonly_key.ok_or_else(|| {
+        anyhow::anyhow!(
+            "P2TR output at height {height} tx_index {tx_index} vout {} is missing x-only key",
+            output.vout
+        )
+    })?;
+    Ok(key.to_vec())
+}
+
+fn output_identity_bytes(
+    output: &TxOutputScan,
+    height: u64,
+    tx_index: u32,
+) -> anyhow::Result<Vec<u8>> {
+    if output.is_p2tr {
+        p2tr_output_identity(output, height, tx_index)
+    } else {
+        Ok(output.script_pubkey.clone())
     }
 }
 
@@ -280,21 +432,27 @@ mod tests {
                 outputs: vec![
                     TxOutputScan {
                         vout: 0,
+                        value_sat: 0,
+                        script_pubkey: Vec::new(),
+                        p2tr_xonly_key: Some([1; 32]),
                         is_p2tr: true,
                         is_nums: false,
-                        identity_bytes: vec![1; 32],
                     },
                     TxOutputScan {
                         vout: 1,
+                        value_sat: 0,
+                        script_pubkey: Vec::new(),
+                        p2tr_xonly_key: Some([1; 32]),
                         is_p2tr: true,
                         is_nums: false,
-                        identity_bytes: vec![1; 32],
                     },
                     TxOutputScan {
                         vout: 2,
+                        value_sat: 0,
+                        script_pubkey: Vec::new(),
+                        p2tr_xonly_key: Some([2; 32]),
                         is_p2tr: true,
                         is_nums: true,
-                        identity_bytes: vec![2; 32],
                     },
                 ],
             }],
@@ -325,15 +483,19 @@ mod tests {
                 outputs: vec![
                     TxOutputScan {
                         vout: 0,
+                        value_sat: 0,
+                        script_pubkey: Vec::new(),
+                        p2tr_xonly_key: None,
                         is_p2tr: false,
                         is_nums: false,
-                        identity_bytes: vec![0],
                     },
                     TxOutputScan {
                         vout: 1,
+                        value_sat: 0,
+                        script_pubkey: Vec::new(),
+                        p2tr_xonly_key: Some([1; 32]),
                         is_p2tr: true,
                         is_nums: false,
-                        identity_bytes: vec![1; 32],
                     },
                 ],
             }],
@@ -355,13 +517,17 @@ mod tests {
                         txid: txid(10),
                         vout: 1,
                     },
+                    script_sig: Vec::new(),
+                    witness: Vec::new(),
                 }],
                 silent_payment_tweak: Some([8; 33].into()),
                 outputs: vec![TxOutputScan {
                     vout: 0,
+                    value_sat: 0,
+                    script_pubkey: Vec::new(),
+                    p2tr_xonly_key: Some([2; 32]),
                     is_p2tr: true,
                     is_nums: false,
-                    identity_bytes: vec![2; 32],
                 }],
             }],
         };
