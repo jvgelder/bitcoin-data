@@ -71,7 +71,7 @@ impl ArchiveBackend for SqliteArchive {
             .meta_text("suggested_reorg_cache_depth")
             .await?
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(144);
+            .unwrap_or(24);
 
         let rows = sqlx::query(
             r#"SELECT scope, cutthrough_blocks, served_tip_height, served_tip_hash

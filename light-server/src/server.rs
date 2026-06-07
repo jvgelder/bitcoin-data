@@ -83,9 +83,6 @@ struct ClientProfileQuery {
     /// Archive scope requested by the client. Defaults to p2tr-sp when omitted.
     /// If the server did not index the requested scope, the request fails.
     scope: Option<ArchiveScope>,
-    /// Client-facing toggle. false/raw by default.
-    #[serde(default)]
-    cutthrough: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,9 +95,6 @@ struct SyncRangeQuery {
     /// Archive scope requested by the client. Defaults to p2tr-sp when omitted.
     /// If the server did not index the requested scope, the request fails.
     scope: Option<ArchiveScope>,
-    /// Client-facing toggle. false/raw by default.
-    #[serde(default)]
-    cutthrough: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,9 +103,6 @@ struct LatestCheckpointQuery {
     /// Archive scope requested by the client. Defaults to p2tr-sp when omitted.
     /// If the server did not index the requested scope, the request fails.
     scope: Option<ArchiveScope>,
-    /// Client-facing toggle. false/raw by default.
-    #[serde(default)]
-    cutthrough: bool,
 }
 
 pub async fn serve(config: ServerConfig, archive: Arc<dyn ArchiveBackend>) -> anyhow::Result<()> {
@@ -123,10 +114,15 @@ pub async fn serve(config: ServerConfig, archive: Arc<dyn ArchiveBackend>) -> an
         .route("/health", get(health))
         .route("/manifest", get(manifest))
         .route("/tip", get(tip))
+        .route("/tip/cutthrough", get(cutthrough_tip))
         .route("/blocks/light", get(block_range))
+        .route("/blocks/light/cutthrough", get(cutthrough_block_range))
         .route("/blocks/:height/light", get(single_block))
+        .route("/blocks/:height/light/cutthrough", get(cutthrough_single_block))
         .route("/checkpoints/latest", get(latest_checkpoint))
+        .route("/checkpoints/latest/cutthrough", get(cutthrough_latest_checkpoint))
         .route("/checkpoints/:height", get(checkpoint))
+        .route("/checkpoints/:height/cutthrough", get(cutthrough_checkpoint))
         .route("/debug/blocks/:height/stats", get(block_stats))
         // .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -149,7 +145,7 @@ async fn tip(
     State(state): State<AppState>,
     Query(q): Query<ClientProfileQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let profile = select_profile(&state.archive, q.scope, q.cutthrough, None).await?;
+    let profile = select_profile(&state.archive, q.scope, StreamProfile::Full, None).await?;
     let tip = state
         .archive
         .tip(&profile)
@@ -165,6 +161,27 @@ async fn tip(
     })))
 }
 
+async fn cutthrough_tip(
+    State(state): State<AppState>,
+    Query(q): Query<ClientProfileQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let profile = select_profile(&state.archive, q.scope, StreamProfile::CutThrough, None).await?;
+    let tip = state
+        .archive
+        .tip(&profile)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no served tip for profile {}", profile.name))?;
+    Ok(Json(json!({
+        "height": tip.height,
+        "block_hash": tip.block_hash,
+        "profile": profile.name.clone(),
+        "scope": profile.profile.scope.as_str(),
+        "stream": "cutthrough",
+        "cutthrough": true,
+        "cutthrough_blocks": profile.profile.cutthrough_blocks,
+    })))
+}
+
 async fn single_block(
     State(state): State<AppState>,
     Path(height): Path<u64>,
@@ -172,8 +189,30 @@ async fn single_block(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let format = response_format(&headers)?;
-    let profile = select_profile(&state.archive, q.scope, q.cutthrough, Some(height)).await?;
+    let profile = select_profile(&state.archive, q.scope, StreamProfile::Full, Some(height)).await?;
     ensure_height_served(height, &profile)?;
+    let (payload, block_hash) = state.archive.read_block(height, &profile).await?;
+    let mut response = match format {
+        ResponseFormat::Capnp => binary_response(payload, cache_control(height, &profile)),
+        ResponseFormat::Json => json_response(
+            serde_json::to_vec_pretty(&json_wire::light_block_to_json(&payload, Some(&profile))?)?,
+            cache_control(height, &profile),
+        ),
+    };
+    add_block_headers(&mut response, height, &block_hash, &profile);
+    Ok(response)
+}
+
+async fn cutthrough_single_block(
+    State(state): State<AppState>,
+    Path(height): Path<u64>,
+    Query(q): Query<ClientProfileQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let format = response_format(&headers)?;
+    let profile = select_profile(&state.archive, q.scope, StreamProfile::CutThrough, Some(height)).await?;
+    ensure_height_served(height, &profile)?;
+    ensure_cutthrough_height_allowed(&state.archive, height, q.scope).await?;
     let (payload, block_hash) = state.archive.read_block(height, &profile).await?;
     let mut response = match format {
         ResponseFormat::Capnp => binary_response(payload, cache_control(height, &profile)),
@@ -201,7 +240,7 @@ async fn block_range(
         )));
     }
     let format = response_format(&headers)?;
-    let profile = select_profile(&state.archive, q.scope, q.cutthrough, Some(q.start)).await?;
+    let profile = select_profile(&state.archive, q.scope, StreamProfile::Full, Some(q.start)).await?;
     let tip = profile
         .served_tip
         .as_ref()
@@ -244,6 +283,66 @@ async fn block_range(
     Ok(response)
 }
 
+async fn cutthrough_block_range(
+    State(state): State<AppState>,
+    Query(q): Query<SyncRangeQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    if q.count == 0 {
+        return Err(ApiError::bad_request("count must be greater than zero"));
+    }
+    if q.count > state.max_range_count {
+        return Err(ApiError::bad_request(format!(
+            "count {} exceeds max_range_count {}",
+            q.count, state.max_range_count
+        )));
+    }
+    let format = response_format(&headers)?;
+    let profile = select_profile(&state.archive, q.scope, StreamProfile::CutThrough, Some(q.start)).await?;
+    let tip = profile
+        .served_tip
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("profile {} has no served tip", profile.name))?;
+    if q.start > tip.height {
+        return Err(ApiError::bad_request(format!(
+            "start height {} is above served tip {} for profile {}",
+            q.start, tip.height, profile.name
+        )));
+    }
+    let available = tip.height - q.start + 1;
+    let count = q.count.min(u32::try_from(available).unwrap_or(u32::MAX));
+    let end = q.start + u64::from(count) - 1;
+    ensure_cutthrough_range_allowed(&state.archive, end, q.scope).await?;
+    let messages = state.archive.read_blocks(q.start, count, &profile).await?;
+    let mut response = match format {
+        ResponseFormat::Capnp => {
+            binary_response(frame_range(&messages)?, cache_control(end, &profile))
+        }
+        ResponseFormat::Json => {
+            let blocks = messages
+                .iter()
+                .map(|payload| json_wire::light_block_to_json(payload, Some(&profile)))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let body = serde_json::to_vec_pretty(&json!({
+                "version": WIRE_VERSION,
+                "format": "light-block-range",
+                "stream": "cutthrough",
+                "profile": profile.name.clone(),
+                "scope": profile.profile.scope.as_str(),
+                "cutthrough": true,
+                "cutthrough_blocks": profile.profile.cutthrough_blocks,
+                "start": q.start,
+                "end": end,
+                "count": count,
+                "blocks": blocks,
+            }))?;
+            json_response(body, cache_control(end, &profile))
+        }
+    };
+    add_range_headers(&mut response, q.start, end, count, &profile);
+    Ok(response)
+}
+
 async fn checkpoint(
     State(state): State<AppState>,
     Path(height): Path<u64>,
@@ -251,8 +350,30 @@ async fn checkpoint(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let format = response_format(&headers)?;
-    let profile = select_profile(&state.archive, q.scope, q.cutthrough, Some(height)).await?;
+    let profile = select_profile(&state.archive, q.scope, StreamProfile::Full, Some(height)).await?;
     ensure_height_served(height, &profile)?;
+    let body = state.archive.read_checkpoint(height, &profile).await?;
+    let mut response = match format {
+        ResponseFormat::Capnp => binary_response(body, cache_control(height, &profile)),
+        ResponseFormat::Json => json_response(
+            serde_json::to_vec_pretty(&json_wire::checkpoint_to_json(&body, Some(&profile))?)?,
+            cache_control(height, &profile),
+        ),
+    };
+    add_checkpoint_headers(&mut response, height, &profile);
+    Ok(response)
+}
+
+async fn cutthrough_checkpoint(
+    State(state): State<AppState>,
+    Path(height): Path<u64>,
+    Query(q): Query<ClientProfileQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let format = response_format(&headers)?;
+    let profile = select_profile(&state.archive, q.scope, StreamProfile::CutThrough, Some(height)).await?;
+    ensure_height_served(height, &profile)?;
+    ensure_cutthrough_height_allowed(&state.archive, height, q.scope).await?;
     let body = state.archive.read_checkpoint(height, &profile).await?;
     let mut response = match format {
         ResponseFormat::Capnp => binary_response(body, cache_control(height, &profile)),
@@ -271,7 +392,7 @@ async fn latest_checkpoint(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let format = response_format(&headers)?;
-    let profile = select_profile(&state.archive, q.scope, q.cutthrough, Some(q.height_lte)).await?;
+    let profile = select_profile(&state.archive, q.scope, StreamProfile::Full, Some(q.height_lte)).await?;
     let height_lte = match profile.served_tip.as_ref() {
         Some(tip) => q.height_lte.min(tip.height),
         None => q.height_lte,
@@ -293,6 +414,35 @@ async fn latest_checkpoint(
     Ok(response)
 }
 
+async fn cutthrough_latest_checkpoint(
+    State(state): State<AppState>,
+    Query(q): Query<LatestCheckpointQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let format = response_format(&headers)?;
+    let profile = select_profile(&state.archive, q.scope, StreamProfile::CutThrough, Some(q.height_lte)).await?;
+    let height_lte = match profile.served_tip.as_ref() {
+        Some(tip) => q.height_lte.min(tip.height),
+        None => q.height_lte,
+    };
+    ensure_cutthrough_height_allowed(&state.archive, height_lte, q.scope).await?;
+    let height = state
+        .archive
+        .latest_checkpoint_height(height_lte, &profile)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no cut-through checkpoint <= {height_lte}"))?;
+    let body = state.archive.read_checkpoint(height, &profile).await?;
+    let mut response = match format {
+        ResponseFormat::Capnp => binary_response(body, cache_control(height, &profile)),
+        ResponseFormat::Json => json_response(
+            serde_json::to_vec_pretty(&json_wire::checkpoint_to_json(&body, Some(&profile))?)?,
+            cache_control(height, &profile),
+        ),
+    };
+    add_checkpoint_headers(&mut response, height, &profile);
+    Ok(response)
+}
+
 async fn block_stats(
     State(state): State<AppState>,
     Path(height): Path<u64>,
@@ -300,10 +450,16 @@ async fn block_stats(
     Ok(Json(state.archive.block_stats(height).await?))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamProfile {
+    Full,
+    CutThrough,
+}
+
 async fn select_profile(
     archive: &Arc<dyn ArchiveBackend>,
     requested_scope: Option<ArchiveScope>,
-    cutthrough: bool,
+    stream: StreamProfile,
     start_or_height: Option<u64>,
 ) -> anyhow::Result<ServedProfile> {
     let scope = requested_scope.unwrap_or(ArchiveScope::P2trSp);
@@ -321,7 +477,7 @@ async fn select_profile(
             .join(", ")
     );
 
-    if !cutthrough {
+    if stream == StreamProfile::Full {
         return archive
             .resolve_profile(
                 None,
@@ -333,7 +489,7 @@ async fn select_profile(
             .await
             .map_err(|err| {
                 anyhow::anyhow!(
-                    "raw profile for scope {} is not available on this server: {err}",
+                    "full profile for scope {} is not available on this server: {err}",
                     scope.as_str()
                 )
             });
@@ -351,7 +507,7 @@ async fn select_profile(
     candidates.sort_by_key(|p| p.cutthrough_blocks);
     let selected = candidates.pop()
         .ok_or_else(|| anyhow::anyhow!(
-            "no cut-through profile for scope {} can serve start/height {}; try cutthrough=false or a lower start height",
+            "no cut-through profile for scope {} can serve start/height {}; use /blocks/light for the full stream or a lower start height",
             scope.as_str(),
             min_height
         ))?;
@@ -365,6 +521,35 @@ async fn select_profile(
             }),
         )
         .await
+}
+
+async fn ensure_cutthrough_height_allowed(
+    archive: &Arc<dyn ArchiveBackend>,
+    height: u64,
+    requested_scope: Option<ArchiveScope>,
+) -> ApiResult<()> {
+    let scope = requested_scope.unwrap_or(ArchiveScope::P2trSp);
+    let manifest = archive.manifest().await?;
+    let Some(full_profile) = manifest
+        .profiles
+        .iter()
+        .find(|p| p.scope == scope && p.cutthrough_blocks == 0)
+    else {
+        return Ok(());
+    };
+    let Some(tip) = &full_profile.tip else {
+        return Ok(());
+    };
+    let max_cutthrough_height = tip.height.saturating_sub(manifest.suggested_reorg_cache_depth);
+    if height > max_cutthrough_height {
+        return Err(ApiError::bad_request(format!(
+            "cut-through requests must end at or below height {max_cutthrough_height} for scope {}; full tip is {}, recent_full_depth is {}",
+            scope.as_str(),
+            tip.height,
+            manifest.suggested_reorg_cache_depth
+        )));
+    }
+    Ok(())
 }
 
 fn ensure_height_served(height: u64, profile: &ServedProfile) -> anyhow::Result<()> {
@@ -464,6 +649,14 @@ fn add_block_headers(
         HeaderValue::from_str(&profile.profile.cutthrough_blocks.to_string()).unwrap(),
     );
     response.headers_mut().insert(
+        HeaderName::from_static("x-bitcoindata-stream"),
+        HeaderValue::from_static(if profile.profile.cutthrough_blocks == 0 {
+            "full"
+        } else {
+            "cutthrough"
+        }),
+    );
+    response.headers_mut().insert(
         HeaderName::from_static("x-bitcoin-block-height"),
         HeaderValue::from_str(&height.to_string()).unwrap(),
     );
@@ -501,6 +694,14 @@ fn add_range_headers(
         HeaderValue::from_str(&profile.profile.cutthrough_blocks.to_string()).unwrap(),
     );
     response.headers_mut().insert(
+        HeaderName::from_static("x-bitcoindata-stream"),
+        HeaderValue::from_static(if profile.profile.cutthrough_blocks == 0 {
+            "full"
+        } else {
+            "cutthrough"
+        }),
+    );
+    response.headers_mut().insert(
         HeaderName::from_static("x-bitcoindata-range-start"),
         HeaderValue::from_str(&start.to_string()).unwrap(),
     );
@@ -530,5 +731,13 @@ fn add_checkpoint_headers(response: &mut Response, height: u64, profile: &Served
     response.headers_mut().insert(
         HeaderName::from_static("x-bitcoindata-cutthrough-blocks"),
         HeaderValue::from_str(&profile.profile.cutthrough_blocks.to_string()).unwrap(),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-bitcoindata-stream"),
+        HeaderValue::from_static(if profile.profile.cutthrough_blocks == 0 {
+            "full"
+        } else {
+            "cutthrough"
+        }),
     );
 }

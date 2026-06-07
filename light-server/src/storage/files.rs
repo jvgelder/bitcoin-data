@@ -26,8 +26,9 @@ pub struct Manifest {
     /// Depth after which server responses can be treated as practically immutable
     /// for caching. Payloads closer to tip remain replaceable on reorg.
     pub finality_depth: u64,
-    /// Suggested number of recent blocks clients should keep enough undo/cache
-    /// state for, so shallow reorgs can be handled without checkpoint fallback.
+    /// Suggested number of recent blocks wallet clients should sync from the full
+    /// endpoint and retain undo metadata for. This is not a requirement to cache
+    /// full payload bytes.
     pub suggested_reorg_cache_depth: u64,
     pub max_range_count: u32,
     pub profiles: Vec<ManifestProfile>,
