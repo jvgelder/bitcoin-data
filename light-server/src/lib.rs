@@ -12,6 +12,8 @@ pub mod p2tr_indexer;
 pub mod profile;
 pub mod range;
 pub mod server;
+pub mod script_classify;
+pub mod sp_tweak;
 pub mod storage;
 pub mod types;
 

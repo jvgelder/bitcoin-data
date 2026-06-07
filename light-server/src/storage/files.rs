@@ -23,6 +23,12 @@ pub struct Manifest {
     pub network: String,
     pub genesis_hash: Option<String>,
     pub checkpoint_interval: u64,
+    /// Depth after which server responses can be treated as practically immutable
+    /// for caching. Payloads closer to tip remain replaceable on reorg.
+    pub finality_depth: u64,
+    /// Suggested number of recent blocks clients should keep enough undo/cache
+    /// state for, so shallow reorgs can be handled without checkpoint fallback.
+    pub suggested_reorg_cache_depth: u64,
     pub max_range_count: u32,
     pub profiles: Vec<ManifestProfile>,
 }
