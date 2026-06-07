@@ -352,6 +352,11 @@ async fn run_command(
     }
 }
 
+const SQL_INSERT_CHUNK: usize = 64;
+
+// NOTE: one batch (batch_size blocks) is fetched, decoded, applied, and held in
+// RAM (applied structs + encoded payloads) before flushing to SQL and fetching
+// the next batch. Larger batch = fewer/larger inserts but more memory.
 #[allow(clippy::too_many_arguments)]
 async fn catch_up_ranges(
     archive: &SqliteArchive,
@@ -365,37 +370,129 @@ async fn catch_up_ranges(
 ) -> anyhow::Result<()> {
     let remaining = finalized_tip - start_height + 1;
     let count = usize::try_from(remaining.min(batch_size as u64))?;
-    let frames = source.get_block_range_by_height(start_height, count).await?;
 
+    // Stage 1: parallel fetch + decode (stateless).
+    let frames = source
+        .get_block_range_by_height(start_height, count)
+        .await?;
     if frames.is_empty() {
         anyhow::bail!("source returned an empty block range at height {start_height}");
     }
 
-    let first = frames.first().expect("non-empty frames");
-    let last = frames.last().expect("non-empty frames");
-    let total_bytes: usize = frames.iter().map(|frame| frame.bytes.len()).sum();
+    let mut decoded: Vec<BlockScanInput> = stream::iter(frames.iter())
+        .map(|frame| {
+            let height = frame.height;
+            let hash = frame.hash;
+            let bytes = frame.bytes.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    decode_block_frame(height, hash, bytes.as_ref())
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("decode worker failed: {e}"))?
+            }
+        })
+        .buffer_unordered(8)
+        .collect::<Vec<anyhow::Result<BlockScanInput>>>()
+        .await
+        .into_iter()
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    decoded.sort_by_key(|d| d.height);
 
+    let first_height = frames.first().expect("non-empty").height;
+    let last_frame = frames.last().expect("non-empty");
+    let last_height = last_frame.height;
+    let last_hash = last_frame.hash;
+    let total_bytes: usize = frames.iter().map(|f| f.bytes.len()).sum();
     println!(
         "fetched finalized range {}..={} count={} bytes={}",
-        first.height,
-        last.height,
-        frames.len(),
+        first_height,
+        last_height,
+        decoded.len(),
         total_bytes
     );
 
-    let mut tx = archive.pool().begin().await?;
-
-    for frame in &frames {
-        let scan = decode_block_frame(frame.height, frame.hash, frame.bytes.as_ref())?;
+    // Stage 2: serial, ordered apply (advances last_uid).
+    struct Pending {
+        applied: btc_data_light_server::p2tr_indexer::AppliedBlock,
+        payload: Vec<u8>,
+    }
+    let mut pending: Vec<Pending> = Vec::with_capacity(decoded.len());
+    for scan in decoded {
         let applied = state.apply_block_with_stats(scan, profile)?;
         let payload = to_packed_bytes(&encode_light_block(&applied.light_block)?)?;
-        write_applied_block(&mut tx, profile_id, &applied, &payload).await?;
+        pending.push(Pending { applied, payload });
     }
 
-    let checkpoint_height = last.height;
-    let checkpoint_hash = BlockHashBytes::from(last.hash);
+    // Stage 3: batched multi-row inserts in one transaction.
+    let mut tx = archive.pool().begin().await?;
+    for chunk in pending.chunks(SQL_INSERT_CHUNK) {
+        {
+            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "INSERT OR REPLACE INTO blocks \
+                 (height, block_hash, previous_block_hash, p2tr_created_count, p2tr_spent_count, anchor_last_uid) ",
+            );
+            qb.push_values(chunk, |mut b, p| {
+                let block = &p.applied.light_block;
+                let stats = &p.applied.stats;
+                b.push_bind(block.height as i64)
+                    .push_bind(block.block_hash.as_bytes().to_vec())
+                    .push_bind(block.previous_block_hash.as_bytes().to_vec())
+                    .push_bind(i64::from(stats.indexed_output_count))
+                    .push_bind(i64::from(stats.indexed_spent_count))
+                    .push_bind(block.block_anchor_last_uid as i64);
+            });
+            qb.build().execute(&mut *tx).await?;
+        }
+        {
+            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "INSERT OR REPLACE INTO block_stats \
+                 (height, tx_count, output_count_total, p2tr_output_count, p2tr_sp_candidate_count, \
+                  p2tr_nums_count, p2tr_reused_count, p2tr_excluded_by_scope_count, \
+                  indexed_output_count, indexed_spent_count, tx_with_p2tr_output_count, \
+                  tx_with_indexed_output_count, tweak_count) ",
+            );
+            qb.push_values(chunk, |mut b, p| {
+                let block = &p.applied.light_block;
+                let s = &p.applied.stats;
+                b.push_bind(block.height as i64)
+                    .push_bind(i64::from(s.tx_count))
+                    .push_bind(i64::from(s.output_count_total))
+                    .push_bind(i64::from(s.p2tr_output_count))
+                    .push_bind(i64::from(s.p2tr_sp_candidate_count))
+                    .push_bind(i64::from(s.p2tr_nums_count))
+                    .push_bind(i64::from(s.p2tr_reused_count))
+                    .push_bind(i64::from(s.p2tr_excluded_by_scope_count))
+                    .push_bind(i64::from(s.indexed_output_count))
+                    .push_bind(i64::from(s.indexed_spent_count))
+                    .push_bind(i64::from(s.tx_with_p2tr_output_count))
+                    .push_bind(i64::from(s.tx_with_indexed_output_count))
+                    .push_bind(i64::from(s.tweak_count));
+            });
+            qb.build().execute(&mut *tx).await?;
+        }
+        {
+            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "INSERT OR REPLACE INTO payload_cache \
+                 (profile_id, height, block_hash, payload, payload_len, created_at) ",
+            );
+            qb.push_values(chunk, |mut b, p| {
+                let block = &p.applied.light_block;
+                b.push_bind(profile_id)
+                    .push_bind(block.height as i64)
+                    .push_bind(block.block_hash.as_bytes().to_vec())
+                    .push_bind(p.payload.clone())
+                    .push_bind(p.payload.len() as i64)
+                    .push("unixepoch()");
+            });
+            qb.build().execute(&mut *tx).await?;
+        }
+    }
+
+    // checkpoint + profile tip: once per range.
+    let checkpoint_hash = BlockHashBytes::from(last_hash);
     let checkpoint = UidCheckpointInput {
-        height: checkpoint_height,
+        height: last_height,
         block_hash: checkpoint_hash,
         last_uid: state.last_uid(),
         profile,
@@ -431,8 +528,8 @@ async fn catch_up_ranges(
 
     println!(
         "indexed finalized range {}..={} last_uid={} live_uids={}",
-        first.height,
-        last.height,
+        first_height,
+        last_height,
         state.last_uid(),
         state.live_uids_sorted().len(),
     );
@@ -527,69 +624,6 @@ fn p2tr_xonly_output_key(script_bytes: &[u8]) -> Option<[u8; 32]> {
     let mut key = [0u8; 32];
     key.copy_from_slice(&script_bytes[2..34]);
     Some(key)
-}
-
-async fn write_applied_block(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    profile_id: i64,
-    applied: &btc_data_light_server::p2tr_indexer::AppliedBlock,
-    payload: &[u8],
-) -> anyhow::Result<()> {
-    let block = &applied.light_block;
-    let stats = &applied.stats;
-
-    sqlx::query(
-        r#"INSERT OR REPLACE INTO blocks
-           (height, block_hash, previous_block_hash, p2tr_created_count, p2tr_spent_count, anchor_last_uid)
-           VALUES (?, ?, ?, ?, ?, ?)"#,
-    )
-        .bind(i64::try_from(block.height)?)
-        .bind(block.block_hash.as_bytes().to_vec())
-        .bind(block.previous_block_hash.as_bytes().to_vec())
-        .bind(i64::from(stats.indexed_output_count))
-        .bind(i64::from(stats.indexed_spent_count))
-        .bind(i64::try_from(block.block_anchor_last_uid)?)
-        .execute(&mut **tx)
-        .await?;
-
-    sqlx::query(
-        r#"INSERT OR REPLACE INTO block_stats
-           (height, tx_count, output_count_total, p2tr_output_count, p2tr_sp_candidate_count,
-            p2tr_nums_count, p2tr_reused_count, p2tr_excluded_by_scope_count,
-            indexed_output_count, indexed_spent_count, tx_with_p2tr_output_count,
-            tx_with_indexed_output_count, tweak_count)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
-    )
-        .bind(i64::try_from(block.height)?)
-        .bind(i64::from(stats.tx_count))
-        .bind(i64::from(stats.output_count_total))
-        .bind(i64::from(stats.p2tr_output_count))
-        .bind(i64::from(stats.p2tr_sp_candidate_count))
-        .bind(i64::from(stats.p2tr_nums_count))
-        .bind(i64::from(stats.p2tr_reused_count))
-        .bind(i64::from(stats.p2tr_excluded_by_scope_count))
-        .bind(i64::from(stats.indexed_output_count))
-        .bind(i64::from(stats.indexed_spent_count))
-        .bind(i64::from(stats.tx_with_p2tr_output_count))
-        .bind(i64::from(stats.tx_with_indexed_output_count))
-        .bind(i64::from(stats.tweak_count))
-        .execute(&mut **tx)
-        .await?;
-
-    sqlx::query(
-        r#"INSERT OR REPLACE INTO payload_cache
-           (profile_id, height, block_hash, payload, payload_len, created_at)
-           VALUES (?, ?, ?, ?, ?, unixepoch())"#,
-    )
-        .bind(profile_id)
-        .bind(i64::try_from(block.height)?)
-        .bind(block.block_hash.as_bytes().to_vec())
-        .bind(payload.to_vec())
-        .bind(i64::try_from(payload.len())?)
-        .execute(&mut **tx)
-        .await?;
-
-    Ok(())
 }
 
 async fn source_tip_command(source: SourceCli) -> anyhow::Result<()> {
