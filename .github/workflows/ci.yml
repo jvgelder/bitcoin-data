@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    container: rust:stable
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add rustfmt
+      - run: cargo fmt --all -- --check
+
+  build-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    container: rust:stable
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: apt-get update && apt-get install -y capnproto libcapnp-dev
+
+      - run: rustup component add clippy
+
+      # Restore on every run; save only on main to keep PRs from polluting the
+      # shared cache. Key invalidates when Cargo.lock changes.
+      - name: Restore cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Save cache
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+  smoke:
+    name: Smoke
+    runs-on: ubuntu-latest
+    container: rust:stable
+    needs: build-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: apt-get update && apt-get install -y capnproto libcapnp-dev
+
+      - name: Restore cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Smoke: run with no source; expect graceful non-zero exit, no panic, and
+      # the expected error. Binary/string verified against main.rs.
+      - name: Run smoke test
+        shell: bash
+        run: |
+          cargo build --bin btc-data-stats --locked
+          set +e
+          OUT=$(cargo run --quiet --bin btc-data-stats -- 2>&1)
+          CODE=$?
+          set -e
+          echo "exit=$CODE"
+          echo "$OUT"
+          if [ "$CODE" -eq 0 ]; then
+            echo "::error::expected non-zero exit when no source supplied"; exit 1
+          fi
+          if echo "$OUT" | grep -qi "panicked"; then
+            echo "::error::binary panicked instead of clean error"; exit 1
+          fi
+          if ! echo "$OUT" | grep -qi "supply at least one"; then
+            echo "::error::missing expected error message"; exit 1
+          fi
+          echo "smoke ok"
