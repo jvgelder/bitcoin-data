@@ -78,14 +78,30 @@ impl ScriptType {
 
 /// Classify a `script_pubkey` into a [`ScriptType`].
 pub fn classify_script(script: &Script) -> ScriptType {
-    if is_p2a(script) { return ScriptType::P2a; }
-    if script.is_p2tr() { return ScriptType::P2tr; }
-    if script.is_p2wpkh() { return ScriptType::P2wpkh; }
-    if script.is_p2wsh() { return ScriptType::P2wsh; }
-    if script.is_p2sh() { return ScriptType::P2sh; }
-    if script.is_p2pkh() { return ScriptType::P2pkh; }
-    if script.is_p2pk() { return ScriptType::P2pk; }
-    if script.is_op_return() { return ScriptType::OpReturn; }
+    if is_p2a(script) {
+        return ScriptType::P2a;
+    }
+    if script.is_p2tr() {
+        return ScriptType::P2tr;
+    }
+    if script.is_p2wpkh() {
+        return ScriptType::P2wpkh;
+    }
+    if script.is_p2wsh() {
+        return ScriptType::P2wsh;
+    }
+    if script.is_p2sh() {
+        return ScriptType::P2sh;
+    }
+    if script.is_p2pkh() {
+        return ScriptType::P2pkh;
+    }
+    if script.is_p2pk() {
+        return ScriptType::P2pk;
+    }
+    if script.is_op_return() {
+        return ScriptType::OpReturn;
+    }
     ScriptType::Unknown
 }
 

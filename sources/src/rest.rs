@@ -13,8 +13,10 @@
 //! decoding of the full block body.
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use btc_data_core::block::RawBlockFrame;
 use btc_data_core::source::BlockSource;
+use bytes::Bytes;
+use futures::{stream, StreamExt};
 use serde::Deserialize;
 
 pub struct RestSource {
@@ -108,14 +110,22 @@ impl BlockSource for RestSource {
         self.get_bytes(&format!("/rest/block/{hash_hex}.bin")).await
     }
 
-
-    async fn get_block_by_height(&self, height: u64) -> anyhow::Result<btc_data_core::block::RawBlockFrame> {
+    async fn get_block_by_height(
+        &self,
+        height: u64,
+    ) -> anyhow::Result<btc_data_core::block::RawBlockFrame> {
         let hash = self.get_block_hash(height).await?;
         let mut display = hash;
         display.reverse();
         let hash_hex = hex::encode(display);
-        let bytes = self.get_bytes(&format!("/rest/block/{hash_hex}.bin")).await?;
-        Ok(btc_data_core::block::RawBlockFrame { height, hash, bytes })
+        let bytes = self
+            .get_bytes(&format!("/rest/block/{hash_hex}.bin"))
+            .await?;
+        Ok(btc_data_core::block::RawBlockFrame {
+            height,
+            hash,
+            bytes,
+        })
     }
 
     async fn get_best_height(&self) -> anyhow::Result<u64> {

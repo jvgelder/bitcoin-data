@@ -60,7 +60,10 @@ pub struct JsonOutputRef {
     pub output_id: String,
 }
 
-pub fn light_block_to_json(bytes: &[u8], profile: Option<&ServedProfile>) -> anyhow::Result<JsonLightBlock> {
+pub fn light_block_to_json(
+    bytes: &[u8],
+    profile: Option<&ServedProfile>,
+) -> anyhow::Result<JsonLightBlock> {
     let mut cursor = Cursor::new(bytes);
     let message = capnp::serialize_packed::read_message(&mut cursor, ReaderOptions::new())?;
     let block = message.get_root::<light_block::Reader>()?;
@@ -86,15 +89,23 @@ pub fn light_block_to_json(bytes: &[u8], profile: Option<&ServedProfile>) -> any
         });
     }
 
-    let tweak_indexes = decode_tx_tweak_indexes(block.get_tx_tweak_indexes()?, block.get_tweak_count() as usize)?;
+    let tweak_indexes = decode_tx_tweak_indexes(
+        block.get_tx_tweak_indexes()?,
+        block.get_tweak_count() as usize,
+    )?;
     let tweak_bytes = block.get_tx_tweaks()?;
-    anyhow::ensure!(tweak_bytes.len() == tweak_indexes.len() * crate::types::TxTweak::LEN, "tx tweak byte length mismatch");
+    anyhow::ensure!(
+        tweak_bytes.len() == tweak_indexes.len() * crate::types::TxTweak::LEN,
+        "tx tweak byte length mismatch"
+    );
     let tweaks = tweak_indexes
         .into_iter()
         .enumerate()
         .map(|(i, tx_index)| JsonTxTweak {
             tx_index,
-            tweak: hex::encode(&tweak_bytes[i * crate::types::TxTweak::LEN..(i + 1) * crate::types::TxTweak::LEN]),
+            tweak: hex::encode(
+                &tweak_bytes[i * crate::types::TxTweak::LEN..(i + 1) * crate::types::TxTweak::LEN],
+            ),
         })
         .collect();
 
@@ -119,7 +130,10 @@ pub fn light_block_to_json(bytes: &[u8], profile: Option<&ServedProfile>) -> any
     })
 }
 
-pub fn checkpoint_to_json(bytes: &[u8], profile: Option<&ServedProfile>) -> anyhow::Result<JsonUidCheckpoint> {
+pub fn checkpoint_to_json(
+    bytes: &[u8],
+    profile: Option<&ServedProfile>,
+) -> anyhow::Result<JsonUidCheckpoint> {
     let mut cursor = Cursor::new(bytes);
     let message = capnp::serialize_packed::read_message(&mut cursor, ReaderOptions::new())?;
     let checkpoint = message.get_root::<uid_checkpoint::Reader>()?;
@@ -148,7 +162,9 @@ fn decode_first_plus_one_deltas(values: &[u64]) -> anyhow::Result<Vec<u64>> {
     let mut out = Vec::with_capacity(values.len());
     out.push(first);
     for delta in &values[1..] {
-        let next = out.last().unwrap()
+        let next = out
+            .last()
+            .unwrap()
             .checked_add(*delta)
             .ok_or_else(|| anyhow::anyhow!("UID delta overflow"))?;
         out.push(next);

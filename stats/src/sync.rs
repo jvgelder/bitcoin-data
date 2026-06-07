@@ -29,7 +29,9 @@ pub trait DurableStatsStore: Send + Sync {
     async fn rollback_to_height(&self, height: u64) -> anyhow::Result<()>;
 
     /// Flush pending batches, if the backend buffers writes.
-    async fn flush(&self) -> anyhow::Result<()> { Ok(()) }
+    async fn flush(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Planned SQLite backend.

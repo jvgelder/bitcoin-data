@@ -6,22 +6,24 @@
 //! Used by the `btc-data-stats` binary; can also be embedded in tests or
 //! other tools.
 
-use crate::checkpoint::{self, CheckpointConfig, CheckpointWriter, StatsCheckpoint, CHECKPOINT_FORMAT_VERSION};
+use crate::checkpoint::{
+    self, CheckpointConfig, CheckpointWriter, StatsCheckpoint, CHECKPOINT_FORMAT_VERSION,
+};
+use crate::script::{classify_script, ScriptType};
 use crate::sinks::StatsSink;
 use crate::{
     classify_p2tr_spend, BlockStats, PerBlock, RollingUtxoHash, SpendContext, SpendPath, Stats,
 };
+use ahash::RandomState;
 use bitcoin::Script;
 use btc_data_core::block::RawBlockFrame;
 use btc_data_core::parse::{decode_raw_block, DecodedBlockFrame};
 use btc_data_core::source::BlockSource;
 use futures::{stream, StreamExt};
-use ahash::RandomState;
 use hashbrown::{HashMap, HashSet};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use serde::{Deserialize, Serialize};
-use crate::script::{classify_script, ScriptType};
 
 /// Fast internal hash map for scanner state.
 ///
@@ -70,7 +72,6 @@ impl Default for ScanConfig {
     }
 }
 
-
 #[derive(Debug, Default, Clone, Copy)]
 struct PrepareMetrics {
     txid_compute: Duration,
@@ -82,8 +83,12 @@ impl PrepareMetrics {
     fn saturating_delta(self, previous: Self) -> Self {
         Self {
             txid_compute: self.txid_compute.saturating_sub(previous.txid_compute),
-            output_classify: self.output_classify.saturating_sub(previous.output_classify),
-            p2tr_spend_classify: self.p2tr_spend_classify.saturating_sub(previous.p2tr_spend_classify),
+            output_classify: self
+                .output_classify
+                .saturating_sub(previous.output_classify),
+            p2tr_spend_classify: self
+                .p2tr_spend_classify
+                .saturating_sub(previous.p2tr_spend_classify),
         }
     }
 }
@@ -188,17 +193,18 @@ async fn prepare_raw_block_blocking(frame: RawBlockFrame) -> anyhow::Result<Prep
         .map_err(|err| anyhow::anyhow!("prepare worker task failed: {err}"))?
 }
 
-async fn prepare_raw_blocks_blocking(frames: Vec<RawBlockFrame>) -> anyhow::Result<Vec<PreparedBlockFrame>> {
+async fn prepare_raw_blocks_blocking(
+    frames: Vec<RawBlockFrame>,
+) -> anyhow::Result<Vec<PreparedBlockFrame>> {
     tokio::task::spawn_blocking(move || {
         frames
             .into_iter()
             .map(prepare_raw_block)
             .collect::<anyhow::Result<Vec<_>>>()
     })
-        .await
-        .map_err(|err| anyhow::anyhow!("prepare batch worker task failed: {err}"))?
+    .await
+    .map_err(|err| anyhow::anyhow!("prepare batch worker task failed: {err}"))?
 }
-
 
 #[derive(Debug, Default, Clone, Copy)]
 struct ProcessMetrics {
@@ -217,10 +223,16 @@ impl ProcessMetrics {
     fn saturating_delta(self, previous: Self) -> Self {
         Self {
             input_remove: self.input_remove.saturating_sub(previous.input_remove),
-            input_accounting: self.input_accounting.saturating_sub(previous.input_accounting),
+            input_accounting: self
+                .input_accounting
+                .saturating_sub(previous.input_accounting),
             p2tr_spend: self.p2tr_spend.saturating_sub(previous.p2tr_spend),
-            output_classify: self.output_classify.saturating_sub(previous.output_classify),
-            output_accounting: self.output_accounting.saturating_sub(previous.output_accounting),
+            output_classify: self
+                .output_classify
+                .saturating_sub(previous.output_classify),
+            output_accounting: self
+                .output_accounting
+                .saturating_sub(previous.output_accounting),
             seen_keys: self.seen_keys.saturating_sub(previous.seen_keys),
             utxo_insert: self.utxo_insert.saturating_sub(previous.utxo_insert),
             utxo_hash: self.utxo_hash.saturating_sub(previous.utxo_hash),
@@ -260,20 +272,38 @@ struct ScanMetrics {
 }
 
 impl ScanMetrics {
-    fn add_fetch_wait(&mut self, dt: Duration) { self.fetch_wait += dt; }
-    fn add_process(&mut self, dt: Duration) { self.process += dt; }
-    fn add_sink(&mut self, dt: Duration) { self.sink += dt; }
-    fn add_checkpoint(&mut self, dt: Duration) { self.checkpoint += dt; }
+    fn add_fetch_wait(&mut self, dt: Duration) {
+        self.fetch_wait += dt;
+    }
+    fn add_process(&mut self, dt: Duration) {
+        self.process += dt;
+    }
+    fn add_sink(&mut self, dt: Duration) {
+        self.sink += dt;
+    }
+    fn add_checkpoint(&mut self, dt: Duration) {
+        self.checkpoint += dt;
+    }
 
-    fn print_progress(&mut self, elapsed: Duration, state: &StatsScannerState, height: u64, scan_start: u64) {
+    fn print_progress(
+        &mut self,
+        elapsed: Duration,
+        state: &StatsScannerState,
+        height: u64,
+        scan_start: u64,
+    ) {
         let bps = (height - scan_start) as f64 / elapsed.as_secs_f64().max(0.001);
         let interval_blocks = self.blocks.saturating_sub(self.last_report_blocks).max(1);
         let fetch_delta = self.fetch_wait.saturating_sub(self.last_report_fetch_wait);
         let process_delta = self.process.saturating_sub(self.last_report_process);
         let sink_delta = self.sink.saturating_sub(self.last_report_sink);
         let checkpoint_delta = self.checkpoint.saturating_sub(self.last_report_checkpoint);
-        let detail_delta = self.process_detail.saturating_delta(self.last_report_process_detail);
-        let prepare_delta = self.prepare_detail.saturating_delta(self.last_report_prepare_detail);
+        let detail_delta = self
+            .process_detail
+            .saturating_delta(self.last_report_process_detail);
+        let prepare_delta = self
+            .prepare_detail
+            .saturating_delta(self.last_report_prepare_detail);
         let other_process = process_delta.saturating_sub(detail_delta.total_accounted());
 
         eprintln!(
@@ -368,7 +398,9 @@ impl UtxoEntry {
 
     fn new(id: u64, script_type: ScriptType) -> Self {
         debug_assert!(id <= Self::MAX_ID, "UTXO id too large to pack");
-        Self { packed: (id << Self::SCRIPT_TYPE_BITS) | u64::from(script_type.to_u8()) }
+        Self {
+            packed: (id << Self::SCRIPT_TYPE_BITS) | u64::from(script_type.to_u8()),
+        }
     }
 
     fn id(self) -> u64 {
@@ -378,7 +410,6 @@ impl UtxoEntry {
     fn script_type(self) -> ScriptType {
         ScriptType::from_u8((self.packed & Self::SCRIPT_TYPE_MASK) as u8)
     }
-
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -408,7 +439,8 @@ impl StatsScannerState {
             self.utxo.reserve(utxo_reserve - self.utxo.capacity());
         }
         if seen_keys_reserve > self.seen_keys.capacity() {
-            self.seen_keys.reserve(seen_keys_reserve - self.seen_keys.capacity());
+            self.seen_keys
+                .reserve(seen_keys_reserve - self.seen_keys.capacity());
         }
     }
 }
@@ -438,20 +470,19 @@ async fn fetch_and_prepare_batch(
     // Fallback path: per-height fetch, concurrent via buffer_unordered, then
     // each block stateless-prepared as it arrives. Used by IPC and any source
     // without a native range API.
-    let mut prepared: Vec<PreparedBlockFrame> =
-        stream::iter(start_height..(start_height + count))
-            .map(|height| {
-                let source = source.clone();
-                async move {
-                    let raw = source.get_block_by_height(height).await?;
-                    prepare_raw_block_blocking(raw).await
-                }
-            })
-            .buffer_unordered(in_flight)
-            .collect::<Vec<anyhow::Result<PreparedBlockFrame>>>()
-            .await
-            .into_iter()
-            .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut prepared: Vec<PreparedBlockFrame> = stream::iter(start_height..(start_height + count))
+        .map(|height| {
+            let source = source.clone();
+            async move {
+                let raw = source.get_block_by_height(height).await?;
+                prepare_raw_block_blocking(raw).await
+            }
+        })
+        .buffer_unordered(in_flight)
+        .collect::<Vec<anyhow::Result<PreparedBlockFrame>>>()
+        .await
+        .into_iter()
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     prepared.sort_by_key(|f| f.height);
     Ok(prepared)
@@ -471,7 +502,10 @@ pub async fn scan(
 
     let requested_end = cfg.start.saturating_add(cfg.blocks.saturating_sub(1));
     if safe_height < cfg.start {
-        eprintln!("No finalized blocks to scan: start={} safe_height={safe_height}", cfg.start);
+        eprintln!(
+            "No finalized blocks to scan: start={} safe_height={safe_height}",
+            cfg.start
+        );
         return Ok(Stats::new());
     }
 
@@ -535,7 +569,8 @@ pub async fn scan(
 
         // ---- Stage 1+2: parallel fetch + stateless stats, joined in order ----
         let fetch_t = Instant::now();
-        let batch = fetch_and_prepare_batch(source.clone(), next_height, this_count, in_flight).await?;
+        let batch =
+            fetch_and_prepare_batch(source.clone(), next_height, this_count, in_flight).await?;
         metrics.add_fetch_wait(fetch_t.elapsed());
 
         // ---- Stage 3: serial, ordered UTXO state commit ----
@@ -584,7 +619,8 @@ pub async fn scan(
                                 per_block.record_spend_uid(prev_id, is_p2tr_spend);
                                 state.stats.record_input_script(prev_script_type);
                                 per_block.record_input_script(prev_script_type);
-                                metrics.process_detail.input_accounting += input_accounting_t.elapsed();
+                                metrics.process_detail.input_accounting +=
+                                    input_accounting_t.elapsed();
 
                                 if is_p2tr_spend {
                                     p2tr_input_seen = true;
@@ -607,7 +643,8 @@ pub async fn scan(
                                 let input_accounting_t = Instant::now();
                                 has_non_p2tr_input = true;
                                 state.missing += 1;
-                                metrics.process_detail.input_accounting += input_accounting_t.elapsed();
+                                metrics.process_detail.input_accounting +=
+                                    input_accounting_t.elapsed();
                             }
                         }
                     }
@@ -646,7 +683,9 @@ pub async fn scan(
                     per_block.record_output_script(script_type);
                     if is_p2tr {
                         state.stats.p2tr_outputs += 1;
-                        if reused { state.stats.p2tr_reused += 1; }
+                        if reused {
+                            state.stats.p2tr_reused += 1;
+                        }
                     }
                     per_block.record_output(is_p2tr, reused);
 
@@ -656,9 +695,14 @@ pub async fn scan(
                     }
                     metrics.process_detail.output_accounting += output_accounting_t.elapsed();
 
-                    let op = bitcoin::OutPoint { txid, vout: vout_idx as u32 };
+                    let op = bitcoin::OutPoint {
+                        txid,
+                        vout: vout_idx as u32,
+                    };
                     let utxo_insert_t = Instant::now();
-                    state.utxo.insert(op, UtxoEntry::new(state.last_id, script_type));
+                    state
+                        .utxo
+                        .insert(op, UtxoEntry::new(state.last_id, script_type));
                     metrics.process_detail.utxo_insert += utxo_insert_t.elapsed();
 
                     let utxo_hash_t = Instant::now();
@@ -722,14 +766,16 @@ pub async fn scan(
     metrics.add_sink(sink_t.elapsed());
 
     if state.missing > 0 {
-        eprintln!("\nNote: {} inputs referenced pre-scan outputs.", state.missing);
+        eprintln!(
+            "\nNote: {} inputs referenced pre-scan outputs.",
+            state.missing
+        );
     }
     eprintln!("Scan loop: {:.1}s", t1.elapsed().as_secs_f64());
     metrics.print_summary(t1.elapsed());
 
     Ok(state.stats)
 }
-
 
 fn make_checkpoint(
     cfg: &ScanConfig,
@@ -749,8 +795,6 @@ fn make_checkpoint(
         scanner_state: state.clone(),
     }
 }
-
-
 
 async fn restore_newest_valid_checkpoint(
     source: &Arc<dyn BlockSource>,
@@ -778,7 +822,10 @@ async fn restore_newest_valid_checkpoint(
             continue;
         }
         if checkpoint.utxo_hash_window != cfg.utxo_hash_window {
-            eprintln!("Skipping checkpoint {}: scanner config differs", path.display());
+            eprintln!(
+                "Skipping checkpoint {}: scanner config differs",
+                path.display()
+            );
             continue;
         }
         let canonical_hash = source.get_block_hash(checkpoint.height).await?;

@@ -17,16 +17,19 @@ pub fn parse_range(bytes: &[u8]) -> anyhow::Result<Vec<&[u8]>> {
     anyhow::ensure!(bytes.len() >= 10, "range frame too short");
     anyhow::ensure!(&bytes[0..4] == RANGE_MAGIC, "bad range magic");
     let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-    anyhow::ensure!(version == RANGE_VERSION, "unsupported range version: {version}");
+    anyhow::ensure!(
+        version == RANGE_VERSION,
+        "unsupported range version: {version}"
+    );
     let count = u32::from_le_bytes(bytes[6..10].try_into().unwrap()) as usize;
     let mut pos = 10usize;
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         anyhow::ensure!(pos + 4 <= bytes.len(), "truncated range item length");
-        let len = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
         anyhow::ensure!(pos + len <= bytes.len(), "truncated range item body");
-        out.push(&bytes[pos..pos+len]);
+        out.push(&bytes[pos..pos + len]);
         pos += len;
     }
     Ok(out)

@@ -75,17 +75,21 @@ impl BitcoinRpc {
             method,
             params,
         };
-        let resp: Resp<R> = self.client
+        let resp: Resp<R> = self
+            .client
             .post(&self.url)
             .basic_auth(&self.user, Some(&self.pass))
             .json(&body)
-            .send().await?
-            .json().await?;
+            .send()
+            .await?
+            .json()
+            .await?;
 
         if let Some(e) = resp.error {
             anyhow::bail!("RPC {} error {}: {}", method, e.code, e.message);
         }
-        resp.result.ok_or_else(|| anyhow::anyhow!("empty RPC result"))
+        resp.result
+            .ok_or_else(|| anyhow::anyhow!("empty RPC result"))
     }
 
     async fn batch_call<R>(&self, requests: Vec<BatchReq>) -> anyhow::Result<Vec<R>>
@@ -97,17 +101,18 @@ impl BitcoinRpc {
         }
 
         let ordered_ids = requests.iter().map(|r| r.id).collect::<Vec<_>>();
-        let responses: Vec<BatchResp<R>> = self.client
+        let responses: Vec<BatchResp<R>> = self
+            .client
             .post(&self.url)
             .basic_auth(&self.user, Some(&self.pass))
             .json(&requests)
-            .send().await?
-            .json().await?;
+            .send()
+            .await?
+            .json()
+            .await?;
 
-        let mut by_id: HashMap<u64, BatchResp<R>> = responses
-            .into_iter()
-            .map(|resp| (resp.id, resp))
-            .collect();
+        let mut by_id: HashMap<u64, BatchResp<R>> =
+            responses.into_iter().map(|resp| (resp.id, resp)).collect();
 
         let mut out = Vec::with_capacity(ordered_ids.len());
         for id in ordered_ids {
@@ -117,7 +122,10 @@ impl BitcoinRpc {
             if let Some(e) = resp.error {
                 anyhow::bail!("RPC batch id={} error {}: {}", id, e.code, e.message);
             }
-            out.push(resp.result.ok_or_else(|| anyhow::anyhow!("empty RPC batch result id={id}"))?);
+            out.push(
+                resp.result
+                    .ok_or_else(|| anyhow::anyhow!("empty RPC batch result id={id}"))?,
+            );
         }
         Ok(out)
     }
@@ -126,7 +134,11 @@ impl BitcoinRpc {
         self.call("getblockhash", serde_json::json!([height])).await
     }
 
-    pub async fn get_block_hashes(&self, start_height: u64, count: usize) -> anyhow::Result<Vec<String>> {
+    pub async fn get_block_hashes(
+        &self,
+        start_height: u64,
+        count: usize,
+    ) -> anyhow::Result<Vec<String>> {
         let requests = (0..count)
             .map(|offset| BatchReq {
                 jsonrpc: "2.0",
@@ -144,7 +156,9 @@ impl BitcoinRpc {
 
     /// Fetch raw consensus-encoded block bytes by hex hash (verbosity=0).
     pub async fn get_block_raw_hex(&self, hash_hex: &str) -> anyhow::Result<Vec<u8>> {
-        let hex_str: String = self.call("getblock", serde_json::json!([hash_hex, 0])).await?;
+        let hex_str: String = self
+            .call("getblock", serde_json::json!([hash_hex, 0]))
+            .await?;
         Ok(hex::decode(&hex_str)?)
     }
 

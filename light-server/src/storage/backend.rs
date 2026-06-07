@@ -1,5 +1,5 @@
-use crate::storage::{ChainTip, Manifest};
 use crate::profile::Profile;
+use crate::storage::{ChainTip, Manifest};
 use async_trait::async_trait;
 
 #[derive(Debug, Clone)]
@@ -25,13 +25,30 @@ pub trait ArchiveBackend: Send + Sync {
 
     async fn tip(&self, profile: &ServedProfile) -> anyhow::Result<Option<ChainTip>>;
 
-    async fn read_block(&self, height: u64, profile: &ServedProfile) -> anyhow::Result<(Vec<u8>, Vec<u8>)>;
+    async fn read_block(
+        &self,
+        height: u64,
+        profile: &ServedProfile,
+    ) -> anyhow::Result<(Vec<u8>, Vec<u8>)>;
 
-    async fn read_blocks(&self, start: u64, count: u32, profile: &ServedProfile) -> anyhow::Result<Vec<Vec<u8>>>;
+    async fn read_blocks(
+        &self,
+        start: u64,
+        count: u32,
+        profile: &ServedProfile,
+    ) -> anyhow::Result<Vec<Vec<u8>>>;
 
-    async fn read_checkpoint(&self, height: u64, profile: &ServedProfile) -> anyhow::Result<Vec<u8>>;
+    async fn read_checkpoint(
+        &self,
+        height: u64,
+        profile: &ServedProfile,
+    ) -> anyhow::Result<Vec<u8>>;
 
-    async fn latest_checkpoint_height(&self, height_lte: u64, profile: &ServedProfile) -> anyhow::Result<Option<u64>>;
+    async fn latest_checkpoint_height(
+        &self,
+        height_lte: u64,
+        profile: &ServedProfile,
+    ) -> anyhow::Result<Option<u64>>;
 
     async fn block_stats(&self, height: u64) -> anyhow::Result<serde_json::Value>;
 }

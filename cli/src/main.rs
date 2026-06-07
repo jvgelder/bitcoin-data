@@ -9,9 +9,9 @@
 
 use btc_data_core::pipeline;
 use btc_data_core::source::BlockSource;
-use btc_data_sources::{EsploraSource, MultiSource, RestSource, RpcSource};
 #[cfg(feature = "ipc")]
 use btc_data_sources::IpcSource;
+use btc_data_sources::{EsploraSource, MultiSource, RestSource, RpcSource};
 use clap::Parser;
 use futures::StreamExt;
 use std::path::PathBuf;
@@ -19,7 +19,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Parser)]
-#[command(name = "btc-data", about = "Fetch Bitcoin blocks and emit events", version)]
+#[command(
+    name = "btc-data",
+    about = "Fetch Bitcoin blocks and emit events",
+    version
+)]
 struct Cli {
     /// bitcoind JSON-RPC URL. Repeatable.
     #[arg(long = "rpc-url")]
@@ -44,7 +48,11 @@ struct Cli {
     #[arg(long = "ipc")]
     ipc_paths: Vec<String>,
     /// Number of Bitcoin Core IPC worker Thread clients to create per IPC socket.
-    #[arg(long = "ipc-threads", env = "BTC_DATA_IPC_THREADS", default_value_t = 8)]
+    #[arg(
+        long = "ipc-threads",
+        env = "BTC_DATA_IPC_THREADS",
+        default_value_t = 8
+    )]
     ipc_threads: usize,
 
     #[arg(long, default_value_t = 709_632)]
@@ -70,9 +78,7 @@ async fn main() -> anyhow::Result<()> {
 
     eprintln!(
         "Fetch {} blocks (in-flight={}, source-batch-size={})...",
-        args.blocks,
-        args.buffer,
-        args.source_batch_size
+        args.blocks, args.buffer, args.source_batch_size
     );
     let t1 = Instant::now();
     let mut stream = pipeline::raw_block_stream_by_height_batched(
@@ -89,14 +95,16 @@ async fn main() -> anyhow::Result<()> {
         count += 1;
         bytes += frame.bytes.len() as u64;
         // TODO: emit to sinks (capnp IPC, kafka, websocket, ...).
-        if args.progress > 0 && count % args.progress == 0 {
+        if args.progress > 0 && count.is_multiple_of(args.progress) {
             let bps = count as f64 / t1.elapsed().as_secs_f64().max(0.001);
             eprintln!("  fetched={count:>6} bytes={bytes:>12} {bps:>5.1} blk/s");
         }
     }
     eprintln!(
         "Done: {} blocks, {} bytes in {:.1}s",
-        count, bytes, t1.elapsed().as_secs_f64()
+        count,
+        bytes,
+        t1.elapsed().as_secs_f64()
     );
     Ok(())
 }
@@ -124,7 +132,10 @@ fn build_source(args: &Cli) -> anyhow::Result<Arc<dyn BlockSource>> {
     #[cfg(feature = "ipc")]
     {
         for path in &args.ipc_paths {
-            srcs.push(Box::new(IpcSource::connect_with_threads(path.clone(), args.ipc_threads)?));
+            srcs.push(Box::new(IpcSource::connect_with_threads(
+                path.clone(),
+                args.ipc_threads,
+            )?));
         }
     }
 

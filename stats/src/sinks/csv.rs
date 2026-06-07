@@ -39,17 +39,31 @@ pub struct StatsCsvSink {
 impl StatsCsvSink {
     pub async fn create(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new().create(true).write(true).truncate(true).open(&path).await?;
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .await?;
         let mut w = BufWriter::new(file);
         w.write_all(BLOCK_STATS_HEADER.as_bytes()).await?;
         w.write_all(b"\n").await?;
         let name = format!("csv:{}", path.display());
-        Ok(Self { path, name, inner: Mutex::new(w) })
+        Ok(Self {
+            path,
+            name,
+            inner: Mutex::new(w),
+        })
     }
 
     pub async fn append(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new().create(true).append(true).read(true).open(&path).await?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&path)
+            .await?;
         let len = file.metadata().await?.len();
         let mut w = BufWriter::new(file);
         if len == 0 {
@@ -57,10 +71,16 @@ impl StatsCsvSink {
             w.write_all(b"\n").await?;
         }
         let name = format!("csv:{}", path.display());
-        Ok(Self { path, name, inner: Mutex::new(w) })
+        Ok(Self {
+            path,
+            name,
+            inner: Mutex::new(w),
+        })
     }
 
-    pub fn path(&self) -> &Path { &self.path }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 #[async_trait]
@@ -134,7 +154,9 @@ impl StatsSink for StatsCsvSink {
         Ok(())
     }
 
-    fn name(&self) -> &str { &self.name }
+    fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 async fn rollback_csv_to_height(path: &Path, height: u64) -> anyhow::Result<()> {
@@ -151,8 +173,12 @@ async fn rollback_csv_to_height(path: &Path, height: u64) -> anyhow::Result<()> 
             out.push('\n');
             continue;
         }
-        let Some(first) = line.split(',').next() else { continue; };
-        let Ok(row_height) = first.parse::<u64>() else { continue; };
+        let Some(first) = line.split(',').next() else {
+            continue;
+        };
+        let Ok(row_height) = first.parse::<u64>() else {
+            continue;
+        };
         if row_height <= height {
             out.push_str(line);
             out.push('\n');

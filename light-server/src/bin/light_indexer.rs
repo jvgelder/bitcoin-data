@@ -1,3 +1,6 @@
+use bitcoin::consensus::encode::deserialize;
+use bitcoin::hashes::Hash as BitcoinHash;
+use bitcoin::Block;
 use btc_data_core::source::{BlockSource, TipWatcher};
 use btc_data_light_server::index::{
     encode_light_block, encode_uid_checkpoint, to_packed_bytes, UidCheckpointInput,
@@ -12,10 +15,8 @@ use btc_data_light_server::storage::{
 };
 use btc_data_light_server::types::{BlockHashBytes, TxTweak, TxidBytes};
 use btc_data_sources::{IpcSource, PollingTipWatcher, RestSource};
-use bitcoin::consensus::encode::deserialize;
-use bitcoin::hashes::Hash as BitcoinHash;
-use bitcoin::Block;
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use futures::{stream, StreamExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -88,10 +89,8 @@ impl SourceCli {
             anyhow::anyhow!("--ipc-socket is required when --source ipc is selected")
         })?;
 
-        let source: Arc<IpcSource> = Arc::new(IpcSource::connect_with_threads(
-            socket,
-            self.ipc_threads,
-        )?);
+        let source: Arc<IpcSource> =
+            Arc::new(IpcSource::connect_with_threads(socket, self.ipc_threads)?);
 
         Ok(SourceBundle {
             source: source.clone(),
@@ -249,7 +248,7 @@ async fn main() -> anyhow::Result<()> {
                 catchup_batch_size,
                 once,
             )
-                .await
+            .await
         }
 
         Command::SourceTip { source } => source_tip_command(source).await,
@@ -268,6 +267,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_command(
     source: SourceCli,
     database_url: String,
@@ -278,7 +278,10 @@ async fn run_command(
     catchup_batch_size: usize,
     once: bool,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(catchup_batch_size > 0, "catchup_batch_size must be greater than zero");
+    anyhow::ensure!(
+        catchup_batch_size > 0,
+        "catchup_batch_size must be greater than zero"
+    );
 
     let bundle = source.build_bundle()?;
     let archive = SqliteArchive::connect(&database_url, true).await?;
@@ -329,7 +332,7 @@ async fn run_command(
                 finalized_tip,
                 catchup_batch_size,
             )
-                .await?;
+            .await?;
 
             // Continue immediately after catch-up work. While processing a large
             // historical range, Core may advance again; do not wait until there
@@ -349,6 +352,7 @@ async fn run_command(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn catch_up_ranges(
     archive: &SqliteArchive,
     source: &dyn BlockSource,
@@ -404,24 +408,24 @@ async fn catch_up_ranges(
            (profile_id, height, block_hash, checkpoint, checkpoint_len, created_at)
            VALUES (?, ?, ?, ?, ?, unixepoch())"#,
     )
-        .bind(profile_id)
-        .bind(i64::try_from(checkpoint_height)?)
-        .bind(checkpoint_hash.as_bytes().to_vec())
-        .bind(checkpoint_bytes.clone())
-        .bind(i64::try_from(checkpoint_bytes.len())?)
-        .execute(&mut *tx)
-        .await?;
+    .bind(profile_id)
+    .bind(i64::try_from(last_height)?)
+    .bind(checkpoint_hash.as_bytes().to_vec())
+    .bind(checkpoint_bytes.clone())
+    .bind(i64::try_from(checkpoint_bytes.len())?)
+    .execute(&mut *tx)
+    .await?;
 
     sqlx::query(
         r#"UPDATE profiles
            SET served_tip_height = ?, served_tip_hash = ?
            WHERE profile_id = ?"#,
     )
-        .bind(i64::try_from(checkpoint_height)?)
-        .bind(checkpoint_hash.as_bytes().to_vec())
-        .bind(profile_id)
-        .execute(&mut *tx)
-        .await?;
+    .bind(i64::try_from(last_height)?)
+    .bind(checkpoint_hash.as_bytes().to_vec())
+    .bind(profile_id)
+    .execute(&mut *tx)
+    .await?;
 
     tx.commit().await?;
 
@@ -430,13 +434,17 @@ async fn catch_up_ranges(
         first.height,
         last.height,
         state.last_uid(),
-        state.live_uids_sorted().len()
+        state.live_uids_sorted().len(),
     );
 
     Ok(())
 }
 
-fn decode_block_frame(height: u64, source_hash: [u8; 32], bytes: &[u8]) -> anyhow::Result<BlockScanInput> {
+fn decode_block_frame(
+    height: u64,
+    source_hash: [u8; 32],
+    bytes: &[u8],
+) -> anyhow::Result<BlockScanInput> {
     let block: Block = deserialize(bytes)?;
     let computed_hash = block.block_hash().to_byte_array();
     anyhow::ensure!(
@@ -628,13 +636,20 @@ async fn fetch_block_command(
     Ok(())
 }
 
-async fn fetch_range_command(source: SourceCli, start_height: u64, count: usize) -> anyhow::Result<()> {
+async fn fetch_range_command(
+    source: SourceCli,
+    start_height: u64,
+    count: usize,
+) -> anyhow::Result<()> {
     anyhow::ensure!(count > 0, "count must be greater than zero");
 
     let src = source.build_source()?;
     let frames = src.get_block_range_by_height(start_height, count).await?;
     let total_bytes: usize = frames.iter().map(|frame| frame.bytes.len()).sum();
-    let end = frames.last().map(|frame| frame.height).unwrap_or(start_height);
+    let end = frames
+        .last()
+        .map(|frame| frame.height)
+        .unwrap_or(start_height);
 
     println!(
         "source={} start={} end={} count={} total_bytes={}",
@@ -883,34 +898,34 @@ async fn write_fixture_db(
                 tx_with_indexed_output_count, tweak_count)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
-            .bind(i64::try_from(height)?)
-            .bind(i64::from(stats.tx_count))
-            .bind(i64::from(stats.output_count_total))
-            .bind(i64::from(stats.p2tr_output_count))
-            .bind(i64::from(stats.p2tr_sp_candidate_count))
-            .bind(i64::from(stats.p2tr_nums_count))
-            .bind(i64::from(stats.p2tr_reused_count))
-            .bind(i64::from(stats.p2tr_excluded_by_scope_count))
-            .bind(i64::from(stats.indexed_output_count))
-            .bind(i64::from(stats.indexed_spent_count))
-            .bind(i64::from(stats.tx_with_p2tr_output_count))
-            .bind(i64::from(stats.tx_with_indexed_output_count))
-            .bind(i64::from(stats.tweak_count))
-            .execute(&mut *tx)
-            .await?;
+        .bind(i64::try_from(height)?)
+        .bind(i64::from(stats.tx_count))
+        .bind(i64::from(stats.output_count_total))
+        .bind(i64::from(stats.p2tr_output_count))
+        .bind(i64::from(stats.p2tr_sp_candidate_count))
+        .bind(i64::from(stats.p2tr_nums_count))
+        .bind(i64::from(stats.p2tr_reused_count))
+        .bind(i64::from(stats.p2tr_excluded_by_scope_count))
+        .bind(i64::from(stats.indexed_output_count))
+        .bind(i64::from(stats.indexed_spent_count))
+        .bind(i64::from(stats.tx_with_p2tr_output_count))
+        .bind(i64::from(stats.tx_with_indexed_output_count))
+        .bind(i64::from(stats.tweak_count))
+        .execute(&mut *tx)
+        .await?;
 
         sqlx::query(
             r#"INSERT OR REPLACE INTO payload_cache
                (profile_id, height, block_hash, payload, payload_len, created_at)
                VALUES (?, ?, ?, ?, ?, unixepoch())"#,
         )
-            .bind(db_profile.profile_id)
-            .bind(i64::try_from(height)?)
-            .bind(hash.as_bytes().to_vec())
-            .bind(bytes.clone())
-            .bind(i64::try_from(bytes.len())?)
-            .execute(&mut *tx)
-            .await?;
+        .bind(db_profile.profile_id)
+        .bind(i64::try_from(height)?)
+        .bind(hash.as_bytes().to_vec())
+        .bind(bytes.clone())
+        .bind(i64::try_from(bytes.len())?)
+        .execute(&mut *tx)
+        .await?;
     }
 
     sqlx::query(
@@ -918,24 +933,24 @@ async fn write_fixture_db(
            (profile_id, height, block_hash, checkpoint, checkpoint_len, created_at)
            VALUES (?, ?, ?, ?, ?, unixepoch())"#,
     )
-        .bind(db_profile.profile_id)
-        .bind(i64::try_from(checkpoint_height)?)
-        .bind(tip_hash.as_bytes().to_vec())
-        .bind(checkpoint_bytes.clone())
-        .bind(i64::try_from(checkpoint_bytes.len())?)
-        .execute(&mut *tx)
-        .await?;
+    .bind(db_profile.profile_id)
+    .bind(i64::try_from(checkpoint_height)?)
+    .bind(tip_hash.as_bytes().to_vec())
+    .bind(checkpoint_bytes.clone())
+    .bind(i64::try_from(checkpoint_bytes.len())?)
+    .execute(&mut *tx)
+    .await?;
 
     sqlx::query(
         r#"UPDATE profiles
            SET served_tip_height = ?, served_tip_hash = ?
            WHERE profile_id = ?"#,
     )
-        .bind(i64::try_from(checkpoint_height)?)
-        .bind(tip_hash.as_bytes().to_vec())
-        .bind(db_profile.profile_id)
-        .execute(&mut *tx)
-        .await?;
+    .bind(i64::try_from(checkpoint_height)?)
+    .bind(tip_hash.as_bytes().to_vec())
+    .bind(db_profile.profile_id)
+    .execute(&mut *tx)
+    .await?;
 
     tx.commit().await?;
 
@@ -991,11 +1006,11 @@ async fn ensure_archive_meta(
              ('scope', ?),
              ('start_height', ?)"#,
     )
-        .bind(network.to_string())
-        .bind(scope.to_string())
-        .bind(start_height.to_string())
-        .execute(archive.pool())
-        .await?;
+    .bind(network.to_string())
+    .bind(scope.to_string())
+    .bind(start_height.to_string())
+    .execute(archive.pool())
+    .await?;
 
     Ok(())
 }
