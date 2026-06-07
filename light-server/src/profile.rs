@@ -6,9 +6,10 @@ use std::{fmt, str::FromStr};
 ///
 /// The archive network is immutable once a SQLite DB/archive is initialized.
 /// Changing it requires a separate DB/rescan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ArchiveNetwork {
+    #[default]
     Mainnet,
     Testnet,
     Signet,
@@ -25,12 +26,6 @@ impl ArchiveNetwork {
             Self::Regtest => "regtest",
             Self::Fixture => "fixture",
         }
-    }
-}
-
-impl Default for ArchiveNetwork {
-    fn default() -> Self {
-        Self::Mainnet
     }
 }
 

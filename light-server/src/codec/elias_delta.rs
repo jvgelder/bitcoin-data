@@ -6,7 +6,7 @@ struct BitWriter {
 
 impl BitWriter {
     fn push_bit(&mut self, bit: bool) {
-        if self.bit_len % 8 == 0 {
+        if self.bit_len.is_multiple_of(8) {
             self.bytes.push(0);
         }
         if bit {

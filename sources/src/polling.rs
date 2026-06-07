@@ -45,7 +45,7 @@ impl TipWatcher for PollingTipWatcher {
             let height = self.source.get_best_height().await?;
             let hash = self.source.get_block_hash(height).await?;
 
-            if old_tip.map_or(true, |old| old != hash) {
+            if old_tip != Some(hash) {
                 return Ok(());
             }
         }

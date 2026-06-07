@@ -743,7 +743,7 @@ pub async fn scan(
                 metrics.add_checkpoint(checkpoint_t.elapsed());
             }
 
-            if cfg.progress > 0 && (h - scan_start) % cfg.progress == 0 && h > scan_start {
+            if cfg.progress > 0 && (h - scan_start).is_multiple_of(cfg.progress) {
                 metrics.print_progress(t1.elapsed(), &state, h, scan_start);
             }
         }
