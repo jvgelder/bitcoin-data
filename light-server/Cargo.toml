@@ -33,9 +33,9 @@ btc-data-sources.workspace = true
 btc-data-core.workspace = true
 bitcoin.workspace = true
 sha2.workspace =  true
+futures.workspace = true
 [build-dependencies]
 capnpc.workspace = true
 
 [features]
-default = []
-ipc = ["btc-data-sources/ipc"]
+default = ["btc-data-sources/ipc"]
