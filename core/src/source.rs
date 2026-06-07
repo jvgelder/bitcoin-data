@@ -2,8 +2,8 @@
 //!
 //! Concrete implementations live in `btc-data-sources`.
 
-use async_trait::async_trait;
 use crate::block::RawBlockFrame;
+use async_trait::async_trait;
 use bytes::Bytes;
 
 #[async_trait]
@@ -25,7 +25,11 @@ pub trait BlockSource: Send + Sync {
     async fn get_block_by_height(&self, height: u64) -> anyhow::Result<RawBlockFrame> {
         let hash = self.get_block_hash(height).await?;
         let bytes = self.get_block_raw(hash).await?;
-        Ok(RawBlockFrame { height, hash, bytes })
+        Ok(RawBlockFrame {
+            height,
+            hash,
+            bytes,
+        })
     }
 
     /// Fetch an ordered contiguous range of block frames by height.
@@ -40,7 +44,10 @@ pub trait BlockSource: Send + Sync {
     ) -> anyhow::Result<Vec<RawBlockFrame>> {
         let mut frames = Vec::with_capacity(count);
         for offset in 0..count {
-            frames.push(self.get_block_by_height(start_height + offset as u64).await?);
+            frames.push(
+                self.get_block_by_height(start_height + offset as u64)
+                    .await?,
+            );
         }
         Ok(frames)
     }

@@ -1,9 +1,9 @@
 //! `btc-data-stats` — runs the scan loop, emits per-block stats to sinks.
 
 use btc_data_core::source::BlockSource;
-use btc_data_sources::{EsploraSource, MultiSource, RestSource, RpcSource};
 #[cfg(feature = "ipc")]
 use btc_data_sources::IpcSource;
+use btc_data_sources::{EsploraSource, MultiSource, RestSource, RpcSource};
 use btc_data_stats::checkpoint::CheckpointConfig;
 use btc_data_stats::scan::{scan, ScanConfig};
 use btc_data_stats::sinks::{Fanout, StatsCsvSink, StatsSink};
@@ -12,7 +12,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "btc-data-stats", about = "Block scanner + stats emitter", version)]
+#[command(
+    name = "btc-data-stats",
+    about = "Block scanner + stats emitter",
+    version
+)]
 struct Cli {
     // ─── sources ────────────────────────────────────────────────
     /// bitcoind JSON-RPC URL. Repeatable.
@@ -38,7 +42,11 @@ struct Cli {
     #[arg(long = "ipc")]
     ipc_paths: Vec<String>,
     /// Number of Bitcoin Core IPC worker Thread clients to create per IPC socket.
-    #[arg(long = "ipc-threads", env = "BTC_DATA_IPC_THREADS", default_value_t = 8)]
+    #[arg(
+        long = "ipc-threads",
+        env = "BTC_DATA_IPC_THREADS",
+        default_value_t = 8
+    )]
     ipc_threads: usize,
 
     // ─── scan range ─────────────────────────────────────────────
@@ -144,7 +152,10 @@ fn build_source(args: &Cli) -> anyhow::Result<Arc<dyn BlockSource>> {
     #[cfg(feature = "ipc")]
     {
         for path in &args.ipc_paths {
-            srcs.push(Box::new(IpcSource::connect_with_threads(path.clone(), args.ipc_threads)?));
+            srcs.push(Box::new(IpcSource::connect_with_threads(
+                path.clone(),
+                args.ipc_threads,
+            )?));
         }
     }
 

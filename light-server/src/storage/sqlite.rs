@@ -1,8 +1,8 @@
-use crate::storage::{ChainTip, Manifest, ManifestProfile};
-use crate::storage::{ArchiveBackend, ServedProfile};
-use async_trait::async_trait;
 use crate::profile::{ArchiveScope, Profile};
+use crate::storage::{ArchiveBackend, ServedProfile};
+use crate::storage::{ChainTip, Manifest, ManifestProfile};
 use crate::{DEFAULT_MAX_RANGE_COUNT, WIRE_VERSION};
+use async_trait::async_trait;
 use serde_json::json;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
@@ -26,31 +26,40 @@ impl SqliteArchive {
     }
 
     pub async fn migrate(&self) -> anyhow::Result<()> {
-        sqlx::migrate!("./src/storage/migrations").run(&self.pool).await?;
+        sqlx::migrate!("./src/storage/migrations")
+            .run(&self.pool)
+            .await?;
         Ok(())
     }
 
-    pub fn pool(&self) -> &SqlitePool { &self.pool }
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
 
     pub async fn meta_text(&self, key: &str) -> anyhow::Result<Option<String>> {
         let row = sqlx::query("SELECT value FROM meta WHERE key = ?")
             .bind(key)
             .fetch_optional(&self.pool)
             .await?;
-        let Some(row) = row else { return Ok(None); };
+        let Some(row) = row else {
+            return Ok(None);
+        };
         let value: Vec<u8> = row.try_get("value")?;
         Ok(Some(String::from_utf8_lossy(&value).into_owned()))
     }
-
-
 }
 
 #[async_trait]
 impl ArchiveBackend for SqliteArchive {
     async fn manifest(&self) -> anyhow::Result<Manifest> {
-        let network = self.meta_text("network").await?.unwrap_or_else(|| "unknown".to_string());
+        let network = self
+            .meta_text("network")
+            .await?
+            .unwrap_or_else(|| "unknown".to_string());
         let genesis_hash = self.meta_text("genesis_hash").await?;
-        let checkpoint_interval = self.meta_text("checkpoint_interval").await?
+        let checkpoint_interval = self
+            .meta_text("checkpoint_interval")
+            .await?
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(10_000);
 
@@ -95,7 +104,11 @@ impl ArchiveBackend for SqliteArchive {
         })
     }
 
-    async fn resolve_profile(&self, name: Option<&str>, profile: Option<Profile>) -> anyhow::Result<ServedProfile> {
+    async fn resolve_profile(
+        &self,
+        name: Option<&str>,
+        profile: Option<Profile>,
+    ) -> anyhow::Result<ServedProfile> {
         let row = if let Some(name) = name {
             sqlx::query(
                 r#"SELECT profile_id, name, scope, cutthrough_blocks, materialization_interval_blocks,
@@ -125,7 +138,8 @@ impl ArchiveBackend for SqliteArchive {
         let name: String = row.try_get("name")?;
         let scope_text: String = row.try_get("scope")?;
         let cutthrough_blocks: i64 = row.try_get("cutthrough_blocks")?;
-        let materialization_interval_blocks: i64 = row.try_get("materialization_interval_blocks")?;
+        let materialization_interval_blocks: i64 =
+            row.try_get("materialization_interval_blocks")?;
         let served_tip_height: i64 = row.try_get("served_tip_height")?;
         let served_tip_hash: Option<Vec<u8>> = row.try_get("served_tip_hash")?;
 
@@ -152,7 +166,11 @@ impl ArchiveBackend for SqliteArchive {
         Ok(db_profile.served_tip.clone())
     }
 
-    async fn read_block(&self, height: u64, profile: &ServedProfile) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    async fn read_block(
+        &self,
+        height: u64,
+        profile: &ServedProfile,
+    ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
         let profile_id = profile.profile_id;
         let row = sqlx::query(
             r#"SELECT block_hash, payload
@@ -167,7 +185,12 @@ impl ArchiveBackend for SqliteArchive {
         Ok((row.try_get("payload")?, row.try_get("block_hash")?))
     }
 
-    async fn read_blocks(&self, start: u64, count: u32, profile: &ServedProfile) -> anyhow::Result<Vec<Vec<u8>>> {
+    async fn read_blocks(
+        &self,
+        start: u64,
+        count: u32,
+        profile: &ServedProfile,
+    ) -> anyhow::Result<Vec<Vec<u8>>> {
         let profile_id = profile.profile_id;
         let end = start + u64::from(count.saturating_sub(1));
         let rows = sqlx::query(
@@ -182,7 +205,10 @@ impl ArchiveBackend for SqliteArchive {
         .fetch_all(&self.pool)
         .await?;
 
-        anyhow::ensure!(rows.len() == count as usize, "range contains missing payloads");
+        anyhow::ensure!(
+            rows.len() == count as usize,
+            "range contains missing payloads"
+        );
         let mut out = Vec::with_capacity(rows.len());
         for (idx, row) in rows.into_iter().enumerate() {
             let height: i64 = row.try_get("height")?;
@@ -193,7 +219,11 @@ impl ArchiveBackend for SqliteArchive {
         Ok(out)
     }
 
-    async fn read_checkpoint(&self, height: u64, profile: &ServedProfile) -> anyhow::Result<Vec<u8>> {
+    async fn read_checkpoint(
+        &self,
+        height: u64,
+        profile: &ServedProfile,
+    ) -> anyhow::Result<Vec<u8>> {
         let profile_id = profile.profile_id;
         let row = sqlx::query(
             r#"SELECT checkpoint
@@ -208,7 +238,11 @@ impl ArchiveBackend for SqliteArchive {
         Ok(row.try_get("checkpoint")?)
     }
 
-    async fn latest_checkpoint_height(&self, height_lte: u64, profile: &ServedProfile) -> anyhow::Result<Option<u64>> {
+    async fn latest_checkpoint_height(
+        &self,
+        height_lte: u64,
+        profile: &ServedProfile,
+    ) -> anyhow::Result<Option<u64>> {
         let profile_id = profile.profile_id;
         let row = sqlx::query(
             r#"SELECT height
@@ -231,13 +265,11 @@ impl ArchiveBackend for SqliteArchive {
     }
 
     async fn block_stats(&self, height: u64) -> anyhow::Result<serde_json::Value> {
-        let row = sqlx::query(
-            r#"SELECT * FROM block_stats WHERE height = ?"#,
-        )
-        .bind(i64::try_from(height)?)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("block stats not found for height {height}"))?;
+        let row = sqlx::query(r#"SELECT * FROM block_stats WHERE height = ?"#)
+            .bind(i64::try_from(height)?)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("block stats not found for height {height}"))?;
 
         let reasons = sqlx::query(
             r#"SELECT reason, count

@@ -29,8 +29,6 @@ impl Default for CheckpointConfig {
     }
 }
 
-
-
 /// Writes checkpoints after a configured number of committed blocks.
 ///
 /// A checkpoint is only written after the caller has fully processed a block
@@ -114,7 +112,10 @@ pub fn block_hash_hex(hash: &[u8; 32]) -> String {
 }
 
 pub fn checkpoint_path(dir: &Path, height: u64, hash: &[u8; 32]) -> PathBuf {
-    dir.join(format!("checkpoint-{height:012}-{}.postcard", block_hash_hex(hash)))
+    dir.join(format!(
+        "checkpoint-{height:012}-{}.postcard",
+        block_hash_hex(hash)
+    ))
 }
 
 pub async fn save_checkpoint(dir: &Path, checkpoint: &StatsCheckpoint) -> anyhow::Result<PathBuf> {
@@ -152,9 +153,13 @@ pub async fn list_checkpoints_newest_first(dir: &Path) -> anyhow::Result<Vec<Pat
 }
 
 pub async fn prune_checkpoints(dir: &Path, keep: usize) -> anyhow::Result<()> {
-    if keep == 0 { return Ok(()); }
+    if keep == 0 {
+        return Ok(());
+    }
     let mut checkpoints = list_checkpoints_newest_first(dir).await?;
-    if checkpoints.len() <= keep { return Ok(()); }
+    if checkpoints.len() <= keep {
+        return Ok(());
+    }
     checkpoints.reverse();
     let remove_count = checkpoints.len() - keep;
     for p in checkpoints.into_iter().take(remove_count) {

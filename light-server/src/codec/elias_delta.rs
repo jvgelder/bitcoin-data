@@ -23,7 +23,9 @@ impl BitWriter {
         }
     }
 
-    fn into_bytes(self) -> Vec<u8> { self.bytes }
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
 }
 
 struct BitReader<'a> {
@@ -32,7 +34,9 @@ struct BitReader<'a> {
 }
 
 impl<'a> BitReader<'a> {
-    fn new(bytes: &'a [u8]) -> Self { Self { bytes, bit_pos: 0 } }
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, bit_pos: 0 }
+    }
 
     fn read_bit(&mut self) -> Option<bool> {
         if self.bit_pos >= self.bytes.len() * 8 {
@@ -98,11 +102,18 @@ fn decode_one(r: &mut BitReader<'_>) -> anyhow::Result<u64> {
     }
     let mut n_bits = 1u64 << zeros;
     if zeros > 0 {
-        n_bits |= r.read_bits(zeros).ok_or_else(|| anyhow::anyhow!("truncated Elias-delta length"))?;
+        n_bits |= r
+            .read_bits(zeros)
+            .ok_or_else(|| anyhow::anyhow!("truncated Elias-delta length"))?;
     }
     anyhow::ensure!((1..=64).contains(&n_bits), "invalid Elias-delta length");
     let tail_bits = (n_bits - 1) as u32;
-    let tail = if tail_bits == 0 { 0 } else { r.read_bits(tail_bits).ok_or_else(|| anyhow::anyhow!("truncated Elias-delta value"))? };
+    let tail = if tail_bits == 0 {
+        0
+    } else {
+        r.read_bits(tail_bits)
+            .ok_or_else(|| anyhow::anyhow!("truncated Elias-delta value"))?
+    };
     Ok((1u64 << tail_bits) | tail)
 }
 
@@ -112,7 +123,20 @@ mod tests {
 
     #[test]
     fn roundtrip_elias_delta() {
-        let values = [1, 2, 3, 4, 5, 17, 255, 256, 257, 65_535, 1_000_000, u32::MAX as u64];
+        let values = [
+            1,
+            2,
+            3,
+            4,
+            5,
+            17,
+            255,
+            256,
+            257,
+            65_535,
+            1_000_000,
+            u32::MAX as u64,
+        ];
         let bytes = encode_elias_delta_values(&values).unwrap();
         let decoded = decode_elias_delta_values(&bytes, values.len()).unwrap();
         assert_eq!(decoded, values);

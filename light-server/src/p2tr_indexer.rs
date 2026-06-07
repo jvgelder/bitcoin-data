@@ -94,19 +94,27 @@ pub struct P2trIndexerState {
 }
 
 impl P2trIndexerState {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-    pub fn last_uid(&self) -> u64 { self.next_uid }
+    pub fn last_uid(&self) -> u64 {
+        self.next_uid
+    }
 
     pub fn live_uids_sorted(&self) -> Vec<u64> {
         self.live_uids.iter().copied().collect()
     }
 
     /// Compatibility alias for earlier P2TR-only code.
-    pub fn last_p2tr_uid(&self) -> u64 { self.last_uid() }
+    pub fn last_p2tr_uid(&self) -> u64 {
+        self.last_uid()
+    }
 
     /// Compatibility alias for earlier P2TR-only code.
-    pub fn live_p2tr_uids_sorted(&self) -> Vec<u64> { self.live_uids_sorted() }
+    pub fn live_p2tr_uids_sorted(&self) -> Vec<u64> {
+        self.live_uids_sorted()
+    }
 
     /// Apply one block to the scoped UID state and return the corresponding
     /// `LightBlockInput` plus debug/statistical counters.
@@ -114,17 +122,28 @@ impl P2trIndexerState {
     /// Inputs are processed before outputs within each tx, matching Bitcoin
     /// spend semantics while still using an end-of-block UID anchor for
     /// same-block spends.
-    pub fn apply_block(&mut self, block: BlockScanInput, profile: Profile) -> anyhow::Result<LightBlockInput> {
+    pub fn apply_block(
+        &mut self,
+        block: BlockScanInput,
+        profile: Profile,
+    ) -> anyhow::Result<LightBlockInput> {
         Ok(self.apply_block_with_stats(block, profile)?.light_block)
     }
 
-    pub fn apply_block_with_stats(&mut self, block: BlockScanInput, profile: Profile) -> anyhow::Result<AppliedBlock> {
+    pub fn apply_block_with_stats(
+        &mut self,
+        block: BlockScanInput,
+        profile: Profile,
+    ) -> anyhow::Result<AppliedBlock> {
         let mut outputs = Vec::<OutputRefInput>::new();
         let mut full_output_hashes = Vec::<OutputIdHash>::new();
         let mut spent_uids = Vec::<u64>::new();
         let mut tx_tweak_indexes = Vec::<u32>::new();
         let mut tx_tweaks = Vec::<TxTweak>::new();
-        let mut stats = BlockScopeStats { tx_count: block.txs.len() as u32, ..Default::default() };
+        let mut stats = BlockScopeStats {
+            tx_count: block.txs.len() as u32,
+            ..Default::default()
+        };
 
         for tx in &block.txs {
             let mut tx_has_p2tr_output = false;
@@ -166,12 +185,22 @@ impl P2trIndexerState {
 
                 tx_has_indexed_output = true;
                 stats.indexed_output_count += 1;
-                self.next_uid = self.next_uid.checked_add(1).ok_or_else(|| anyhow::anyhow!("scoped UID overflow"))?;
+                self.next_uid = self
+                    .next_uid
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("scoped UID overflow"))?;
                 let uid = self.next_uid;
-                let outpoint = OutPointKey { txid: tx.txid, vout: output.vout };
+                let outpoint = OutPointKey {
+                    txid: tx.txid,
+                    vout: output.vout,
+                };
                 self.outpoint_to_uid.insert(outpoint, uid);
                 self.live_uids.insert(uid);
-                outputs.push(OutputRefInput { tx_index: tx.tx_index, vout: output.vout, uid });
+                outputs.push(OutputRefInput {
+                    tx_index: tx.tx_index,
+                    vout: output.vout,
+                    uid,
+                });
                 full_output_hashes.push(output_identifier_hash(&output.identity_bytes));
             }
 
@@ -195,7 +224,9 @@ impl P2trIndexerState {
         }
 
         spent_uids.sort_unstable();
-        let output_id_bytes = choose_output_id_bytes(outputs.len() as u64, OUTPUT_ID_COLLISION_PROBABILITY_LOG2).clamp(1, crate::index::MAX_P2TR_OUTPUT_ID_BYTES);
+        let output_id_bytes =
+            choose_output_id_bytes(outputs.len() as u64, OUTPUT_ID_COLLISION_PROBABILITY_LOG2)
+                .clamp(1, crate::index::MAX_P2TR_OUTPUT_ID_BYTES);
         let output_ids = truncate_into_packed(&full_output_hashes, output_id_bytes)?;
 
         Ok(AppliedBlock {
@@ -229,7 +260,9 @@ pub fn output_identifier_hash(identity_bytes: &[u8]) -> OutputIdHash {
 mod tests {
     use super::*;
 
-    fn txid(n: u8) -> TxidBytes { [n; 32].into() }
+    fn txid(n: u8) -> TxidBytes {
+        [n; 32].into()
+    }
 
     #[test]
     fn p2tr_sp_includes_reuse_and_does_not_filter_output_nums() {
@@ -245,9 +278,24 @@ mod tests {
                 inputs: vec![],
                 silent_payment_tweak: Some([9; 33].into()),
                 outputs: vec![
-                    TxOutputScan { vout: 0, is_p2tr: true, is_nums: false, identity_bytes: vec![1; 32] },
-                    TxOutputScan { vout: 1, is_p2tr: true, is_nums: false, identity_bytes: vec![1; 32] },
-                    TxOutputScan { vout: 2, is_p2tr: true, is_nums: true, identity_bytes: vec![2; 32] },
+                    TxOutputScan {
+                        vout: 0,
+                        is_p2tr: true,
+                        is_nums: false,
+                        identity_bytes: vec![1; 32],
+                    },
+                    TxOutputScan {
+                        vout: 1,
+                        is_p2tr: true,
+                        is_nums: false,
+                        identity_bytes: vec![1; 32],
+                    },
+                    TxOutputScan {
+                        vout: 2,
+                        is_p2tr: true,
+                        is_nums: true,
+                        identity_bytes: vec![2; 32],
+                    },
                 ],
             }],
         };
@@ -275,8 +323,18 @@ mod tests {
                 inputs: vec![],
                 silent_payment_tweak: Some([9; 33].into()),
                 outputs: vec![
-                    TxOutputScan { vout: 0, is_p2tr: false, is_nums: false, identity_bytes: vec![0] },
-                    TxOutputScan { vout: 1, is_p2tr: true, is_nums: false, identity_bytes: vec![1; 32] },
+                    TxOutputScan {
+                        vout: 0,
+                        is_p2tr: false,
+                        is_nums: false,
+                        identity_bytes: vec![0],
+                    },
+                    TxOutputScan {
+                        vout: 1,
+                        is_p2tr: true,
+                        is_nums: false,
+                        identity_bytes: vec![1; 32],
+                    },
                 ],
             }],
         };
@@ -292,9 +350,19 @@ mod tests {
             txs: vec![TxScanInput {
                 txid: txid(11),
                 tx_index: 0,
-                inputs: vec![TxInputScan { previous_output: OutPointKey { txid: txid(10), vout: 1 } }],
+                inputs: vec![TxInputScan {
+                    previous_output: OutPointKey {
+                        txid: txid(10),
+                        vout: 1,
+                    },
+                }],
                 silent_payment_tweak: Some([8; 33].into()),
-                outputs: vec![TxOutputScan { vout: 0, is_p2tr: true, is_nums: false, identity_bytes: vec![2; 32] }],
+                outputs: vec![TxOutputScan {
+                    vout: 0,
+                    is_p2tr: true,
+                    is_nums: false,
+                    identity_bytes: vec![2; 32],
+                }],
             }],
         };
         let light2 = state.apply_block(block2, profile).unwrap();

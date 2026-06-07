@@ -85,7 +85,11 @@ impl CodecValueCosts {
     #[inline]
     pub fn new(value: u64, zeroable: bool) -> Self {
         let leb128_bytes = leb128_len_u64(value) as u128;
-        let elias_value = if zeroable { value.saturating_add(1) } else { value };
+        let elias_value = if zeroable {
+            value.saturating_add(1)
+        } else {
+            value
+        };
         let elias_delta_bits = elias_delta_bits(elias_value) as u128;
 
         let mut rice_bits_by_k = [0u128; RICE_K_COUNT];
@@ -104,7 +108,12 @@ impl CodecValueCosts {
             }
         }
 
-        Self { leb128_bytes, elias_delta_bits, rice_bits_by_k, escaped_rice_bits }
+        Self {
+            leb128_bytes,
+            elias_delta_bits,
+            rice_bits_by_k,
+            escaped_rice_bits,
+        }
     }
 }
 
@@ -162,10 +171,18 @@ impl CodecEstimate {
         self.values += 1;
         self.leb128_bytes += costs.leb128_bytes;
         self.elias_delta_bits += costs.elias_delta_bits;
-        for (dst, src) in self.rice_bits_by_k.iter_mut().zip(costs.rice_bits_by_k.iter()) {
+        for (dst, src) in self
+            .rice_bits_by_k
+            .iter_mut()
+            .zip(costs.rice_bits_by_k.iter())
+        {
             *dst += *src;
         }
-        for (dst_row, src_row) in self.escaped_rice_bits.iter_mut().zip(costs.escaped_rice_bits.iter()) {
+        for (dst_row, src_row) in self
+            .escaped_rice_bits
+            .iter_mut()
+            .zip(costs.escaped_rice_bits.iter())
+        {
             for (dst, src) in dst_row.iter_mut().zip(src_row.iter()) {
                 *dst += *src;
             }
@@ -176,10 +193,18 @@ impl CodecEstimate {
         self.values += other.values;
         self.leb128_bytes += other.leb128_bytes;
         self.elias_delta_bits += other.elias_delta_bits;
-        for (dst, src) in self.rice_bits_by_k.iter_mut().zip(other.rice_bits_by_k.iter()) {
+        for (dst, src) in self
+            .rice_bits_by_k
+            .iter_mut()
+            .zip(other.rice_bits_by_k.iter())
+        {
             *dst += *src;
         }
-        for (dst_row, src_row) in self.escaped_rice_bits.iter_mut().zip(other.escaped_rice_bits.iter()) {
+        for (dst_row, src_row) in self
+            .escaped_rice_bits
+            .iter_mut()
+            .zip(other.escaped_rice_bits.iter())
+        {
             for (dst, src) in dst_row.iter_mut().zip(src_row.iter()) {
                 *dst += *src;
             }
@@ -188,24 +213,39 @@ impl CodecEstimate {
     }
 
     pub fn best_rice(&self) -> RiceChoice {
-        let mut best = RiceChoice { k: 0, bits: u128::MAX };
+        let mut best = RiceChoice {
+            k: 0,
+            bits: u128::MAX,
+        };
         for (k, &bits) in self.rice_bits_by_k.iter().enumerate() {
             if bits < best.bits {
                 best = RiceChoice { k: k as u32, bits };
             }
         }
-        if self.values == 0 { RiceChoice { k: 0, bits: 0 } } else { best }
+        if self.values == 0 {
+            RiceChoice { k: 0, bits: 0 }
+        } else {
+            best
+        }
     }
 
     pub fn best_escaped_rice(&self) -> EscapedRiceChoice {
         if self.values == 0 {
             return EscapedRiceChoice::default();
         }
-        let mut best = EscapedRiceChoice { threshold: 0, k: 0, bits: u128::MAX };
+        let mut best = EscapedRiceChoice {
+            threshold: 0,
+            k: 0,
+            bits: u128::MAX,
+        };
         for (threshold_idx, &threshold) in ESCAPED_RICE_THRESHOLDS.iter().enumerate() {
             for (k, &bits) in self.escaped_rice_bits[threshold_idx].iter().enumerate() {
                 if bits < best.bits {
-                    best = EscapedRiceChoice { threshold, k: k as u32, bits };
+                    best = EscapedRiceChoice {
+                        threshold,
+                        k: k as u32,
+                        bits,
+                    };
                 }
             }
         }
@@ -222,12 +262,30 @@ impl CodecEstimate {
         let escaped = self.best_escaped_rice();
         println!("{label}:");
         println!("  values:             {}", self.values);
-        println!("  LEB128:             {} bytes ({:.3} bytes/value)", self.leb128_bytes, self.leb128_bytes as f64 / n);
-        println!("  Elias delta:        {} bits ({:.3} bytes/value)", self.elias_delta_bits, self.elias_delta_bits as f64 / 8.0 / n);
-        println!("  Golomb-Rice best:   k={} M={} {} bits ({:.3} bytes/value)",
-                 best.k, 1u128 << best.k, best.bits, best.bits as f64 / 8.0 / n);
-        println!("  Rice+LEB128 escape: threshold={} k={} {} bits ({:.3} bytes/value)",
-                 escaped.threshold, escaped.k, escaped.bits, escaped.bits as f64 / 8.0 / n);
+        println!(
+            "  LEB128:             {} bytes ({:.3} bytes/value)",
+            self.leb128_bytes,
+            self.leb128_bytes as f64 / n
+        );
+        println!(
+            "  Elias delta:        {} bits ({:.3} bytes/value)",
+            self.elias_delta_bits,
+            self.elias_delta_bits as f64 / 8.0 / n
+        );
+        println!(
+            "  Golomb-Rice best:   k={} M={} {} bits ({:.3} bytes/value)",
+            best.k,
+            1u128 << best.k,
+            best.bits,
+            best.bits as f64 / 8.0 / n
+        );
+        println!(
+            "  Rice+LEB128 escape: threshold={} k={} {} bits ({:.3} bytes/value)",
+            escaped.threshold,
+            escaped.k,
+            escaped.bits,
+            escaped.bits as f64 / 8.0 / n
+        );
         self.hist.print(label);
     }
 }
@@ -248,23 +306,36 @@ impl SortedUidCodecStats {
         println!("{label}:");
         println!("  blocks with spends: {}", self.blocks_with_spends);
         let values = self.combined.values.max(1) as f64;
-        println!("  Elias-Fano + 64-bit base: {} bits ({:.3} bytes/value)",
-                 self.ef_bits_with_64bit_base, self.ef_bits_with_64bit_base as f64 / 8.0 / values);
+        println!(
+            "  Elias-Fano + 64-bit base: {} bits ({:.3} bytes/value)",
+            self.ef_bits_with_64bit_base,
+            self.ef_bits_with_64bit_base as f64 / 8.0 / values
+        );
         if self.deltas.values > 0 {
-            println!("  per-block Rice best on deltas (+{} bits/block k): {} bits ({:.3} bytes/value)",
-                     PER_BLOCK_RICE_K_OVERHEAD_BITS,
-                     self.delta_per_block_rice_best_bits_with_k_overhead,
-                     self.delta_per_block_rice_best_bits_with_k_overhead as f64 / 8.0 / self.deltas.values as f64);
+            println!(
+                "  per-block Rice best on deltas (+{} bits/block k): {} bits ({:.3} bytes/value)",
+                PER_BLOCK_RICE_K_OVERHEAD_BITS,
+                self.delta_per_block_rice_best_bits_with_k_overhead,
+                self.delta_per_block_rice_best_bits_with_k_overhead as f64
+                    / 8.0
+                    / self.deltas.values as f64
+            );
         }
         if self.combined.values > 0 {
-            println!("  per-block Rice best on combined (+{} bits/block k): {} bits ({:.3} bytes/value)",
-                     PER_BLOCK_RICE_K_OVERHEAD_BITS,
-                     self.combined_per_block_rice_best_bits_with_k_overhead,
-                     self.combined_per_block_rice_best_bits_with_k_overhead as f64 / 8.0 / self.combined.values as f64);
+            println!(
+                "  per-block Rice best on combined (+{} bits/block k): {} bits ({:.3} bytes/value)",
+                PER_BLOCK_RICE_K_OVERHEAD_BITS,
+                self.combined_per_block_rice_best_bits_with_k_overhead,
+                self.combined_per_block_rice_best_bits_with_k_overhead as f64
+                    / 8.0
+                    / self.combined.values as f64
+            );
         }
-        self.first_offsets.print_codec("  first offset from block_anchor_last_uid");
+        self.first_offsets
+            .print_codec("  first offset from block_anchor_last_uid");
         self.deltas.print_codec("  sorted intra-block deltas");
-        self.combined.print_codec("  combined first-offset + deltas");
+        self.combined
+            .print_codec("  combined first-offset + deltas");
     }
 }
 
@@ -342,7 +413,9 @@ pub fn measure_sorted_uid_stream(
 
     let first_offset_costs = CodecValueCosts::new(first_offset, true);
     block_combined.add_costs_no_hist(&first_offset_costs);
-    stats.first_offsets.add_costs(first_offset, &first_offset_costs);
+    stats
+        .first_offsets
+        .add_costs(first_offset, &first_offset_costs);
     stats.combined.add_costs(first_offset, &first_offset_costs);
 
     let mut prev = first_uid;
@@ -473,80 +546,118 @@ impl Stats {
         println!("\n==== Scan Summary ====");
         println!("Total outputs:       {}", self.outputs);
         println!("  P2TR outputs:      {}", self.p2tr_outputs);
-        println!("  P2TR reused:       {} ({:.1}%)",
-                 self.p2tr_reused,
-                 100.0 * self.p2tr_reused as f64 / self.p2tr_outputs.max(1) as f64);
+        println!(
+            "  P2TR reused:       {} ({:.1}%)",
+            self.p2tr_reused,
+            100.0 * self.p2tr_reused as f64 / self.p2tr_outputs.max(1) as f64
+        );
         println!("Total spends:        {}", self.spends);
 
         let p2tr_denom = self.p2tr_spends.max(1) as f64;
         println!("P2TR spends:         {}", self.p2tr_spends);
-        println!("  Key-path:          {} ({:.1}%)",
-                 self.p2tr_keypath_spends, 100.0 * self.p2tr_keypath_spends as f64 / p2tr_denom);
-        println!("  Script-path:       {} ({:.1}%)",
-                 self.p2tr_scriptpath_spends, 100.0 * self.p2tr_scriptpath_spends as f64 / p2tr_denom);
-        println!("    NUMS internal key:    {} ({:.2}%)",
-                 self.p2tr_nums_spends, 100.0 * self.p2tr_nums_spends as f64 / p2tr_denom);
-        println!("    Inscriptions (any):   {} ({:.2}%)",
-                 self.p2tr_inscription_spends,
-                 100.0 * self.p2tr_inscription_spends as f64 / p2tr_denom);
-        println!("    NUMS ∩ inscription:   {} ({:.2}%)",
-                 self.p2tr_nums_and_inscription_spends,
-                 100.0 * self.p2tr_nums_and_inscription_spends as f64 / p2tr_denom);
-        println!("  SP-eligible:       {} ({:.1}%)",
-                 self.p2tr_sp_eligible_spends,
-                 100.0 * self.p2tr_sp_eligible_spends as f64 / p2tr_denom);
+        println!(
+            "  Key-path:          {} ({:.1}%)",
+            self.p2tr_keypath_spends,
+            100.0 * self.p2tr_keypath_spends as f64 / p2tr_denom
+        );
+        println!(
+            "  Script-path:       {} ({:.1}%)",
+            self.p2tr_scriptpath_spends,
+            100.0 * self.p2tr_scriptpath_spends as f64 / p2tr_denom
+        );
+        println!(
+            "    NUMS internal key:    {} ({:.2}%)",
+            self.p2tr_nums_spends,
+            100.0 * self.p2tr_nums_spends as f64 / p2tr_denom
+        );
+        println!(
+            "    Inscriptions (any):   {} ({:.2}%)",
+            self.p2tr_inscription_spends,
+            100.0 * self.p2tr_inscription_spends as f64 / p2tr_denom
+        );
+        println!(
+            "    NUMS ∩ inscription:   {} ({:.2}%)",
+            self.p2tr_nums_and_inscription_spends,
+            100.0 * self.p2tr_nums_and_inscription_spends as f64 / p2tr_denom
+        );
+        println!(
+            "  SP-eligible:       {} ({:.1}%)",
+            self.p2tr_sp_eligible_spends,
+            100.0 * self.p2tr_sp_eligible_spends as f64 / p2tr_denom
+        );
 
         println!();
         println!("Same-tx spends (canary, should be 0):");
         println!("  all:               {}", self.same_tx_spends);
         println!("  P2TR:              {}", self.p2tr_same_tx_spends);
         println!("Same-block spends (later tx, same block):");
-        println!("  all:               {} ({:.2}% of spends)",
-                 self.same_block_spends,
-                 100.0 * self.same_block_spends as f64 / self.spends.max(1) as f64);
-        println!("  P2TR:              {} ({:.2}% of P2TR spends)",
-                 self.p2tr_same_block_spends,
-                 100.0 * self.p2tr_same_block_spends as f64 / p2tr_denom);
+        println!(
+            "  all:               {} ({:.2}% of spends)",
+            self.same_block_spends,
+            100.0 * self.same_block_spends as f64 / self.spends.max(1) as f64
+        );
+        println!(
+            "  P2TR:              {} ({:.2}% of P2TR spends)",
+            self.p2tr_same_block_spends,
+            100.0 * self.p2tr_same_block_spends as f64 / p2tr_denom
+        );
 
         println!();
-        println!("SP-ineligible txs:   {} (all P2TR inputs NUMS, no other input types)",
-                 self.nonsp_txs);
-        println!("  Their outputs:     {} ({:.2}% of all outputs, filterable)",
-                 self.nonsp_tx_outputs,
-                 100.0 * self.nonsp_tx_outputs as f64 / self.outputs.max(1) as f64);
+        println!(
+            "SP-ineligible txs:   {} (all P2TR inputs NUMS, no other input types)",
+            self.nonsp_txs
+        );
+        println!(
+            "  Their outputs:     {} ({:.2}% of all outputs, filterable)",
+            self.nonsp_tx_outputs,
+            100.0 * self.nonsp_tx_outputs as f64 / self.outputs.max(1) as f64
+        );
 
         println!();
         print_script_type_table("Outputs by script type", &self.script_outputs, self.outputs);
-        let total_inputs: u64 = self.script_inputs.p2pk + self.script_inputs.p2pkh
-            + self.script_inputs.p2sh + self.script_inputs.p2wpkh + self.script_inputs.p2wsh
-            + self.script_inputs.p2tr + self.script_inputs.p2a + self.script_inputs.op_return
+        let total_inputs: u64 = self.script_inputs.p2pk
+            + self.script_inputs.p2pkh
+            + self.script_inputs.p2sh
+            + self.script_inputs.p2wpkh
+            + self.script_inputs.p2wsh
+            + self.script_inputs.p2tr
+            + self.script_inputs.p2a
+            + self.script_inputs.op_return
             + self.script_inputs.unknown;
-        print_script_type_table("Inputs by spent script type", &self.script_inputs, total_inputs);
+        print_script_type_table(
+            "Inputs by spent script type",
+            &self.script_inputs,
+            total_inputs,
+        );
 
         println!();
         println!("==== Spent-ID Sorted Delta Encoding ====");
         self.sorted_spent_ids.print_report("All spends");
         println!();
         self.sorted_p2tr_spent_ids.print_report("P2TR spends");
-
     }
 }
 
 fn print_script_type_table(label: &str, c: &TypeCounts, total: u64) {
     let denom = total.max(1) as f64;
     let row = |name: &str, n: u64| {
-        println!("  {:<12} {:>10}  ({:.2}%)", name, n, 100.0 * n as f64 / denom);
+        println!(
+            "  {:<12} {:>10}  ({:.2}%)",
+            name,
+            n,
+            100.0 * n as f64 / denom
+        );
     };
     println!("{label}: total={}", total);
-    row("p2pk",      c.p2pk);
-    row("p2pkh",     c.p2pkh);
-    row("p2sh",      c.p2sh);
-    row("p2wpkh",    c.p2wpkh);
-    row("p2wsh",     c.p2wsh);
-    row("p2tr",      c.p2tr);
-    row("p2a",       c.p2a);
+    row("p2pk", c.p2pk);
+    row("p2pkh", c.p2pkh);
+    row("p2sh", c.p2sh);
+    row("p2wpkh", c.p2wpkh);
+    row("p2wsh", c.p2wsh);
+    row("p2tr", c.p2tr);
+    row("p2a", c.p2a);
     row("op_return", c.op_return);
-    row("unknown",   c.unknown);
+    row("unknown", c.unknown);
 }
 
 /// Metrics that can be computed from the block itself.
@@ -632,7 +743,11 @@ pub struct BlockStats {
 
 impl BlockStats {
     pub fn new(height: u64) -> Self {
-        Self { height, stats_version: crate::STATS_STATE_VERSION, ..Default::default() }
+        Self {
+            height,
+            stats_version: crate::STATS_STATE_VERSION,
+            ..Default::default()
+        }
     }
 
     /// Refresh typed stats classes from the flat compatibility fields.
@@ -752,7 +867,9 @@ impl PerBlock {
         self.output_count += 1;
         if is_p2tr {
             self.p2tr_output_count += 1;
-            if reused { self.p2tr_reused_count += 1; }
+            if reused {
+                self.p2tr_reused_count += 1;
+            }
         }
     }
 

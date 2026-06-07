@@ -44,12 +44,18 @@ pub struct UidCheckpointInput {
     pub unspent_uids_sorted: Vec<u64>,
 }
 
-pub fn encode_spent_uids(block_anchor_last_uid: u64, spent_sorted: &[u64]) -> anyhow::Result<Vec<u8>> {
+pub fn encode_spent_uids(
+    block_anchor_last_uid: u64,
+    spent_sorted: &[u64],
+) -> anyhow::Result<Vec<u8>> {
     if spent_sorted.is_empty() {
         return Ok(Vec::new());
     }
     validate_sorted_unique(spent_sorted)?;
-    anyhow::ensure!(spent_sorted[0] <= block_anchor_last_uid, "spent uid exceeds block anchor");
+    anyhow::ensure!(
+        spent_sorted[0] <= block_anchor_last_uid,
+        "spent uid exceeds block anchor"
+    );
     let mut values = Vec::with_capacity(spent_sorted.len());
     values.push(block_anchor_last_uid - spent_sorted[0] + 1);
     for pair in spent_sorted.windows(2) {
@@ -58,7 +64,11 @@ pub fn encode_spent_uids(block_anchor_last_uid: u64, spent_sorted: &[u64]) -> an
     encode_elias_delta_values(&values)
 }
 
-pub fn decode_spent_uids(block_anchor_last_uid: u64, encoded: &[u8], count: usize) -> anyhow::Result<Vec<u64>> {
+pub fn decode_spent_uids(
+    block_anchor_last_uid: u64,
+    encoded: &[u8],
+    count: usize,
+) -> anyhow::Result<Vec<u64>> {
     if count == 0 {
         return Ok(Vec::new());
     }
@@ -69,7 +79,11 @@ pub fn decode_spent_uids(block_anchor_last_uid: u64, encoded: &[u8], count: usiz
     let mut out = Vec::with_capacity(count);
     out.push(first);
     for delta in &values[1..] {
-        let next = out.last().unwrap().checked_add(*delta).ok_or_else(|| anyhow::anyhow!("spent uid delta overflow"))?;
+        let next = out
+            .last()
+            .unwrap()
+            .checked_add(*delta)
+            .ok_or_else(|| anyhow::anyhow!("spent uid delta overflow"))?;
         out.push(next);
     }
     Ok(out)
@@ -81,7 +95,10 @@ pub fn encode_tx_tweak_indexes(indexes: &[u32]) -> anyhow::Result<Vec<u8>> {
     }
     validate_sorted_unique_u32(indexes)?;
     for &index in indexes {
-        anyhow::ensure!(index < MAX_TX_TWEAK_INDEX_DOMAIN, "tx tweak index {index} exceeds tx-index domain bound {MAX_TX_TWEAK_INDEX_DOMAIN}");
+        anyhow::ensure!(
+            index < MAX_TX_TWEAK_INDEX_DOMAIN,
+            "tx tweak index {index} exceeds tx-index domain bound {MAX_TX_TWEAK_INDEX_DOMAIN}"
+        );
     }
     let mut values = Vec::with_capacity(indexes.len());
     values.push(indexes[0] as u64 + 1);
@@ -99,34 +116,64 @@ pub fn decode_tx_tweak_indexes(encoded: &[u8], count: usize) -> anyhow::Result<V
     let first = values[0] - 1;
     anyhow::ensure!(first <= u32::MAX as u64, "tx index overflow");
     let mut out = Vec::with_capacity(count);
-    anyhow::ensure!((first as u32) < MAX_TX_TWEAK_INDEX_DOMAIN, "tx index exceeds tx-index domain bound");
+    anyhow::ensure!(
+        (first as u32) < MAX_TX_TWEAK_INDEX_DOMAIN,
+        "tx index exceeds tx-index domain bound"
+    );
     out.push(first as u32);
     for delta in &values[1..] {
         let next = u64::from(*out.last().unwrap()) + *delta;
         anyhow::ensure!(next <= u32::MAX as u64, "tx index overflow");
-        anyhow::ensure!((next as u32) < MAX_TX_TWEAK_INDEX_DOMAIN, "tx index exceeds tx-index domain bound");
+        anyhow::ensure!(
+            (next as u32) < MAX_TX_TWEAK_INDEX_DOMAIN,
+            "tx index exceeds tx-index domain bound"
+        );
         out.push(next as u32);
     }
     Ok(out)
 }
 
 pub fn encode_light_block(input: &LightBlockInput) -> anyhow::Result<Builder<HeapAllocator>> {
-    anyhow::ensure!(input.tx_tweak_indexes.len() == input.tx_tweaks.len(), "tx tweak indexes/tweaks length mismatch");
-    anyhow::ensure!(input.tx_tweaks.len() <= u32::MAX as usize, "too many tweaks");
+    anyhow::ensure!(
+        input.tx_tweak_indexes.len() == input.tx_tweaks.len(),
+        "tx tweak indexes/tweaks length mismatch"
+    );
+    anyhow::ensure!(
+        input.tx_tweaks.len() <= u32::MAX as usize,
+        "too many tweaks"
+    );
     // Each served Silent Payments tweak is a 33-byte compressed public key.
     // The name intentionally follows Blindbit/light-client terminology: it is
     // public point input_hash*A, not a 32-byte scalar.
-    anyhow::ensure!(input.outputs.len() <= MAX_P2TR_OUTPUTS_PER_BLOCK, "too many scope outputs in one block");
-    anyhow::ensure!(input.output_id_bytes <= MAX_P2TR_OUTPUT_ID_BYTES, "scope output_id_bytes exceeds configured bound");
+    anyhow::ensure!(
+        input.outputs.len() <= MAX_P2TR_OUTPUTS_PER_BLOCK,
+        "too many scope outputs in one block"
+    );
+    anyhow::ensure!(
+        input.output_id_bytes <= MAX_P2TR_OUTPUT_ID_BYTES,
+        "scope output_id_bytes exceeds configured bound"
+    );
     let output_id_bytes = input.output_id_bytes as usize;
     anyhow::ensure!(output_id_bytes > 0, "output_id_bytes must be non-zero");
-    anyhow::ensure!(input.output_ids.len() == input.outputs.len() * output_id_bytes, "packed output id length mismatch");
+    anyhow::ensure!(
+        input.output_ids.len() == input.outputs.len() * output_id_bytes,
+        "packed output id length mismatch"
+    );
     for output in &input.outputs {
-        anyhow::ensure!(output.uid <= input.block_anchor_last_uid, "output UID exceeds block anchor");
-        anyhow::ensure!(output.tx_index < MAX_TX_TWEAK_INDEX_DOMAIN, "output tx index exceeds tx-index domain bound");
+        anyhow::ensure!(
+            output.uid <= input.block_anchor_last_uid,
+            "output UID exceeds block anchor"
+        );
+        anyhow::ensure!(
+            output.tx_index < MAX_TX_TWEAK_INDEX_DOMAIN,
+            "output tx index exceeds tx-index domain bound"
+        );
     }
     for &uid in &input.spent_uids_sorted {
-        anyhow::ensure!(uid <= input.block_anchor_last_uid, "spent UID exceeds block anchor");
+        anyhow::ensure!(
+            uid <= input.block_anchor_last_uid,
+            "spent UID exceeds block anchor"
+        );
     }
 
     let tx_tweak_indexes = encode_tx_tweak_indexes(&input.tx_tweak_indexes)?;
@@ -191,7 +238,9 @@ pub fn encode_uid_checkpoint(input: &UidCheckpointInput) -> anyhow::Result<Build
 }
 
 fn deltas_first_plus_one(values: &[u64]) -> Vec<u64> {
-    if values.is_empty() { return Vec::new(); }
+    if values.is_empty() {
+        return Vec::new();
+    }
     let mut out = Vec::with_capacity(values.len());
     out.push(values[0] + 1);
     for pair in values.windows(2) {
@@ -202,14 +251,20 @@ fn deltas_first_plus_one(values: &[u64]) -> Vec<u64> {
 
 fn validate_sorted_unique(values: &[u64]) -> anyhow::Result<()> {
     for pair in values.windows(2) {
-        anyhow::ensure!(pair[0] < pair[1], "values must be sorted ascending and unique");
+        anyhow::ensure!(
+            pair[0] < pair[1],
+            "values must be sorted ascending and unique"
+        );
     }
     Ok(())
 }
 
 fn validate_sorted_unique_u32(values: &[u32]) -> anyhow::Result<()> {
     for pair in values.windows(2) {
-        anyhow::ensure!(pair[0] < pair[1], "values must be sorted ascending and unique");
+        anyhow::ensure!(
+            pair[0] < pair[1],
+            "values must be sorted ascending and unique"
+        );
     }
     Ok(())
 }
@@ -247,7 +302,6 @@ mod tests {
         assert_eq!(decoded, indexes);
     }
 }
-
 
 #[cfg(test)]
 mod tx_index_bound_tests {

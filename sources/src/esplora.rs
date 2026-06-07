@@ -5,8 +5,8 @@
 //! - Source-wide dormancy on 429/5xx (all in-flight tasks back off together).
 //! - `Retry-After` header honored when present.
 
-use btc_data_core::source::BlockSource;
 use async_trait::async_trait;
+use btc_data_core::source::BlockSource;
 use bytes::Bytes;
 
 pub struct EsploraSource {
@@ -46,19 +46,27 @@ impl EsploraSource {
 
     fn now_ms() -> u64 {
         std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
     }
 
     /// Wait until `dormant_until` has passed AND the min-gap has elapsed.
     async fn throttle(&self) {
         loop {
-            let dormant = self.dormant_until.load(std::sync::atomic::Ordering::Relaxed);
+            let dormant = self
+                .dormant_until
+                .load(std::sync::atomic::Ordering::Relaxed);
             let now = Self::now_ms();
-            if now >= dormant { break; }
+            if now >= dormant {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(dormant - now)).await;
         }
 
-        if self.min_gap_ms == 0 { return; }
+        if self.min_gap_ms == 0 {
+            return;
+        }
         let mut last = self.last_req.lock().await;
         let now = Self::now_ms();
         let elapsed = now.saturating_sub(*last);
@@ -71,7 +79,8 @@ impl EsploraSource {
     /// Push the source's dormant-until forward (never backward).
     fn extend_dormancy(&self, ms_from_now: u64) {
         let target = Self::now_ms() + ms_from_now;
-        self.dormant_until.fetch_max(target, std::sync::atomic::Ordering::Relaxed);
+        self.dormant_until
+            .fetch_max(target, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Parse Retry-After header (seconds integer; HTTP-date form not supported).
@@ -94,8 +103,14 @@ impl EsploraSource {
                     }
                     if status.as_u16() == 429 || status.is_server_error() {
                         let wait_ms = Self::parse_retry_after(&resp).unwrap_or(delay_ms);
-                        eprintln!("[{}] {} → {} (attempt {}, dormant {}ms)",
-                                  self.base, url, status, attempt + 1, wait_ms);
+                        eprintln!(
+                            "[{}] {} → {} (attempt {}, dormant {}ms)",
+                            self.base,
+                            url,
+                            status,
+                            attempt + 1,
+                            wait_ms
+                        );
                         self.extend_dormancy(wait_ms);
                         tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
                         delay_ms = (delay_ms * 2).min(60_000);
@@ -104,8 +119,14 @@ impl EsploraSource {
                     anyhow::bail!("HTTP {} for {}", status, url);
                 }
                 Err(e) => {
-                    eprintln!("[{}] {} → {} (attempt {}, backoff {}ms)",
-                              self.base, url, e, attempt + 1, delay_ms);
+                    eprintln!(
+                        "[{}] {} → {} (attempt {}, backoff {}ms)",
+                        self.base,
+                        url,
+                        e,
+                        attempt + 1,
+                        delay_ms
+                    );
                     self.extend_dormancy(delay_ms);
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     delay_ms = (delay_ms * 2).min(60_000);
@@ -126,7 +147,9 @@ impl BlockSource for EsploraSource {
         if trimmed.len() != 64 || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
             anyhow::bail!(
                 "{}: expected 64-char hex block hash for height {}, got {:?}",
-                self.base, height, trimmed.chars().take(120).collect::<String>()
+                self.base,
+                height,
+                trimmed.chars().take(120).collect::<String>()
             );
         }
         let mut out = [0u8; 32];
@@ -151,5 +174,7 @@ impl BlockSource for EsploraSource {
         Ok(text.trim().parse::<u64>()?)
     }
 
-    fn name(&self) -> &str { &self.base }
+    fn name(&self) -> &str {
+        &self.base
+    }
 }

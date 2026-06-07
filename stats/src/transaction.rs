@@ -30,10 +30,8 @@ pub enum SpendPath {
 /// point" section. Reused as the internal key for ordinals inscription
 /// reveals so the commitment is provably non-keypath.
 pub const NUMS_H_XONLY: [u8; 32] = [
-    0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54,
-    0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a, 0x5e,
-    0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5,
-    0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80, 0x3a, 0xc0,
+    0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a, 0x5e,
+    0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80, 0x3a, 0xc0,
 ];
 
 /// Spend path + inscription envelope, both inferred from a P2TR witness stack.
@@ -61,7 +59,10 @@ pub fn classify_p2tr_spend(witness: &Witness) -> SpendClass {
     let mut len = witness.len();
 
     if len == 0 {
-        return SpendClass { path: SpendPath::Key, inscription: false };
+        return SpendClass {
+            path: SpendPath::Key,
+            inscription: false,
+        };
     }
 
     // BIP341 annex: if present, it is the final witness element and starts
@@ -73,16 +74,27 @@ pub fn classify_p2tr_spend(witness: &Witness) -> SpendClass {
     }
 
     if len < 2 {
-        return SpendClass { path: SpendPath::Key, inscription: false };
+        return SpendClass {
+            path: SpendPath::Key,
+            inscription: false,
+        };
     }
 
     let control = match witness_item(witness, len - 1) {
         Some(control) => control,
-        None => return SpendClass { path: SpendPath::Key, inscription: false },
+        None => {
+            return SpendClass {
+                path: SpendPath::Key,
+                inscription: false,
+            }
+        }
     };
 
     if !is_taproot_control_block(control) {
-        return SpendClass { path: SpendPath::Key, inscription: false };
+        return SpendClass {
+            path: SpendPath::Key,
+            inscription: false,
+        };
     }
 
     let script = witness_item(witness, len - 2).unwrap_or_default();
@@ -108,7 +120,7 @@ fn is_taproot_annex(item: &[u8]) -> bool {
 
 fn is_taproot_control_block(item: &[u8]) -> bool {
     // BIP341 control block length: 33 + 32m, where m is 0..=128.
-    item.len() >= 33 && (item.len() - 33) % 32 == 0
+    item.len() >= 33 && (item.len() - 33).is_multiple_of(32)
 }
 
 // ─── Inscription envelope detection ────────────────────────────────────

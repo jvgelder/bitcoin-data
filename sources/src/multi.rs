@@ -4,10 +4,10 @@
 //! across sources for higher aggregate throughput against rate-limited
 //! public endpoints.
 
-use btc_data_core::block::RawBlockFrame;
-use bytes::Bytes;
-use btc_data_core::source::BlockSource;
 use async_trait::async_trait;
+use btc_data_core::block::RawBlockFrame;
+use btc_data_core::source::BlockSource;
+use bytes::Bytes;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct MultiSource {
@@ -18,7 +18,10 @@ pub struct MultiSource {
 impl MultiSource {
     pub fn new(sources: Vec<Box<dyn BlockSource>>) -> Self {
         assert!(!sources.is_empty(), "need at least one source");
-        Self { sources, cursor: AtomicUsize::new(0) }
+        Self {
+            sources,
+            cursor: AtomicUsize::new(0),
+        }
     }
 
     fn pick(&self) -> &dyn BlockSource {
@@ -36,7 +39,10 @@ impl BlockSource for MultiSource {
             let src = self.pick();
             match src.get_block_hash(height).await {
                 Ok(h) => return Ok(h),
-                Err(e) => { eprintln!("[{}] hash {height}: {e}", src.name()); last_err = Some(e); }
+                Err(e) => {
+                    eprintln!("[{}] hash {height}: {e}", src.name());
+                    last_err = Some(e);
+                }
             }
         }
         Err(last_err.unwrap())
@@ -49,7 +55,10 @@ impl BlockSource for MultiSource {
             let src = self.pick();
             match src.get_block_raw(hash).await {
                 Ok(b) => return Ok(b),
-                Err(e) => { eprintln!("[{}] block fetch: {e}", src.name()); last_err = Some(e); }
+                Err(e) => {
+                    eprintln!("[{}] block fetch: {e}", src.name());
+                    last_err = Some(e);
+                }
             }
         }
         Err(last_err.unwrap())
@@ -62,7 +71,10 @@ impl BlockSource for MultiSource {
             let src = self.pick();
             match src.get_best_height().await {
                 Ok(h) => return Ok(h),
-                Err(e) => { eprintln!("[{}] best height: {e}", src.name()); last_err = Some(e); }
+                Err(e) => {
+                    eprintln!("[{}] best height: {e}", src.name());
+                    last_err = Some(e);
+                }
             }
         }
         Err(last_err.unwrap())
@@ -75,7 +87,10 @@ impl BlockSource for MultiSource {
             let src = self.pick();
             match src.get_block_by_height(height).await {
                 Ok(frame) => return Ok(frame),
-                Err(e) => { eprintln!("[{}] block height {height}: {e}", src.name()); last_err = Some(e); }
+                Err(e) => {
+                    eprintln!("[{}] block height {height}: {e}", src.name());
+                    last_err = Some(e);
+                }
             }
         }
         Err(last_err.unwrap())
@@ -107,12 +122,18 @@ impl BlockSource for MultiSource {
     }
 
     fn supports_block_range_batches(&self) -> bool {
-        self.sources.iter().all(|source| source.supports_block_range_batches())
+        self.sources
+            .iter()
+            .all(|source| source.supports_block_range_batches())
     }
 
     fn prefers_height_fetch(&self) -> bool {
-        self.sources.iter().all(|source| source.prefers_height_fetch())
+        self.sources
+            .iter()
+            .all(|source| source.prefers_height_fetch())
     }
 
-    fn name(&self) -> &str { "multi" }
+    fn name(&self) -> &str {
+        "multi"
+    }
 }

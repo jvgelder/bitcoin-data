@@ -24,7 +24,11 @@ pub type ParsedBlock = DecodedBlockFrame;
 pub fn decode_raw_block(frame: RawBlockFrame) -> anyhow::Result<DecodedBlockFrame> {
     let mut bytes = frame.bytes.as_ref();
     let block = bitcoin::Block::consensus_decode(&mut bytes)?;
-    Ok(DecodedBlockFrame { height: frame.height, hash: frame.hash, block })
+    Ok(DecodedBlockFrame {
+        height: frame.height,
+        hash: frame.hash,
+        block,
+    })
 }
 
 /// Backwards-compatible alias for callers that still use the old name.

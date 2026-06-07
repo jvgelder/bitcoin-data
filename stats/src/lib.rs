@@ -19,19 +19,24 @@ pub mod histogram;
 pub mod scan;
 pub mod script;
 pub mod sinks;
+pub mod stats;
 pub mod sync;
 pub mod transaction;
 pub mod utxo_hash;
 
 pub const STATS_STATE_VERSION: u32 = 6;
 
+pub mod stats_capnp {
+    include!(concat!(env!("OUT_DIR"), "/stats_capnp.rs"));
+}
+
 pub use block::{
-    elias_delta_bits, elias_fano_bits, leb128_len_u64, measure_sorted_uid_stream,
-    rice_bits, BlockLocalStats, BlockStats, ChainDerivedStats, CodecEstimate, PerBlock,
-    RiceChoice, SortedUidBlockEstimate, SortedUidCodecStats, SpendContext, Stats,
+    elias_delta_bits, elias_fano_bits, leb128_len_u64, measure_sorted_uid_stream, rice_bits,
+    BlockLocalStats, BlockStats, ChainDerivedStats, CodecEstimate, PerBlock, RiceChoice,
+    SortedUidBlockEstimate, SortedUidCodecStats, SpendContext, Stats,
 };
-pub use histogram::Log2Hist;
 pub use checkpoint::{CheckpointConfig, StatsCheckpoint};
+pub use histogram::Log2Hist;
 pub use scan::{scan, ScanConfig, StatsScannerState};
 pub use script::{classify_script, ScriptType, TypeCounts};
 pub use transaction::{

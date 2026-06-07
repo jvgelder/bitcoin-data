@@ -1,5 +1,5 @@
-use crate::storage::{ArchiveBackend, ServedProfile};
 use crate::profile::{ArchiveScope, Profile};
+use crate::storage::{ArchiveBackend, ServedProfile};
 use crate::{json_wire, range::frame_range, DEFAULT_MAX_RANGE_COUNT, WIRE_VERSION};
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -62,7 +62,6 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 
-
 impl From<serde_json::Error> for ApiError {
     fn from(error: serde_json::Error) -> Self {
         Self::internal(anyhow::Error::from(error))
@@ -116,7 +115,10 @@ struct LatestCheckpointQuery {
 }
 
 pub async fn serve(config: ServerConfig, archive: Arc<dyn ArchiveBackend>) -> anyhow::Result<()> {
-    let state = AppState { archive, max_range_count: config.max_range_count };
+    let state = AppState {
+        archive,
+        max_range_count: config.max_range_count,
+    };
     let app = Router::new()
         .route("/health", get(health))
         .route("/manifest", get(manifest))
@@ -143,9 +145,16 @@ async fn manifest(State(state): State<AppState>) -> ApiResult<Json<serde_json::V
     Ok(Json(serde_json::to_value(state.archive.manifest().await?)?))
 }
 
-async fn tip(State(state): State<AppState>, Query(q): Query<ClientProfileQuery>) -> ApiResult<Json<serde_json::Value>> {
+async fn tip(
+    State(state): State<AppState>,
+    Query(q): Query<ClientProfileQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
     let profile = select_profile(&state.archive, q.scope, q.cutthrough, None).await?;
-    let tip = state.archive.tip(&profile).await?.ok_or_else(|| anyhow::anyhow!("no served tip for profile {}", profile.name))?;
+    let tip = state
+        .archive
+        .tip(&profile)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no served tip for profile {}", profile.name))?;
     Ok(Json(json!({
         "height": tip.height,
         "block_hash": tip.block_hash,
@@ -168,7 +177,10 @@ async fn single_block(
     let (payload, block_hash) = state.archive.read_block(height, &profile).await?;
     let mut response = match format {
         ResponseFormat::Capnp => binary_response(payload, cache_control(height, &profile)),
-        ResponseFormat::Json => json_response(serde_json::to_vec_pretty(&json_wire::light_block_to_json(&payload, Some(&profile))?)?, cache_control(height, &profile)),
+        ResponseFormat::Json => json_response(
+            serde_json::to_vec_pretty(&json_wire::light_block_to_json(&payload, Some(&profile))?)?,
+            cache_control(height, &profile),
+        ),
     };
     add_block_headers(&mut response, height, &block_hash, &profile);
     Ok(response)
@@ -185,13 +197,14 @@ async fn block_range(
     if q.count > state.max_range_count {
         return Err(ApiError::bad_request(format!(
             "count {} exceeds max_range_count {}",
-            q.count,
-            state.max_range_count
+            q.count, state.max_range_count
         )));
     }
     let format = response_format(&headers)?;
     let profile = select_profile(&state.archive, q.scope, q.cutthrough, Some(q.start)).await?;
-    let tip = profile.served_tip.as_ref()
+    let tip = profile
+        .served_tip
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("profile {} has no served tip", profile.name))?;
     if q.start > tip.height {
         return Err(ApiError::bad_request(format!(
@@ -204,9 +217,12 @@ async fn block_range(
     let end = q.start + u64::from(count) - 1;
     let messages = state.archive.read_blocks(q.start, count, &profile).await?;
     let mut response = match format {
-        ResponseFormat::Capnp => binary_response(frame_range(&messages)?, cache_control(end, &profile)),
+        ResponseFormat::Capnp => {
+            binary_response(frame_range(&messages)?, cache_control(end, &profile))
+        }
         ResponseFormat::Json => {
-            let blocks = messages.iter()
+            let blocks = messages
+                .iter()
                 .map(|payload| json_wire::light_block_to_json(payload, Some(&profile)))
                 .collect::<anyhow::Result<Vec<_>>>()?;
             let body = serde_json::to_vec_pretty(&json!({
@@ -240,7 +256,10 @@ async fn checkpoint(
     let body = state.archive.read_checkpoint(height, &profile).await?;
     let mut response = match format {
         ResponseFormat::Capnp => binary_response(body, cache_control(height, &profile)),
-        ResponseFormat::Json => json_response(serde_json::to_vec_pretty(&json_wire::checkpoint_to_json(&body, Some(&profile))?)?, cache_control(height, &profile)),
+        ResponseFormat::Json => json_response(
+            serde_json::to_vec_pretty(&json_wire::checkpoint_to_json(&body, Some(&profile))?)?,
+            cache_control(height, &profile),
+        ),
     };
     add_checkpoint_headers(&mut response, height, &profile);
     Ok(response)
@@ -257,18 +276,27 @@ async fn latest_checkpoint(
         Some(tip) => q.height_lte.min(tip.height),
         None => q.height_lte,
     };
-    let height = state.archive.latest_checkpoint_height(height_lte, &profile).await?
+    let height = state
+        .archive
+        .latest_checkpoint_height(height_lte, &profile)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("no checkpoint <= {height_lte}"))?;
     let body = state.archive.read_checkpoint(height, &profile).await?;
     let mut response = match format {
         ResponseFormat::Capnp => binary_response(body, cache_control(height, &profile)),
-        ResponseFormat::Json => json_response(serde_json::to_vec_pretty(&json_wire::checkpoint_to_json(&body, Some(&profile))?)?, cache_control(height, &profile)),
+        ResponseFormat::Json => json_response(
+            serde_json::to_vec_pretty(&json_wire::checkpoint_to_json(&body, Some(&profile))?)?,
+            cache_control(height, &profile),
+        ),
     };
     add_checkpoint_headers(&mut response, height, &profile);
     Ok(response)
 }
 
-async fn block_stats(State(state): State<AppState>, Path(height): Path<u64>) -> ApiResult<Json<serde_json::Value>> {
+async fn block_stats(
+    State(state): State<AppState>,
+    Path(height): Path<u64>,
+) -> ApiResult<Json<serde_json::Value>> {
     Ok(Json(state.archive.block_stats(height).await?))
 }
 
@@ -280,25 +308,41 @@ async fn select_profile(
 ) -> anyhow::Result<ServedProfile> {
     let scope = requested_scope.unwrap_or(ArchiveScope::P2trSp);
     let manifest = archive.manifest().await?;
-    let indexed_scopes: std::collections::BTreeSet<_> = manifest.profiles.iter().map(|p| p.scope).collect();
+    let indexed_scopes: std::collections::BTreeSet<_> =
+        manifest.profiles.iter().map(|p| p.scope).collect();
     anyhow::ensure!(
         indexed_scopes.contains(&scope),
         "scope {} is not indexed by this server; indexed scopes: {}",
         scope.as_str(),
-        indexed_scopes.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        indexed_scopes
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
 
     if !cutthrough {
-        return archive.resolve_profile(None, Some(Profile { scope, cutthrough_blocks: 0 })).await
-            .map_err(|err| anyhow::anyhow!(
-                "raw profile for scope {} is not available on this server: {err}",
-                scope.as_str()
-            ));
+        return archive
+            .resolve_profile(
+                None,
+                Some(Profile {
+                    scope,
+                    cutthrough_blocks: 0,
+                }),
+            )
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "raw profile for scope {} is not available on this server: {err}",
+                    scope.as_str()
+                )
+            });
     }
 
     let min_height = start_or_height.unwrap_or(0);
 
-    let mut candidates: Vec<_> = manifest.profiles
+    let mut candidates: Vec<_> = manifest
+        .profiles
         .into_iter()
         .filter(|p| p.scope == scope && p.cutthrough_blocks > 0)
         .filter(|p| p.tip.as_ref().is_some_and(|tip| tip.height >= min_height))
@@ -312,14 +356,27 @@ async fn select_profile(
             min_height
         ))?;
 
-    archive.resolve_profile(None, Some(Profile { scope, cutthrough_blocks: selected.cutthrough_blocks })).await
+    archive
+        .resolve_profile(
+            None,
+            Some(Profile {
+                scope,
+                cutthrough_blocks: selected.cutthrough_blocks,
+            }),
+        )
+        .await
 }
 
 fn ensure_height_served(height: u64, profile: &ServedProfile) -> anyhow::Result<()> {
     let Some(tip) = &profile.served_tip else {
         anyhow::bail!("profile {} has no served tip", profile.name);
     };
-    anyhow::ensure!(height <= tip.height, "height {height} is above served tip {} for profile {}", tip.height, profile.name);
+    anyhow::ensure!(
+        height <= tip.height,
+        "height {height} is above served tip {} for profile {}",
+        tip.height,
+        profile.name
+    );
     Ok(())
 }
 
@@ -357,37 +414,121 @@ fn json_response(body: Vec<u8>, cache_control: &'static str) -> Response {
     response_with_content_type(body, cache_control, "application/json; charset=utf-8")
 }
 
-fn response_with_content_type(body: Vec<u8>, cache_control: &'static str, content_type: &'static str) -> Response {
+fn response_with_content_type(
+    body: Vec<u8>,
+    cache_control: &'static str,
+    content_type: &'static str,
+) -> Response {
     let mut response = Response::new(Body::from(body));
-    response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static(cache_control));
-    response.headers_mut().insert(header::VARY, HeaderValue::from_static("Accept"));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(cache_control),
+    );
+    response
+        .headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("Accept"));
     response
 }
 
-fn add_block_headers(response: &mut Response, height: u64, block_hash: &[u8], profile: &ServedProfile) {
-    response.headers_mut().insert(HeaderName::from_static("x-bitcoindata-light-version"), HeaderValue::from_str(&WIRE_VERSION.to_string()).unwrap());
-    response.headers_mut().insert(HeaderName::from_static("x-bitcoindata-profile"), HeaderValue::from_str(&profile.name).unwrap());
-    response.headers_mut().insert(HeaderName::from_static("x-bitcoindata-scope"), HeaderValue::from_str(profile.profile.scope.as_str()).unwrap());
-    response.headers_mut().insert(HeaderName::from_static("x-bitcoindata-cutthrough"), HeaderValue::from_static(if profile.profile.cutthrough_blocks == 0 { "false" } else { "true" }));
-    response.headers_mut().insert(HeaderName::from_static("x-bitcoindata-cutthrough-blocks"), HeaderValue::from_str(&profile.profile.cutthrough_blocks.to_string()).unwrap());
-    response.headers_mut().insert(HeaderName::from_static("x-bitcoin-block-height"), HeaderValue::from_str(&height.to_string()).unwrap());
-    response.headers_mut().insert(HeaderName::from_static("x-bitcoin-block-hash"), HeaderValue::from_str(&hex::encode(block_hash)).unwrap());
+fn add_block_headers(
+    response: &mut Response,
+    height: u64,
+    block_hash: &[u8],
+    profile: &ServedProfile,
+) {
+    response.headers_mut().insert(
+        HeaderName::from_static("x-bitcoindata-light-version"),
+        HeaderValue::from_str(&WIRE_VERSION.to_string()).unwrap(),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-bitcoindata-profile"),
+        HeaderValue::from_str(&profile.name).unwrap(),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-bitcoindata-scope"),
+        HeaderValue::from_str(profile.profile.scope.as_str()).unwrap(),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-bitcoindata-cutthrough"),
+        HeaderValue::from_static(if profile.profile.cutthrough_blocks == 0 {
+            "false"
+        } else {
+            "true"
+        }),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-bitcoindata-cutthrough-blocks"),
+        HeaderValue::from_str(&profile.profile.cutthrough_blocks.to_string()).unwrap(),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-bitcoin-block-height"),
+        HeaderValue::from_str(&height.to_string()).unwrap(),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-bitcoin-block-hash"),
+        HeaderValue::from_str(&hex::encode(block_hash)).unwrap(),
+    );
 }
 
-fn add_range_headers(response: &mut Response, start: u64, end: u64, count: u32, profile: &ServedProfile) {
-    response.headers_mut().insert(HeaderName::from_static("x-bitcoindata-profile"), HeaderValue::from_str(&profile.name).unwrap());
-    response.headers_mut().insert(HeaderName::from_static("x-bitcoindata-scope"), HeaderValue::from_str(profile.profile.scope.as_str()).unwrap());
-    response.headers_mut().insert(HeaderName::from_static("x-bitcoindata-cutthrough"), HeaderValue::from_static(if profile.profile.cutthrough_blocks == 0 { "false" } else { "true" }));
-    response.headers_mut().insert(HeaderName::from_static("x-bitcoindata-cutthrough-blocks"), HeaderValue::from_str(&profile.profile.cutthrough_blocks.to_string()).unwrap());
-    response.headers_mut().insert(HeaderName::from_static("x-bitcoindata-range-start"), HeaderValue::from_str(&start.to_string()).unwrap());
-    response.headers_mut().insert(HeaderName::from_static("x-bitcoindata-range-end"), HeaderValue::from_str(&end.to_string()).unwrap());
-    response.headers_mut().insert(HeaderName::from_static("x-bitcoindata-range-count"), HeaderValue::from_str(&count.to_string()).unwrap());
+fn add_range_headers(
+    response: &mut Response,
+    start: u64,
+    end: u64,
+    count: u32,
+    profile: &ServedProfile,
+) {
+    response.headers_mut().insert(
+        HeaderName::from_static("x-bitcoindata-profile"),
+        HeaderValue::from_str(&profile.name).unwrap(),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-bitcoindata-scope"),
+        HeaderValue::from_str(profile.profile.scope.as_str()).unwrap(),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-bitcoindata-cutthrough"),
+        HeaderValue::from_static(if profile.profile.cutthrough_blocks == 0 {
+            "false"
+        } else {
+            "true"
+        }),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-bitcoindata-cutthrough-blocks"),
+        HeaderValue::from_str(&profile.profile.cutthrough_blocks.to_string()).unwrap(),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-bitcoindata-range-start"),
+        HeaderValue::from_str(&start.to_string()).unwrap(),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-bitcoindata-range-end"),
+        HeaderValue::from_str(&end.to_string()).unwrap(),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-bitcoindata-range-count"),
+        HeaderValue::from_str(&count.to_string()).unwrap(),
+    );
 }
 
 fn add_checkpoint_headers(response: &mut Response, height: u64, profile: &ServedProfile) {
-    response.headers_mut().insert(HeaderName::from_static("x-bitcoin-checkpoint-height"), HeaderValue::from_str(&height.to_string()).unwrap());
-    response.headers_mut().insert(HeaderName::from_static("x-bitcoindata-profile"), HeaderValue::from_str(&profile.name).unwrap());
-    response.headers_mut().insert(HeaderName::from_static("x-bitcoindata-scope"), HeaderValue::from_str(profile.profile.scope.as_str()).unwrap());
-    response.headers_mut().insert(HeaderName::from_static("x-bitcoindata-cutthrough-blocks"), HeaderValue::from_str(&profile.profile.cutthrough_blocks.to_string()).unwrap());
+    response.headers_mut().insert(
+        HeaderName::from_static("x-bitcoin-checkpoint-height"),
+        HeaderValue::from_str(&height.to_string()).unwrap(),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-bitcoindata-profile"),
+        HeaderValue::from_str(&profile.name).unwrap(),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-bitcoindata-scope"),
+        HeaderValue::from_str(profile.profile.scope.as_str()).unwrap(),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-bitcoindata-cutthrough-blocks"),
+        HeaderValue::from_str(&profile.profile.cutthrough_blocks.to_string()).unwrap(),
+    );
 }

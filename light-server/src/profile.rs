@@ -198,13 +198,25 @@ mod tests {
 
     #[test]
     fn p2tr_scopes_default_to_taproot_activation_on_mainnet() {
-        assert_eq!(ArchiveScope::P2trSp.default_start_height(ArchiveNetwork::Mainnet), 709_632);
-        assert_eq!(ArchiveScope::P2tr.default_start_height(ArchiveNetwork::Mainnet), 709_632);
+        assert_eq!(
+            ArchiveScope::P2trSp.default_start_height(ArchiveNetwork::Mainnet),
+            709_632
+        );
+        assert_eq!(
+            ArchiveScope::P2tr.default_start_height(ArchiveNetwork::Mainnet),
+            709_632
+        );
     }
 
     #[test]
     fn p2tr_scopes_default_to_taproot_activation_on_testnet() {
-        assert_eq!(ArchiveScope::P2trSp.default_start_height(ArchiveNetwork::Testnet), 2_011_968);
-        assert_eq!(ArchiveScope::P2tr.default_start_height(ArchiveNetwork::Testnet), 2_011_968);
+        assert_eq!(
+            ArchiveScope::P2trSp.default_start_height(ArchiveNetwork::Testnet),
+            2_011_968
+        );
+        assert_eq!(
+            ArchiveScope::P2tr.default_start_height(ArchiveNetwork::Testnet),
+            2_011_968
+        );
     }
 }

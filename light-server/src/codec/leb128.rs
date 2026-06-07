@@ -10,9 +10,13 @@ fn encode_one(mut value: u64, out: &mut Vec<u8>) {
     loop {
         let mut byte = (value & 0x7f) as u8;
         value >>= 7;
-        if value != 0 { byte |= 0x80; }
+        if value != 0 {
+            byte |= 0x80;
+        }
         out.push(byte);
-        if value == 0 { break; }
+        if value == 0 {
+            break;
+        }
     }
 }
 
@@ -27,7 +31,9 @@ pub fn decode_leb128_values(bytes: &[u8], count: usize) -> anyhow::Result<Vec<u6
             let byte = bytes[i];
             i += 1;
             value |= u64::from(byte & 0x7f) << shift;
-            if byte & 0x80 == 0 { break; }
+            if byte & 0x80 == 0 {
+                break;
+            }
             shift += 7;
             anyhow::ensure!(shift < 64, "LEB128 value is too large");
         }

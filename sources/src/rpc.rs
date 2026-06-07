@@ -1,9 +1,9 @@
 //! bitcoind JSON-RPC source (verbosity=0 → raw hex).
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use btc_data_core::block::RawBlockFrame;
 use btc_data_core::source::BlockSource;
+use bytes::Bytes;
 use std::path::{Path, PathBuf};
 
 pub struct RpcSource {
@@ -14,7 +14,10 @@ pub struct RpcSource {
 impl RpcSource {
     pub fn new(url: String, user: String, pass: String) -> Self {
         let name = url.clone();
-        Self { rpc: crate::rpc_client::BitcoinRpc::new(url, user, pass), name }
+        Self {
+            rpc: crate::rpc_client::BitcoinRpc::new(url, user, pass),
+            name,
+        }
     }
 
     /// Create an RPC source using explicit username/password when supplied,
@@ -66,7 +69,10 @@ fn read_cookie_auth(url: &str, cookie_file: Option<&Path>) -> anyhow::Result<(St
         };
 
         if user.is_empty() || pass.is_empty() {
-            anyhow::bail!("invalid RPC cookie in {}: empty username or password", path.display());
+            anyhow::bail!(
+                "invalid RPC cookie in {}: empty username or password",
+                path.display()
+            );
         }
 
         return Ok((user.to_owned(), pass.to_owned()));
@@ -130,8 +136,12 @@ fn default_bitcoin_datadir() -> Option<PathBuf> {
 
     #[cfg(target_os = "macos")]
     {
-        std::env::var_os("HOME")
-            .map(|p| PathBuf::from(p).join("Library").join("Application Support").join("Bitcoin"))
+        std::env::var_os("HOME").map(|p| {
+            PathBuf::from(p)
+                .join("Library")
+                .join("Application Support")
+                .join("Bitcoin")
+        })
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -195,7 +205,7 @@ impl BlockSource for RpcSource {
 
         Ok(hashes
             .into_iter()
-            .zip(bytes.into_iter())
+            .zip(bytes)
             .enumerate()
             .map(|(offset, (hash, bytes))| RawBlockFrame {
                 height: start_height + offset as u64,
@@ -209,5 +219,7 @@ impl BlockSource for RpcSource {
         true
     }
 
-    fn name(&self) -> &str { &self.name }
+    fn name(&self) -> &str {
+        &self.name
+    }
 }

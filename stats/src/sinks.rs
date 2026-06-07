@@ -29,7 +29,9 @@ pub trait StatsSink: Send + Sync {
         let _ = height;
         Ok(())
     }
-    async fn flush(&self) -> anyhow::Result<()> { Ok(()) }
+    async fn flush(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
     fn name(&self) -> &str;
 }
 

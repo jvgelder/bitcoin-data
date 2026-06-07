@@ -10,15 +10,22 @@
 //! while allowing the generated capnp clients to stay on a `LocalSet`.
 
 use async_trait::async_trait;
+use btc_data_core::{
+    block::RawBlockFrame,
+    source::{BlockSource, TipWatcher},
+};
 use bytes::Bytes;
-use btc_data_core::{block::RawBlockFrame, source::{BlockSource, TipWatcher}};
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
 #[cfg(feature = "ipc")]
-use bitcoin_capnp_types::{chain_capnp::chain, init_capnp::init, proxy_capnp::{thread, thread_map}};
+use bitcoin_capnp_types::{
+    chain_capnp::chain,
+    init_capnp::init,
+    proxy_capnp::{thread, thread_map},
+};
 #[cfg(feature = "ipc")]
 use capnp_rpc::{rpc_twoparty_capnp::Side, twoparty::VatNetwork, RpcSystem};
 #[cfg(feature = "ipc")]
@@ -115,7 +122,11 @@ impl IpcSource {
             })?;
 
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self { socket_path, name, tx }),
+            Ok(Ok(())) => Ok(Self {
+                socket_path,
+                name,
+                tx,
+            }),
             Ok(Err(err)) => Err(err),
             Err(err) => Err(anyhow::anyhow!("IPC actor failed to start: {err}")),
         }
@@ -150,26 +161,31 @@ impl IpcSource {
             .send(make(reply))
             .await
             .map_err(|_| anyhow::anyhow!("IPC actor is not running"))?;
-        rx.await.map_err(|_| anyhow::anyhow!("IPC actor dropped response"))?
+        rx.await
+            .map_err(|_| anyhow::anyhow!("IPC actor dropped response"))?
     }
 }
 
 #[async_trait]
 impl BlockSource for IpcSource {
     async fn get_block_hash(&self, height: u64) -> anyhow::Result<[u8; 32]> {
-        self.request(|reply| IpcRequest::GetBlockHash { height, reply }).await
+        self.request(|reply| IpcRequest::GetBlockHash { height, reply })
+            .await
     }
 
     async fn get_block_raw(&self, hash: [u8; 32]) -> anyhow::Result<Bytes> {
-        self.request(|reply| IpcRequest::GetBlockRaw { hash, reply }).await
+        self.request(|reply| IpcRequest::GetBlockRaw { hash, reply })
+            .await
     }
 
     async fn get_best_height(&self) -> anyhow::Result<u64> {
-        self.request(|reply| IpcRequest::GetBestHeight { reply }).await
+        self.request(|reply| IpcRequest::GetBestHeight { reply })
+            .await
     }
 
     async fn get_block_by_height(&self, height: u64) -> anyhow::Result<RawBlockFrame> {
-        self.request(|reply| IpcRequest::GetBlockByHeight { height, reply }).await
+        self.request(|reply| IpcRequest::GetBlockByHeight { height, reply })
+            .await
     }
 
     fn prefers_height_fetch(&self) -> bool {
@@ -184,7 +200,8 @@ impl BlockSource for IpcSource {
 #[async_trait]
 impl TipWatcher for IpcSource {
     async fn wait_for_tip_change(&self, old_tip: Option<[u8; 32]>) -> anyhow::Result<()> {
-        self.request(|reply| IpcRequest::WaitForTipChange { old_tip, reply }).await
+        self.request(|reply| IpcRequest::WaitForTipChange { old_tip, reply })
+            .await
     }
 
     fn name(&self) -> &str {
@@ -202,9 +219,12 @@ struct IpcActor {
 #[cfg(feature = "ipc")]
 impl IpcActor {
     async fn connect(socket_path: &Path, thread_count: usize) -> anyhow::Result<Self> {
-        let stream = UnixStream::connect(socket_path)
-            .await
-            .map_err(|err| anyhow::anyhow!("failed to connect to IPC socket {}: {err}", socket_path.display()))?;
+        let stream = UnixStream::connect(socket_path).await.map_err(|err| {
+            anyhow::anyhow!(
+                "failed to connect to IPC socket {}: {err}",
+                socket_path.display()
+            )
+        })?;
 
         let (reader, writer) = stream.into_split();
         let reader = futures::io::BufReader::with_capacity(4 << 20, reader.compat());
@@ -230,7 +250,9 @@ impl IpcActor {
             .get()
             .map_err(|err| anyhow::anyhow!("IPC Init.construct response failed: {err}"))?
             .get_thread_map()
-            .map_err(|err| anyhow::anyhow!("IPC Init.construct did not return thread map: {err}"))?;
+            .map_err(|err| {
+                anyhow::anyhow!("IPC Init.construct did not return thread map: {err}")
+            })?;
 
         let mut threads = Vec::with_capacity(thread_count);
         for index in 0..thread_count {
@@ -239,12 +261,16 @@ impl IpcActor {
                 .send()
                 .promise
                 .await
-                .map_err(|err| anyhow::anyhow!("IPC ThreadMap.makeThread #{index} failed: {err}"))?;
+                .map_err(|err| {
+                    anyhow::anyhow!("IPC ThreadMap.makeThread #{index} failed: {err}")
+                })?;
             let thread: thread::Client = thread_response
                 .get()
                 .map_err(|err| anyhow::anyhow!("IPC makeThread #{index} response failed: {err}"))?
                 .get_result()
-                .map_err(|err| anyhow::anyhow!("IPC makeThread #{index} did not return thread: {err}"))?;
+                .map_err(|err| {
+                    anyhow::anyhow!("IPC makeThread #{index} did not return thread: {err}")
+                })?;
             threads.push(thread);
         }
 
@@ -264,7 +290,11 @@ impl IpcActor {
             .get_result()
             .map_err(|err| anyhow::anyhow!("IPC makeChain did not return Chain client: {err}"))?;
 
-        Ok(Self { threads, next: Cell::new(0), chain })
+        Ok(Self {
+            threads,
+            next: Cell::new(0),
+            chain,
+        })
     }
 
     fn pick_thread(&self) -> thread::Client {
@@ -331,8 +361,9 @@ async fn get_block_hash(
     thread: &thread::Client,
     height: u64,
 ) -> anyhow::Result<[u8; 32]> {
-    let height_i32 = i32::try_from(height)
-        .map_err(|_| anyhow::anyhow!("height {height} does not fit Bitcoin Core IPC Int32 height"))?;
+    let height_i32 = i32::try_from(height).map_err(|_| {
+        anyhow::anyhow!("height {height} does not fit Bitcoin Core IPC Int32 height")
+    })?;
     let mut req = chain.get_block_hash_request();
     req.get()
         .get_context()
@@ -353,20 +384,22 @@ async fn get_block_hash(
     data_to_hash(hash, "getBlockHash")
 }
 
-
 #[cfg(feature = "ipc")]
 async fn get_block_by_height(
     chain: &chain::Client,
     thread: &thread::Client,
     height: u64,
 ) -> anyhow::Result<RawBlockFrame> {
-    let height_i32 = i32::try_from(height)
-        .map_err(|_| anyhow::anyhow!("height {height} does not fit Bitcoin Core IPC Int32 height"))?;
+    let height_i32 = i32::try_from(height).map_err(|_| {
+        anyhow::anyhow!("height {height} does not fit Bitcoin Core IPC Int32 height")
+    })?;
 
     let mut req = chain.find_first_block_with_time_and_height_request();
     req.get()
         .get_context()
-        .map_err(|err| anyhow::anyhow!("IPC findFirstBlockWithTimeAndHeight context failed: {err}"))?
+        .map_err(|err| {
+            anyhow::anyhow!("IPC findFirstBlockWithTimeAndHeight context failed: {err}")
+        })?
         .set_thread(thread.clone());
     req.get().set_min_time(0);
     req.get().set_min_height(height_i32);
@@ -377,23 +410,25 @@ async fn get_block_by_height(
         params.set_want_data(true);
     }
 
-    let resp = req
-        .send()
-        .promise
-        .await
-        .map_err(|err| anyhow::anyhow!("IPC Chain.findFirstBlockWithTimeAndHeight({height}) failed: {err}"))?;
-    let result = resp
-        .get()
-        .map_err(|err| anyhow::anyhow!("IPC findFirstBlockWithTimeAndHeight response failed: {err}"))?;
+    let resp = req.send().promise.await.map_err(|err| {
+        anyhow::anyhow!("IPC Chain.findFirstBlockWithTimeAndHeight({height}) failed: {err}")
+    })?;
+    let result = resp.get().map_err(|err| {
+        anyhow::anyhow!("IPC findFirstBlockWithTimeAndHeight response failed: {err}")
+    })?;
     if !result.get_result() {
-        anyhow::bail!("IPC Chain.findFirstBlockWithTimeAndHeight did not find block at height {height}");
+        anyhow::bail!(
+            "IPC Chain.findFirstBlockWithTimeAndHeight did not find block at height {height}"
+        );
     }
 
-    let block = result
-        .get_block()
-        .map_err(|err| anyhow::anyhow!("IPC findFirstBlockWithTimeAndHeight block result invalid: {err}"))?;
+    let block = result.get_block().map_err(|err| {
+        anyhow::anyhow!("IPC findFirstBlockWithTimeAndHeight block result invalid: {err}")
+    })?;
     if !block.get_found() {
-        anyhow::bail!("IPC Chain.findFirstBlockWithTimeAndHeight returned found=false for height {height}");
+        anyhow::bail!(
+            "IPC Chain.findFirstBlockWithTimeAndHeight returned found=false for height {height}"
+        );
     }
 
     let returned_height = block.get_height();
@@ -416,7 +451,11 @@ async fn get_block_by_height(
         .map_err(|err| anyhow::anyhow!("IPC height block returned no block data: {err}"))?;
     let bytes = Bytes::copy_from_slice(data);
 
-    Ok(RawBlockFrame { height, hash, bytes })
+    Ok(RawBlockFrame {
+        height,
+        hash,
+        bytes,
+    })
 }
 
 #[cfg(feature = "ipc")]
@@ -447,7 +486,10 @@ async fn get_block_raw(
         .get()
         .map_err(|err| anyhow::anyhow!("IPC findBlock response failed: {err}"))?;
     if !result.get_result() {
-        anyhow::bail!("IPC Chain.findBlock did not find block {}", display_hash(hash));
+        anyhow::bail!(
+            "IPC Chain.findBlock did not find block {}",
+            display_hash(hash)
+        );
     }
     let block = result
         .get_block()
@@ -457,7 +499,6 @@ async fn get_block_raw(
         .map_err(|err| anyhow::anyhow!("IPC findBlock returned no block data: {err}"))?;
     Ok(Bytes::copy_from_slice(data))
 }
-
 
 #[cfg(feature = "ipc")]
 async fn wait_for_tip_change(
@@ -469,13 +510,14 @@ async fn wait_for_tip_change(
         let mut req = chain.wait_for_notifications_if_tip_changed_request();
         req.get()
             .get_context()
-            .map_err(|err| anyhow::anyhow!("IPC waitForNotificationsIfTipChanged context failed: {err}"))?
+            .map_err(|err| {
+                anyhow::anyhow!("IPC waitForNotificationsIfTipChanged context failed: {err}")
+            })?
             .set_thread(thread.clone());
         req.get().set_old_tip(&old_tip);
-        req.send()
-            .promise
-            .await
-            .map_err(|err| anyhow::anyhow!("IPC Chain.waitForNotificationsIfTipChanged failed: {err}"))?;
+        req.send().promise.await.map_err(|err| {
+            anyhow::anyhow!("IPC Chain.waitForNotificationsIfTipChanged failed: {err}")
+        })?;
     } else {
         let mut req = chain.wait_for_notifications_request();
         req.get()

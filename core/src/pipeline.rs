@@ -52,7 +52,11 @@ pub fn raw_block_stream(
             let height = start_height + i as u64;
             async move {
                 let bytes = source.get_block_raw(hash).await?;
-                Ok::<_, anyhow::Error>(RawBlockFrame { height, hash, bytes })
+                Ok::<_, anyhow::Error>(RawBlockFrame {
+                    height,
+                    hash,
+                    bytes,
+                })
             }
         })
         .buffered(buffer)
@@ -69,8 +73,7 @@ pub fn decoded_block_stream(
     hashes: Vec<[u8; 32]>,
     buffer: usize,
 ) -> impl Stream<Item = anyhow::Result<DecodedBlockFrame>> {
-    raw_block_stream(source, start_height, hashes, buffer)
-        .map(|raw| raw.and_then(decode_raw_block))
+    raw_block_stream(source, start_height, hashes, buffer).map(|raw| raw.and_then(decode_raw_block))
 }
 
 /// Stream of [`RawBlockFrame`] in strict height order, fetching directly by
@@ -133,7 +136,11 @@ pub fn raw_block_stream_by_height_batched(
             let remaining = start_height + count - batch_start;
             let this_count = remaining.min(batch_size) as usize;
 
-            async move { source.get_block_range_by_height(batch_start, this_count).await }
+            async move {
+                source
+                    .get_block_range_by_height(batch_start, this_count)
+                    .await
+            }
         })
         .buffered(buffer)
         .flat_map(|result| {
@@ -144,7 +151,6 @@ pub fn raw_block_stream_by_height_batched(
             futures::stream::iter(items)
         })
 }
-
 
 /// Stream of decoded blocks in strict height order using source-native raw block
 /// batches when available, then decoding every raw frame through the shared

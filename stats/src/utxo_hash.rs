@@ -31,10 +31,14 @@ impl RollingUtxoHash {
         }
     }
 
-    pub fn enabled(&self) -> bool { self.window_blocks > 0 }
+    pub fn enabled(&self) -> bool {
+        self.window_blocks > 0
+    }
 
     pub fn add_output(&mut self, global_id: u64) {
-        if !self.enabled() { return; }
+        if !self.enabled() {
+            return;
+        }
         let mut h = Sha256::new();
         h.update(b"add");
         h.update(global_id.to_be_bytes());
@@ -43,7 +47,9 @@ impl RollingUtxoHash {
     }
 
     pub fn remove_output(&mut self, global_id: u64) {
-        if !self.enabled() { return; }
+        if !self.enabled() {
+            return;
+        }
         let mut h = Sha256::new();
         h.update(b"rem");
         h.update(global_id.to_be_bytes());
@@ -54,7 +60,9 @@ impl RollingUtxoHash {
     /// Finalize the current block and update the accumulator.
     /// Returns the current accumulator hex-encoded.
     pub fn finalize_block(&mut self) -> String {
-        if !self.enabled() { return String::new(); }
+        if !self.enabled() {
+            return String::new();
+        }
 
         xor_into(&mut self.acc, &self.current_block);
         self.window.push_back(self.current_block);
@@ -70,11 +78,15 @@ impl RollingUtxoHash {
 }
 
 fn xor_into(dst: &mut [u8; 32], src: &[u8]) {
-    for i in 0..32 { dst[i] ^= src[i]; }
+    for i in 0..32 {
+        dst[i] ^= src[i];
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes { s.push_str(&format!("{:02x}", b)); }
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
     s
 }

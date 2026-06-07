@@ -1,9 +1,9 @@
-use btc_data_light_server::storage::FileArchive;
-use btc_data_light_server::storage::ArchiveBackend;
-use btc_data_light_server::storage::SqliteArchive;
 use btc_data_light_server::server::{serve, ServerConfig};
-use std::sync::Arc;
+use btc_data_light_server::storage::ArchiveBackend;
+use btc_data_light_server::storage::FileArchive;
+use btc_data_light_server::storage::SqliteArchive;
 use clap::{Parser, ValueEnum};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, ValueEnum)]
 enum BackendKind {

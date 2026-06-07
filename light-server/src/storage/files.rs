@@ -39,19 +39,31 @@ impl FileArchive {
         Self { root: root.into() }
     }
 
-    pub fn root(&self) -> &Path { &self.root }
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
 
-    pub fn blocks_dir(&self) -> PathBuf { self.root.join("blocks") }
-    pub fn checkpoints_dir(&self) -> PathBuf { self.root.join("checkpoints") }
-    pub fn stats_dir(&self) -> PathBuf { self.root.join("block_stats") }
-    pub fn manifest_path(&self) -> PathBuf { self.root.join("manifest.json") }
+    pub fn blocks_dir(&self) -> PathBuf {
+        self.root.join("blocks")
+    }
+    pub fn checkpoints_dir(&self) -> PathBuf {
+        self.root.join("checkpoints")
+    }
+    pub fn stats_dir(&self) -> PathBuf {
+        self.root.join("block_stats")
+    }
+    pub fn manifest_path(&self) -> PathBuf {
+        self.root.join("manifest.json")
+    }
 
     pub fn block_path(&self, height: u64, profile: Profile) -> PathBuf {
-        self.blocks_dir().join(format!("{height:010}.{}.capnp", profile.file_tag()))
+        self.blocks_dir()
+            .join(format!("{height:010}.{}.capnp", profile.file_tag()))
     }
 
     pub fn checkpoint_path(&self, height: u64, profile: Profile) -> PathBuf {
-        self.checkpoints_dir().join(format!("{height:010}.{}.unspent.capnp", profile.file_tag()))
+        self.checkpoints_dir()
+            .join(format!("{height:010}.{}.unspent.capnp", profile.file_tag()))
     }
 
     pub fn block_stats_path(&self, height: u64) -> PathBuf {
@@ -63,11 +75,23 @@ impl FileArchive {
         Ok(fs::read(path)?)
     }
 
-    pub fn read_blocks(&self, start: u64, count: u32, profile: Profile) -> anyhow::Result<Vec<Vec<u8>>> {
-        (0..count).map(|i| self.read_block(start + u64::from(i), profile)).collect()
+    pub fn read_blocks(
+        &self,
+        start: u64,
+        count: u32,
+        profile: Profile,
+    ) -> anyhow::Result<Vec<Vec<u8>>> {
+        (0..count)
+            .map(|i| self.read_block(start + u64::from(i), profile))
+            .collect()
     }
 
-    pub fn write_block_bytes(&self, height: u64, profile: Profile, bytes: &[u8]) -> anyhow::Result<PathBuf> {
+    pub fn write_block_bytes(
+        &self,
+        height: u64,
+        profile: Profile,
+        bytes: &[u8],
+    ) -> anyhow::Result<PathBuf> {
         fs::create_dir_all(self.blocks_dir())?;
         let path = self.block_path(height, profile);
         fs::write(&path, bytes)?;
@@ -79,16 +103,27 @@ impl FileArchive {
         Ok(fs::read(path)?)
     }
 
-    pub fn write_checkpoint_bytes(&self, height: u64, profile: Profile, bytes: &[u8]) -> anyhow::Result<PathBuf> {
+    pub fn write_checkpoint_bytes(
+        &self,
+        height: u64,
+        profile: Profile,
+        bytes: &[u8],
+    ) -> anyhow::Result<PathBuf> {
         fs::create_dir_all(self.checkpoints_dir())?;
         let path = self.checkpoint_path(height, profile);
         fs::write(&path, bytes)?;
         Ok(path)
     }
 
-    pub fn latest_checkpoint_height(&self, height_lte: u64, profile: Profile) -> anyhow::Result<Option<u64>> {
+    pub fn latest_checkpoint_height(
+        &self,
+        height_lte: u64,
+        profile: Profile,
+    ) -> anyhow::Result<Option<u64>> {
         let dir = self.checkpoints_dir();
-        if !dir.exists() { return Ok(None); }
+        if !dir.exists() {
+            return Ok(None);
+        }
         let suffix = format!(".{}.unspent.capnp", profile.file_tag());
         let mut best = None;
         for entry in fs::read_dir(dir)? {
@@ -97,7 +132,7 @@ impl FileArchive {
             let name = name.to_string_lossy();
             if let Some(prefix) = name.strip_suffix(&suffix) {
                 if let Ok(height) = prefix.parse::<u64>() {
-                    if height <= height_lte && best.map_or(true, |b| height > b) {
+                    if height <= height_lte && best.is_none_or(|b| height > b) {
                         best = Some(height);
                     }
                 }
@@ -110,8 +145,11 @@ impl FileArchive {
         let manifest = self.read_manifest().ok();
         if let Some(manifest) = manifest {
             for p in manifest.profiles {
-                if p.scope == profile.scope && p.cutthrough_blocks == profile.cutthrough_blocks {
-                    if p.tip.is_some() { return Ok(p.tip); }
+                if p.scope == profile.scope
+                    && p.cutthrough_blocks == profile.cutthrough_blocks
+                    && p.tip.is_some()
+                {
+                    return Ok(p.tip);
                 }
             }
         }
@@ -120,7 +158,9 @@ impl FileArchive {
 
     pub fn tip_from_files(&self, profile: Profile) -> anyhow::Result<Option<ChainTip>> {
         let dir = self.blocks_dir();
-        if !dir.exists() { return Ok(None); }
+        if !dir.exists() {
+            return Ok(None);
+        }
         let suffix = format!(".{}.capnp", profile.file_tag());
         let mut best = None;
         for entry in fs::read_dir(dir)? {
@@ -129,17 +169,23 @@ impl FileArchive {
             let name = name.to_string_lossy();
             if let Some(prefix) = name.strip_suffix(&suffix) {
                 if let Ok(height) = prefix.parse::<u64>() {
-                    if best.map_or(true, |b| height > b) {
+                    if best.is_none_or(|b| height > b) {
                         best = Some(height);
                     }
                 }
             }
         }
-        Ok(best.map(|height| ChainTip { height, block_hash: String::new() }))
+        Ok(best.map(|height| ChainTip {
+            height,
+            block_hash: String::new(),
+        }))
     }
 
-
-    pub fn write_block_stats<T: Serialize>(&self, height: u64, stats: &T) -> anyhow::Result<PathBuf> {
+    pub fn write_block_stats<T: Serialize>(
+        &self,
+        height: u64,
+        stats: &T,
+    ) -> anyhow::Result<PathBuf> {
         fs::create_dir_all(self.stats_dir())?;
         let path = self.block_stats_path(height);
         fs::write(&path, serde_json::to_vec_pretty(stats)?)?;
@@ -192,28 +238,52 @@ impl crate::storage::ArchiveBackend for FileArchive {
             profile_id: 0,
             name,
             profile,
-            materialization_interval_blocks: if profile.cutthrough_blocks == 0 { 1 } else { 144 },
+            materialization_interval_blocks: if profile.cutthrough_blocks == 0 {
+                1
+            } else {
+                144
+            },
             served_tip: tip,
         })
     }
 
-    async fn tip(&self, profile: &crate::storage::ServedProfile) -> anyhow::Result<Option<ChainTip>> {
+    async fn tip(
+        &self,
+        profile: &crate::storage::ServedProfile,
+    ) -> anyhow::Result<Option<ChainTip>> {
         self.tip(profile.profile)
     }
 
-    async fn read_block(&self, height: u64, profile: &crate::storage::ServedProfile) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    async fn read_block(
+        &self,
+        height: u64,
+        profile: &crate::storage::ServedProfile,
+    ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
         Ok((self.read_block(height, profile.profile)?, Vec::new()))
     }
 
-    async fn read_blocks(&self, start: u64, count: u32, profile: &crate::storage::ServedProfile) -> anyhow::Result<Vec<Vec<u8>>> {
+    async fn read_blocks(
+        &self,
+        start: u64,
+        count: u32,
+        profile: &crate::storage::ServedProfile,
+    ) -> anyhow::Result<Vec<Vec<u8>>> {
         self.read_blocks(start, count, profile.profile)
     }
 
-    async fn read_checkpoint(&self, height: u64, profile: &crate::storage::ServedProfile) -> anyhow::Result<Vec<u8>> {
+    async fn read_checkpoint(
+        &self,
+        height: u64,
+        profile: &crate::storage::ServedProfile,
+    ) -> anyhow::Result<Vec<u8>> {
         self.read_checkpoint(height, profile.profile)
     }
 
-    async fn latest_checkpoint_height(&self, height_lte: u64, profile: &crate::storage::ServedProfile) -> anyhow::Result<Option<u64>> {
+    async fn latest_checkpoint_height(
+        &self,
+        height_lte: u64,
+        profile: &crate::storage::ServedProfile,
+    ) -> anyhow::Result<Option<u64>> {
         self.latest_checkpoint_height(height_lte, profile.profile)
     }
 
@@ -224,10 +294,16 @@ impl crate::storage::ArchiveBackend for FileArchive {
 
 fn parse_profile_name(name: &str) -> anyhow::Result<Profile> {
     if name == "raw-sp" || name == "p2tr-sp-raw" {
-        return Ok(Profile { scope: ArchiveScope::P2trSp, cutthrough_blocks: 0 });
+        return Ok(Profile {
+            scope: ArchiveScope::P2trSp,
+            cutthrough_blocks: 0,
+        });
     }
     if let Some(rest) = name.strip_prefix("ct").and_then(|s| s.strip_suffix("-sp")) {
-        return Ok(Profile { scope: ArchiveScope::P2trSp, cutthrough_blocks: rest.parse()? });
+        return Ok(Profile {
+            scope: ArchiveScope::P2trSp,
+            cutthrough_blocks: rest.parse()?,
+        });
     }
     anyhow::bail!("file backend cannot resolve profile name {name:?}; use scope+ct instead")
 }
