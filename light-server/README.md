@@ -233,35 +233,52 @@ checkpoint_cache(profile_id, height)   -> serialized UidCheckpoint bytes
 ```bash
 curl http://127.0.0.1:3000/health
 
-# Raw finalized tip for a selected scope.
+# Full finalized tip for a selected scope.
 curl 'http://127.0.0.1:3000/tip?scope=p2tr-sp'
 
-# Ask the server to select a cut-through profile for the selected scope.
-curl 'http://127.0.0.1:3000/tip?scope=p2tr-sp&cutthrough=true'
+# Cut-through finalized tip for a selected scope.
+curl 'http://127.0.0.1:3000/tip/cutthrough?scope=p2tr-sp'
 
-# Single light block.
+# Single full light block.
 curl -H 'Accept: application/octet-stream' \
   -o block.capnp \
-  'http://127.0.0.1:3000/blocks/709632/light?scope=p2tr-sp&cutthrough=false'
+  'http://127.0.0.1:3000/blocks/709632/light?scope=p2tr-sp'
 
-# JSON debug view of one light block.
+# Single cut-through light block.
+curl -H 'Accept: application/octet-stream' \
+  -o block-ct.capnp \
+  'http://127.0.0.1:3000/blocks/709632/light/cutthrough?scope=p2tr-sp'
+
+# JSON debug view of one full light block.
 curl -H 'Accept: application/json' \
-  'http://127.0.0.1:3000/blocks/709632/light?scope=p2tr-sp&cutthrough=false'
+  'http://127.0.0.1:3000/blocks/709632/light?scope=p2tr-sp'
 
-# Range sync. The client passes start/count plus simple scope/cutthrough selection.
+# Full range sync.
 curl -H 'Accept: application/octet-stream' \
   -o range.bdsr \
-  'http://127.0.0.1:3000/blocks/light?start=709632&count=1000&scope=p2tr-sp&cutthrough=false'
+  'http://127.0.0.1:3000/blocks/light?start=709632&count=1000&scope=p2tr-sp'
 
-# Latest checkpoint before a height.
+# Cut-through historical backfill.
+curl -H 'Accept: application/octet-stream' \
+  -o range-ct.bdsr \
+  'http://127.0.0.1:3000/blocks/light/cutthrough?start=709632&count=1000&scope=p2tr-sp'
+
+# Latest full checkpoint before a height.
 curl -o checkpoint.capnp \
-  'http://127.0.0.1:3000/checkpoints/latest?height_lte=710000&scope=p2tr-sp&cutthrough=false'
+  'http://127.0.0.1:3000/checkpoints/latest?height_lte=710000&scope=p2tr-sp'
+
+# Latest cut-through checkpoint before a height. This is explicit because it is
+# a different profile/state snapshot from the full checkpoint.
+curl -o checkpoint-ct.capnp \
+  'http://127.0.0.1:3000/checkpoints/latest/cutthrough?height_lte=710000&scope=p2tr-sp'
 
 # Per-block stats.
 curl 'http://127.0.0.1:3000/debug/blocks/709632/stats'
 ```
 
-The public API intentionally exposes `scope=` and `cutthrough=true|false`, but not `profile=`, `domain=`, or numeric `ct=` parameters. The selected `scope` defines the UID namespace. The server validates that the requested scope exists in the archive and returns a clear error when it does not.
+The public API intentionally exposes `scope=` and dedicated full vs cut-through endpoints, but not `profile=`, `domain=`, or numeric `ct=` parameters. The selected `scope` defines the UID namespace. The server validates that the requested scope exists in the archive and returns a clear error when it does not.
+
+`cutthrough=true` is not accepted on the full endpoints. Use the `/cutthrough` endpoints instead so clients cannot accidentally treat a reduced stream as a full stream.
 
 ## Sync target and cut-through
 
@@ -269,7 +286,7 @@ The public sync target should be finalized blocks only:
 
 ```text
 finality_depth = 6
-raw served_tip = indexed_tip - 6
+full served_tip = indexed_tip - 6
 cut-through served_tip = floor((indexed_tip - 6 - ct) / 144) * 144
 ```
 
@@ -286,7 +303,33 @@ ct52560-sp  ct=52560
 ct105120-sp ct=105120
 ```
 
-For `cutthrough=true`, the server chooses the largest materialized cut-through window that can serve the requested start height.
+For `/blocks/light/cutthrough`, the server chooses the largest materialized cut-through window that can serve the requested start height.
+
+Cut-through requests must end at or below:
+
+```text
+full_tip - suggested_reorg_cache_depth
+```
+
+This keeps wallet clients from using a reduced stream for the recent reorg window. The default suggested reorg cache depth is 24 blocks.
+
+## Wallet cold-boot flow
+
+A v1 Silent Payments wallet client should not use UID checkpoints for output discovery. A checkpoint contains only the live unspent UID set at a height; it does not contain transaction tweaks, output identifiers, output refs, labels, or creation history. The wallet must scan block payloads to discover its own outputs.
+
+Recommended cold boot:
+
+```text
+1. GET /manifest
+2. GET /tip?scope=p2tr-sp
+3. recent_full_depth = manifest.suggested_reorg_cache_depth, default 24
+4. stable_tip = tip.height - recent_full_depth
+5. scan /blocks/light/cutthrough from wallet birthday/start height through stable_tip
+6. scan /blocks/light from stable_tip + 1 through tip.height
+7. live sync new blocks with /blocks/light only
+```
+
+The cut-through stream is a historical backfill optimization. It may omit outputs created and spent inside the cut-through window, so it is not a complete activity-history stream. The full stream is required near the tip for shallow reorg handling and short-lived recent wallet outputs.
 
 ## Wire payload semantics
 
@@ -322,10 +365,10 @@ Current implementation status:
 ```text
 TxTweak type and wire length: 33 bytes
 fake placeholder tweak emission: removed
-full BIP352 tweak computation: not implemented yet
+BIP352 scan-point computation: implemented for P2TR, P2WPKH, P2SH-P2WPKH, and P2PKH inputs
 ```
 
-Until prevout-aware BIP352 input reconstruction is implemented, live indexing should omit tweak data rather than serve incorrect tweak data.
+If prevout context is missing or a transaction is not eligible under BIP352, live indexing omits tweak data rather than serving incorrect tweak data.
 
 ## BIP352 tweak computation requirements
 
