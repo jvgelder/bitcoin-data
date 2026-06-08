@@ -32,6 +32,8 @@ pub struct Manifest {
     pub suggested_reorg_cache_depth: u64,
     pub max_range_count: u32,
     pub profiles: Vec<ManifestProfile>,
+    #[serde(default)]
+    pub cutthrough_snapshots: Vec<ManifestCutthroughSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +41,16 @@ pub struct ManifestProfile {
     pub scope: ArchiveScope,
     pub cutthrough_blocks: u32,
     pub tip: Option<ChainTip>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestCutthroughSnapshot {
+    pub scope: ArchiveScope,
+    pub cutthrough_blocks: u32,
+    pub height: u64,
+    pub block_hash: String,
+    pub latest_endpoint: String,
+    pub endpoint: String,
 }
 
 impl FileArchive {
@@ -276,6 +288,24 @@ impl crate::storage::ArchiveBackend for FileArchive {
         profile: &crate::storage::ServedProfile,
     ) -> anyhow::Result<Vec<Vec<u8>>> {
         self.read_blocks(start, count, profile.profile)
+    }
+
+    async fn read_cutthrough_delta_blocks(
+        &self,
+        _known_height: u64,
+        _max_end_height: u64,
+        _target_response_bytes: usize,
+        _profile: &crate::storage::ServedProfile,
+    ) -> anyhow::Result<crate::storage::CutthroughDeltaBlocks> {
+        anyhow::bail!("file-backed archives do not support SQLite cut-through delta ranges")
+    }
+
+    async fn read_cutthrough_snapshot(
+        &self,
+        _height: u64,
+        _profile: &crate::storage::ServedProfile,
+    ) -> anyhow::Result<crate::storage::CutthroughSnapshot> {
+        anyhow::bail!("file-backed archives do not support cut-through snapshots")
     }
 
     async fn read_checkpoint(

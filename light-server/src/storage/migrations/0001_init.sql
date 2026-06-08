@@ -114,6 +114,9 @@ CREATE TABLE IF NOT EXISTS p2tr_outputs (
 CREATE INDEX IF NOT EXISTS p2tr_outputs_created_height_idx
 ON p2tr_outputs(created_height);
 
+CREATE INDEX IF NOT EXISTS p2tr_outputs_created_order_idx
+ON p2tr_outputs(created_height, tx_index, vout);
+
 CREATE UNIQUE INDEX IF NOT EXISTS p2tr_outputs_location_idx
 ON p2tr_outputs(created_height, created_block_hash, tx_index, vout);
 
@@ -148,6 +151,9 @@ ON p2tr_spends(spent_height);
 
 CREATE INDEX IF NOT EXISTS p2tr_spends_spent_order_idx
 ON p2tr_spends(spent_height, uid);
+
+CREATE INDEX IF NOT EXISTS p2tr_spends_uid_spent_idx
+ON p2tr_spends(uid, spent_height);
 
 CREATE TABLE IF NOT EXISTS p2tr_key_stats (
   output_key BLOB PRIMARY KEY,
@@ -185,6 +191,19 @@ CREATE TABLE IF NOT EXISTS checkpoint_cache (
   block_hash BLOB NOT NULL,
   checkpoint BLOB NOT NULL,
   checkpoint_len INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY(profile_id, height),
+  FOREIGN KEY(profile_id) REFERENCES profiles(profile_id),
+  FOREIGN KEY(height) REFERENCES blocks(height)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS cutthrough_snapshot_cache (
+  profile_id INTEGER NOT NULL,
+  height INTEGER NOT NULL,
+  block_hash BLOB NOT NULL,
+  payload BLOB NOT NULL,
+  payload_len INTEGER NOT NULL,
+  block_count INTEGER NOT NULL,
   created_at INTEGER NOT NULL,
   PRIMARY KEY(profile_id, height),
   FOREIGN KEY(profile_id) REFERENCES profiles(profile_id),

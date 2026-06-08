@@ -27,6 +27,35 @@ struct OutputRef {
   uid @2 :UInt64;
 }
 
+# SnapshotBlock is a live-output snapshot block, not a normal block delta.
+# A cut-through snapshot at height H contains only outputs that were created in
+# this block and are still live at H. It has no spent stream; outputs omitted
+# from the snapshot were spent by H or are outside the selected scope.
+struct SnapshotBlock {
+  version @0 :UInt16;
+  height @1 :UInt64;
+  blockHash @2 :Data;
+  previousBlockHash @3 :Data;
+  blockAnchorLastUid @4 :UInt64;
+  outputIdBytes @5 :UInt8;
+  txs @6 :List(SnapshotTx);
+}
+
+struct SnapshotTx {
+  txIndex @0 :UInt32;
+  # 33-byte compressed public scan point input_hash*A for this transaction.
+  tweak @1 :Data;
+  outputs @2 :List(SnapshotOutputRef);
+  # Packed truncated output identifiers for outputs, using the parent block's
+  # outputIdBytes. len = outputs.len * outputIdBytes.
+  outputIds @3 :Data;
+}
+
+struct SnapshotOutputRef {
+  vout @0 :UInt32;
+  uid @1 :UInt64;
+}
+
 struct LightBlockProfile {
   scope @0 :ArchiveScope;
   # 0 means raw/no cut-through. Non-zero cut-through profiles are materialized

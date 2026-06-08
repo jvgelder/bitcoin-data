@@ -1104,6 +1104,7 @@ fn write_fixture_archive(
                 block_hash: hex::encode(tip_hash.as_bytes()),
             }),
         }],
+        cutthrough_snapshots: Vec::new(),
     })?;
 
     println!(

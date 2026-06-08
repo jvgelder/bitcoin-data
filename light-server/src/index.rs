@@ -1,5 +1,5 @@
 use crate::codec::elias_delta::encode_elias_delta_values;
-use crate::light_capnp::{light_block, output_ref, uid_checkpoint, SpentIdCodec, UidSetCodec};
+use crate::light_capnp::{light_block, output_ref, snapshot_block, snapshot_output_ref, uid_checkpoint, SpentIdCodec, UidSetCodec};
 use crate::profile::Profile;
 use crate::types::{BlockHashBytes, TxTweak};
 use crate::WIRE_VERSION;
@@ -33,6 +33,30 @@ pub struct LightBlockInput {
     pub outputs: Vec<OutputRefInput>,
     pub output_ids: Vec<u8>,
     pub spent_uids_sorted: Vec<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SnapshotOutputRefInput {
+    pub vout: u32,
+    pub uid: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SnapshotTxInput {
+    pub tx_index: u32,
+    pub tweak: TxTweak,
+    pub outputs: Vec<SnapshotOutputRefInput>,
+    pub output_ids: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SnapshotBlockInput {
+    pub height: u64,
+    pub block_hash: BlockHashBytes,
+    pub previous_block_hash: BlockHashBytes,
+    pub block_anchor_last_uid: u64,
+    pub output_id_bytes: u8,
+    pub txs: Vec<SnapshotTxInput>,
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +232,81 @@ pub fn encode_light_block(input: &LightBlockInput) -> anyhow::Result<Builder<Hea
         b.set_spent_ids(&spent);
     }
     Ok(msg)
+}
+
+pub fn encode_snapshot_block(input: &SnapshotBlockInput) -> anyhow::Result<Builder<HeapAllocator>> {
+    anyhow::ensure!(
+        input.output_id_bytes <= MAX_P2TR_OUTPUT_ID_BYTES,
+        "snapshot output_id_bytes exceeds configured bound"
+    );
+    let output_id_bytes = input.output_id_bytes as usize;
+    anyhow::ensure!(output_id_bytes > 0, "output_id_bytes must be non-zero");
+
+    let mut total_outputs = 0usize;
+    let mut last_tx_index = None;
+    for tx in &input.txs {
+        anyhow::ensure!(
+            tx.tx_index < MAX_TX_TWEAK_INDEX_DOMAIN,
+            "snapshot tx index exceeds tx-index domain bound"
+        );
+        if let Some(prev) = last_tx_index {
+            anyhow::ensure!(prev < tx.tx_index, "snapshot txs must be sorted and unique");
+        }
+        last_tx_index = Some(tx.tx_index);
+        anyhow::ensure!(
+            tx.output_ids.len() == tx.outputs.len() * output_id_bytes,
+            "snapshot tx packed output id length mismatch"
+        );
+        let mut last_vout = None;
+        for output in &tx.outputs {
+            if let Some(prev) = last_vout {
+                anyhow::ensure!(prev < output.vout, "snapshot outputs must be sorted by vout");
+            }
+            last_vout = Some(output.vout);
+            anyhow::ensure!(
+                output.uid <= input.block_anchor_last_uid,
+                "snapshot output UID exceeds block anchor"
+            );
+        }
+        total_outputs += tx.outputs.len();
+    }
+    anyhow::ensure!(
+        total_outputs <= MAX_P2TR_OUTPUTS_PER_BLOCK,
+        "too many snapshot outputs in one block"
+    );
+
+    let mut msg = Builder::new_default();
+    {
+        let mut b = msg.init_root::<snapshot_block::Builder>();
+        b.set_version(WIRE_VERSION);
+        b.set_height(input.height);
+        b.set_block_hash(input.block_hash.as_bytes());
+        b.set_previous_block_hash(input.previous_block_hash.as_bytes());
+        b.set_block_anchor_last_uid(input.block_anchor_last_uid);
+        b.set_output_id_bytes(input.output_id_bytes);
+        let mut txs = b.reborrow().init_txs(input.txs.len() as u32);
+        for (tx_idx, src_tx) in input.txs.iter().enumerate() {
+            let mut dst_tx = txs.reborrow().get(tx_idx as u32);
+            dst_tx.set_tx_index(src_tx.tx_index);
+            dst_tx.set_tweak(src_tx.tweak.as_bytes());
+            {
+                let mut outs = dst_tx.reborrow().init_outputs(src_tx.outputs.len() as u32);
+                for (i, src) in src_tx.outputs.iter().enumerate() {
+                    fill_snapshot_output_ref(outs.reborrow().get(i as u32), src);
+                }
+            }
+            dst_tx.set_output_ids(&src_tx.output_ids);
+        }
+    }
+    Ok(msg)
+}
+
+fn fill_snapshot_output_ref(
+    mut b: snapshot_output_ref::Builder<'_>,
+    src: &SnapshotOutputRefInput,
+) {
+    b.set_vout(src.vout);
+    b.set_uid(src.uid);
 }
 
 fn fill_output_ref(mut b: output_ref::Builder<'_>, src: &OutputRefInput) {
