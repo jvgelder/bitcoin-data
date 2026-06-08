@@ -1,9 +1,26 @@
-use crate::{RANGE_MAGIC, RANGE_VERSION};
+use crate::{RANGE_MAGIC, RANGE_VERSION, SNAPSHOT_MAGIC, SNAPSHOT_VERSION};
 
 pub fn frame_range(messages: &[Vec<u8>]) -> anyhow::Result<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(RANGE_MAGIC);
     out.extend_from_slice(&RANGE_VERSION.to_le_bytes());
+    out.extend_from_slice(&(messages.len() as u32).to_le_bytes());
+    for msg in messages {
+        let len: u32 = msg.len().try_into()?;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(msg);
+    }
+    Ok(out)
+}
+
+/// Frame cut-through snapshot blocks. Snapshot frames intentionally use a
+/// different magic from normal LightBlock ranges because the item messages are
+/// SnapshotBlock values, not LightBlock values.
+pub fn frame_snapshot(snapshot_height: u64, messages: &[Vec<u8>]) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    out.extend_from_slice(SNAPSHOT_MAGIC);
+    out.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
+    out.extend_from_slice(&snapshot_height.to_le_bytes());
     out.extend_from_slice(&(messages.len() as u32).to_le_bytes());
     for msg in messages {
         let len: u32 = msg.len().try_into()?;
