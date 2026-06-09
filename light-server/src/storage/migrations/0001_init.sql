@@ -77,24 +77,6 @@ VALUES
 
 
 -- Canonical-chain UTXO lookup used only by the raw indexer to derive BIP352
--- transaction scan points. This is intentionally all-output, not P2TR-only:
--- BIP352 input eligibility can depend on P2WPKH/P2SH/P2PKH/P2TR prevouts.
--- Rows are valid only for the currently indexed best-work chain; reorg
--- rollback must disconnect affected block effects before replacement blocks are indexed.
-CREATE TABLE IF NOT EXISTS chain_utxo_lookup (
-  txid BLOB NOT NULL,
-  vout INTEGER NOT NULL,
-  value_sat INTEGER NOT NULL,
-  script_pubkey BLOB NOT NULL,
-  created_height INTEGER NOT NULL,
-  created_block_hash BLOB NOT NULL,
-  created_tx_index INTEGER NOT NULL,
-  PRIMARY KEY(txid, vout)
-) WITHOUT ROWID;
-
-CREATE INDEX IF NOT EXISTS chain_utxo_lookup_created_height_idx
-ON chain_utxo_lookup(created_height);
-
 CREATE TABLE IF NOT EXISTS p2tr_outputs (
   uid INTEGER PRIMARY KEY CHECK(uid > 0),
   txid BLOB NOT NULL,

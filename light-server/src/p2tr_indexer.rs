@@ -144,12 +144,17 @@ pub struct P2trIndexerState {
     next_uid: u64,
     outpoint_to_entry: HashMap<OutPointKey, ScopedUtxoEntry>,
     live_uids: BTreeSet<u64>,
-    seen_p2tr_keys: HashSet<Vec<u8>>,
+    seen_p2tr_keys: Option<HashSet<Vec<u8>>>,
 }
 
 impl P2trIndexerState {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            next_uid: 0,
+            outpoint_to_entry: HashMap::new(),
+            live_uids: BTreeSet::new(),
+            seen_p2tr_keys: Some(HashSet::new()),
+        }
     }
 
     pub fn restore(
@@ -161,13 +166,35 @@ impl P2trIndexerState {
             next_uid: last_uid,
             outpoint_to_entry: HashMap::new(),
             live_uids: BTreeSet::new(),
-            seen_p2tr_keys: seen_keys.into_iter().collect(),
+            seen_p2tr_keys: Some(seen_keys.into_iter().collect()),
         };
         for entry in live_entries {
             state.live_uids.insert(entry.uid);
             state.outpoint_to_entry.insert(entry.outpoint, entry);
         }
         state
+    }
+
+
+    pub fn restore_without_reuse_tracking(
+        last_uid: u64,
+        live_entries: impl IntoIterator<Item = ScopedUtxoEntry>,
+    ) -> Self {
+        let mut state = Self {
+            next_uid: last_uid,
+            outpoint_to_entry: HashMap::new(),
+            live_uids: BTreeSet::new(),
+            seen_p2tr_keys: None,
+        };
+        for entry in live_entries {
+            state.live_uids.insert(entry.uid);
+            state.outpoint_to_entry.insert(entry.outpoint, entry);
+        }
+        state
+    }
+
+    pub fn live_uid_count(&self) -> usize {
+        self.live_uids.len()
     }
 
     pub fn live_entries(&self) -> impl Iterator<Item = &ScopedUtxoEntry> {
@@ -222,7 +249,6 @@ impl P2trIndexerState {
         };
         let mut created_utxos = Vec::<CreatedScopedUtxo>::new();
         let mut spent_utxos = Vec::<SpentScopedUtxo>::new();
-        let mut seen_p2tr_keys = Vec::<SeenP2trKey>::new();
 
         for tx in &block.txs {
             let mut tx_has_p2tr_output = false;
@@ -258,19 +284,12 @@ impl P2trIndexerState {
                     // can be produced.
                     stats.p2tr_sp_candidate_count += 1;
                     let output_identity = p2tr_output_identity(output, block.height, tx.tx_index)?;
-                    is_reused_output = !self.seen_p2tr_keys.insert(output_identity.clone());
-                    if is_reused_output {
-                        stats.p2tr_reused_count += 1;
+                    if let Some(seen_p2tr_keys) = self.seen_p2tr_keys.as_mut() {
+                        is_reused_output = !seen_p2tr_keys.insert(output_identity);
+                        if is_reused_output {
+                            stats.p2tr_reused_count += 1;
+                        }
                     }
-                    seen_p2tr_keys.push(SeenP2trKey {
-                        output_key: output_identity,
-                        first_height: block.height,
-                        last_height: block.height,
-                        seen_count: 1,
-                        first_uid: None,
-                        last_uid: None,
-                        is_nums: output.is_nums,
-                    });
                 }
                 let include = profile.scope.include_output(output.is_p2tr, output.is_nums);
                 if !include {
@@ -369,7 +388,7 @@ impl P2trIndexerState {
             stats,
             created_utxos,
             spent_utxos,
-            seen_p2tr_keys,
+            seen_p2tr_keys: Vec::new(),
         })
     }
 }
