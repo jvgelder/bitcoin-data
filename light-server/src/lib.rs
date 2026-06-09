@@ -10,6 +10,7 @@ pub mod json_wire;
 pub mod output_id;
 pub mod p2tr_indexer;
 pub mod profile;
+pub mod prevout_store;
 pub mod range;
 pub mod server;
 pub mod script_classify;

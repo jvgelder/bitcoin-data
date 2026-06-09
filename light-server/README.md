@@ -129,7 +129,7 @@ cargo run -p btc-data-light-server --bin light-indexer -- fetch-block \
   --output block-709632.bin
 ```
 
-Run mainnet indexing from Taproot activation:
+Run mainnet indexing with genesis prevout warmup and P2TR/SP emission from Taproot activation:
 
 ```bash
 cargo run -p btc-data-light-server --bin light-indexer -- run \
@@ -138,7 +138,9 @@ cargo run -p btc-data-light-server --bin light-indexer -- run \
   --database-url sqlite:lightdata-mainnet.db \
   --network mainnet \
   --scope p2tr-sp \
-  --finality-depth 6
+  --finality-depth 6 \
+  --utxo-checkpoint-dir /var/lib/bitcoind/light-utxo-checkpoints \
+  --utxo-checkpoints-retain 3
 ```
 
 For a smoke test that performs one pass and exits:
@@ -151,6 +153,8 @@ cargo run -p btc-data-light-server --bin light-indexer -- run \
   --network mainnet \
   --scope p2tr-sp \
   --finality-depth 6 \
+  --utxo-checkpoint-dir /var/lib/bitcoind/light-utxo-checkpoints \
+  --utxo-checkpoints-retain 3 \
   --once
 ```
 

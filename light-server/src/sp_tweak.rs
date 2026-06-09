@@ -23,7 +23,6 @@ const TAPROOT_NUMS_H_XONLY: [u8; 32] = [
 
 #[derive(Debug, Clone)]
 pub struct PrevoutInfo {
-    pub value_sat: u64,
     pub script_pubkey: Vec<u8>,
 }
 
@@ -346,7 +345,6 @@ mod tests {
             script_sig: Vec::new(),
             witness: vec![vec![1; 64]],
             prevout: Some(PrevoutInfo {
-                value_sat: 1_000,
                 script_pubkey: p2tr_script(GENERATOR_XONLY),
             }),
         }])
@@ -365,7 +363,6 @@ mod tests {
             script_sig: Vec::new(),
             witness: vec![vec![1; 64], GENERATOR_COMPRESSED.to_vec()],
             prevout: Some(PrevoutInfo {
-                value_sat: 1_000,
                 script_pubkey: p2wpkh_script(&GENERATOR_COMPRESSED),
             }),
         }])
@@ -383,7 +380,6 @@ mod tests {
             script_sig: Vec::new(),
             witness: Vec::new(),
             prevout: Some(PrevoutInfo {
-                value_sat: 1_000,
                 script_pubkey: v2_script,
             }),
         }])
