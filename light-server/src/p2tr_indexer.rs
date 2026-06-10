@@ -69,17 +69,6 @@ pub struct SpentScopedUtxo {
 }
 
 #[derive(Debug, Clone)]
-pub struct SeenP2trKey {
-    pub output_key: [u8; 32],
-    pub first_height: u64,
-    pub last_height: u64,
-    pub seen_count: u64,
-    pub first_uid: Option<u64>,
-    pub last_uid: Option<u64>,
-    pub is_nums: bool,
-}
-
-#[derive(Debug, Clone)]
 pub struct TxInputScan {
     pub previous_output: OutPointKey,
     /// Raw scriptSig bytes from the spending input. Needed by BIP352 input
@@ -145,7 +134,6 @@ pub struct AppliedBlock {
     pub stats: BlockScopeStats,
     pub created_utxos: Vec<CreatedScopedUtxo>,
     pub spent_utxos: Vec<SpentScopedUtxo>,
-    pub seen_p2tr_keys: Vec<SeenP2trKey>,
 }
 
 #[derive(Debug, Default)]
@@ -401,7 +389,6 @@ impl P2trIndexerState {
             stats,
             created_utxos,
             spent_utxos,
-            seen_p2tr_keys: Vec::new(),
         })
     }
 }
