@@ -14,9 +14,9 @@ INSERT OR IGNORE INTO meta(key, value) VALUES
   ('checkpoint_interval', '10000');
 
 CREATE TABLE IF NOT EXISTS blocks (
-  height INTEGER PRIMARY KEY,
-  block_hash BLOB NOT NULL UNIQUE,
-  previous_block_hash BLOB NOT NULL,
+  height INTEGER PRIMARY KEY CHECK(height >= 0),
+  block_hash BLOB NOT NULL UNIQUE CHECK(length(block_hash) = 32),
+  previous_block_hash BLOB NOT NULL CHECK(length(previous_block_hash) = 32),
   block_time INTEGER,
   p2tr_created_count INTEGER NOT NULL DEFAULT 0,
   p2tr_spent_count INTEGER NOT NULL DEFAULT 0,
@@ -57,8 +57,8 @@ CREATE TABLE IF NOT EXISTS profiles (
   scope TEXT NOT NULL,
   cutthrough_blocks INTEGER NOT NULL,
   materialization_interval_blocks INTEGER NOT NULL,
-  served_tip_height INTEGER NOT NULL DEFAULT 0,
-  served_tip_hash BLOB,
+  served_tip_height INTEGER NOT NULL DEFAULT 0 CHECK(served_tip_height >= 0),
+  served_tip_hash BLOB CHECK(served_tip_hash IS NULL OR length(served_tip_hash) = 32),
   enabled INTEGER NOT NULL DEFAULT 1,
   UNIQUE(scope, cutthrough_blocks)
 );
@@ -79,14 +79,14 @@ VALUES
 -- Canonical-chain UTXO lookup used only by the raw indexer to derive BIP352
 CREATE TABLE IF NOT EXISTS p2tr_outputs (
   uid INTEGER PRIMARY KEY CHECK(uid > 0),
-  txid BLOB NOT NULL,
-  created_height INTEGER NOT NULL,
-  created_block_hash BLOB NOT NULL,
-  tx_index INTEGER NOT NULL,
-  vout INTEGER NOT NULL,
-  value_sat INTEGER NOT NULL,
-  script_pubkey BLOB NOT NULL,
-  p2tr_xonly_key BLOB NOT NULL,
+  txid BLOB NOT NULL CHECK(length(txid) = 32),
+  created_height INTEGER NOT NULL CHECK(created_height >= 0),
+  created_block_hash BLOB NOT NULL CHECK(length(created_block_hash) = 32),
+  tx_index INTEGER NOT NULL CHECK(tx_index >= 0),
+  vout INTEGER NOT NULL CHECK(vout >= 0),
+  value_sat INTEGER NOT NULL CHECK(value_sat >= 0),
+  script_pubkey BLOB NOT NULL CHECK(length(script_pubkey) > 0),
+  p2tr_xonly_key BLOB NOT NULL CHECK(length(p2tr_xonly_key) = 32),
   is_nums INTEGER NOT NULL DEFAULT 0,
   is_reused INTEGER NOT NULL DEFAULT 0,
   reuse_count_at_creation INTEGER NOT NULL DEFAULT 1,
@@ -103,15 +103,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS p2tr_outputs_location_idx
 ON p2tr_outputs(created_height, created_block_hash, tx_index, vout);
 
 CREATE TABLE IF NOT EXISTS p2tr_utxo_lookup (
-  txid BLOB NOT NULL,
-  vout INTEGER NOT NULL,
+  txid BLOB NOT NULL CHECK(length(txid) = 32),
+  vout INTEGER NOT NULL CHECK(vout >= 0),
   uid INTEGER NOT NULL CHECK(uid > 0),
-  value_sat INTEGER NOT NULL,
-  script_pubkey BLOB NOT NULL,
-  p2tr_xonly_key BLOB NOT NULL,
-  created_height INTEGER NOT NULL,
-  created_block_hash BLOB NOT NULL,
-  created_tx_index INTEGER NOT NULL,
+  value_sat INTEGER NOT NULL CHECK(value_sat >= 0),
+  script_pubkey BLOB NOT NULL CHECK(length(script_pubkey) > 0),
+  p2tr_xonly_key BLOB NOT NULL CHECK(length(p2tr_xonly_key) = 32),
+  created_height INTEGER NOT NULL CHECK(created_height >= 0),
+  created_block_hash BLOB NOT NULL CHECK(length(created_block_hash) = 32),
+  created_tx_index INTEGER NOT NULL CHECK(created_tx_index >= 0),
   PRIMARY KEY(txid, vout),
   FOREIGN KEY(uid) REFERENCES p2tr_outputs(uid)
 ) WITHOUT ROWID;
@@ -121,9 +121,9 @@ ON p2tr_utxo_lookup(uid);
 
 CREATE TABLE IF NOT EXISTS p2tr_spends (
   uid INTEGER PRIMARY KEY CHECK(uid > 0),
-  spent_height INTEGER NOT NULL,
-  spent_block_hash BLOB NOT NULL,
-  spend_tx_index INTEGER NOT NULL,
+  spent_height INTEGER NOT NULL CHECK(spent_height >= 0),
+  spent_block_hash BLOB NOT NULL CHECK(length(spent_block_hash) = 32),
+  spend_tx_index INTEGER NOT NULL CHECK(spend_tx_index >= 0),
   FOREIGN KEY(uid) REFERENCES p2tr_outputs(uid),
   FOREIGN KEY(spent_height) REFERENCES blocks(height)
 );
@@ -138,19 +138,19 @@ CREATE INDEX IF NOT EXISTS p2tr_spends_uid_spent_idx
 ON p2tr_spends(uid, spent_height);
 
 CREATE TABLE IF NOT EXISTS p2tr_key_stats (
-  output_key BLOB PRIMARY KEY,
-  first_height INTEGER NOT NULL,
-  last_height INTEGER NOT NULL,
-  seen_count INTEGER NOT NULL,
+  output_key BLOB PRIMARY KEY CHECK(length(output_key) = 32),
+  first_height INTEGER NOT NULL CHECK(first_height >= 0),
+  last_height INTEGER NOT NULL CHECK(last_height >= first_height),
+  seen_count INTEGER NOT NULL CHECK(seen_count > 0),
   first_uid INTEGER,
   last_uid INTEGER,
   is_nums INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS tx_tweaks (
-  height INTEGER NOT NULL,
-  tx_index INTEGER NOT NULL,
-  tweak BLOB NOT NULL,
+  height INTEGER NOT NULL CHECK(height >= 0),
+  tx_index INTEGER NOT NULL CHECK(tx_index >= 0),
+  tweak BLOB NOT NULL CHECK(length(tweak) = 33),
   PRIMARY KEY(height, tx_index),
   FOREIGN KEY(height) REFERENCES blocks(height)
 ) WITHOUT ROWID;
@@ -158,9 +158,9 @@ CREATE TABLE IF NOT EXISTS tx_tweaks (
 CREATE TABLE IF NOT EXISTS payload_cache (
   profile_id INTEGER NOT NULL,
   height INTEGER NOT NULL,
-  block_hash BLOB NOT NULL,
-  payload BLOB NOT NULL,
-  payload_len INTEGER NOT NULL,
+  block_hash BLOB NOT NULL CHECK(length(block_hash) = 32),
+  payload BLOB NOT NULL CHECK(length(payload) = payload_len),
+  payload_len INTEGER NOT NULL CHECK(payload_len >= 0),
   created_at INTEGER NOT NULL,
   PRIMARY KEY(profile_id, height),
   FOREIGN KEY(profile_id) REFERENCES profiles(profile_id),
@@ -170,9 +170,9 @@ CREATE TABLE IF NOT EXISTS payload_cache (
 CREATE TABLE IF NOT EXISTS checkpoint_cache (
   profile_id INTEGER NOT NULL,
   height INTEGER NOT NULL,
-  block_hash BLOB NOT NULL,
-  checkpoint BLOB NOT NULL,
-  checkpoint_len INTEGER NOT NULL,
+  block_hash BLOB NOT NULL CHECK(length(block_hash) = 32),
+  checkpoint BLOB NOT NULL CHECK(length(checkpoint) = checkpoint_len),
+  checkpoint_len INTEGER NOT NULL CHECK(checkpoint_len >= 0),
   created_at INTEGER NOT NULL,
   PRIMARY KEY(profile_id, height),
   FOREIGN KEY(profile_id) REFERENCES profiles(profile_id),
@@ -182,10 +182,10 @@ CREATE TABLE IF NOT EXISTS checkpoint_cache (
 CREATE TABLE IF NOT EXISTS cutthrough_snapshot_cache (
   profile_id INTEGER NOT NULL,
   height INTEGER NOT NULL,
-  block_hash BLOB NOT NULL,
-  payload BLOB NOT NULL,
-  payload_len INTEGER NOT NULL,
-  block_count INTEGER NOT NULL,
+  block_hash BLOB NOT NULL CHECK(length(block_hash) = 32),
+  payload BLOB NOT NULL CHECK(length(payload) = payload_len),
+  payload_len INTEGER NOT NULL CHECK(payload_len >= 0),
+  block_count INTEGER NOT NULL CHECK(block_count >= 0),
   created_at INTEGER NOT NULL,
   PRIMARY KEY(profile_id, height),
   FOREIGN KEY(profile_id) REFERENCES profiles(profile_id),
