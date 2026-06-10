@@ -10,5 +10,7 @@ pub mod files;
 pub mod sqlite;
 
 pub use backend::{ArchiveBackend, CutthroughDeltaBlocks, CutthroughSnapshot, ServedProfile};
-pub use files::{ChainTip, FileArchive, LightArchive, Manifest, ManifestCutthroughSnapshot, ManifestProfile};
+pub use files::{
+    ChainTip, FileArchive, LightArchive, Manifest, ManifestCutthroughSnapshot, ManifestProfile,
+};
 pub use sqlite::SqliteArchive;

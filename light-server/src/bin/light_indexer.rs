@@ -6,11 +6,11 @@ use btc_data_light_server::index::{
     encode_light_block, encode_uid_checkpoint, to_packed_bytes, UidCheckpointInput,
 };
 use btc_data_light_server::p2tr_indexer::{
-    BlockScanInput, BlockScopeStats, OutPointKey, P2trIndexerState, ScopedUtxoEntry,
-    TxInputScan, TxOutputScan, TxScanInput,
+    BlockScanInput, BlockScopeStats, OutPointKey, P2trIndexerState, ScopedUtxoEntry, TxInputScan,
+    TxOutputScan, TxScanInput,
 };
-use btc_data_light_server::profile::{ArchiveNetwork, ArchiveScope, Profile};
 use btc_data_light_server::prevout_store::{PendingPrevoutWrites, PrevoutStore};
+use btc_data_light_server::profile::{ArchiveNetwork, ArchiveScope, Profile};
 use btc_data_light_server::script_classify::extract_p2tr_xonly;
 use btc_data_light_server::storage::{
     ArchiveBackend, ChainTip, FileArchive, Manifest, ManifestProfile, SqliteArchive,
@@ -72,7 +72,6 @@ async fn delete_p2tr_outpoints(
 
     Ok(())
 }
-
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -203,7 +202,6 @@ enum Command {
 
         #[arg(long, default_value_t = ArchiveScope::P2trSp)]
         scope: ArchiveScope,
-
 
         #[arg(long, default_value_t = 6)]
         finality_depth: u64,
@@ -403,7 +401,8 @@ async fn run_command(
     let db_profile = archive.resolve_profile(None, Some(profile)).await?;
 
     validate_resume_boundary(&archive, db_profile.profile_id, emit_start_height).await?;
-    let profile_next_height = next_index_height(&archive, db_profile.profile_id, emit_start_height).await?;
+    let profile_next_height =
+        next_index_height(&archive, db_profile.profile_id, emit_start_height).await?;
     let committed_profile_tip = profile_next_height
         .checked_sub(1)
         .filter(|h| *h >= emit_start_height);
@@ -556,7 +555,9 @@ async fn catch_up_ranges(
 
         // Stage 1a: fetch raw blocks for this bounded source chunk.
         let fetch_started = Instant::now();
-        let frames = source.get_block_range_by_height(chunk_start, chunk_count).await?;
+        let frames = source
+            .get_block_range_by_height(chunk_start, chunk_count)
+            .await?;
         let fetch_elapsed = fetch_started.elapsed();
         total_fetch_elapsed += fetch_elapsed;
         if frames.is_empty() {
@@ -624,7 +625,8 @@ async fn catch_up_ranges(
         let apply_started = Instant::now();
         for mut scan in decoded {
             let emit_light_payload = scan.height >= emit_start_height;
-            let chain_delta = prevout_store.enrich_block_scan_points(&mut pending_prevouts, &mut scan)?;
+            let chain_delta =
+                prevout_store.enrich_block_scan_points(&mut pending_prevouts, &mut scan)?;
             chain_created += chain_delta.created.len();
             chain_spent += chain_delta.spent.len();
 
@@ -925,7 +927,11 @@ async fn catch_up_ranges(
     let pending_prevout_write_count = pending_prevouts.len();
     let prevout_store_started = Instant::now();
     if pending_prevout_write_count > 0 || prevout_store.tip().0 != Some(last_height) {
-        prevout_store.apply_pending(mem::take(&mut pending_prevouts), last_height, checkpoint_hash)?;
+        prevout_store.apply_pending(
+            mem::take(&mut pending_prevouts),
+            last_height,
+            checkpoint_hash,
+        )?;
     }
     total_prevout_store_elapsed += prevout_store_started.elapsed();
     sql_timing.prevout_store_ms = total_prevout_store_elapsed.as_millis();
@@ -1527,7 +1533,8 @@ async fn restore_indexer_state(
         .bind(i64::try_from(height)?)
         .fetch_one(archive.pool())
         .await?;
-        value.ok_or_else(|| anyhow::anyhow!("missing committed tip block row at height {height}"))?
+        value
+            .ok_or_else(|| anyhow::anyhow!("missing committed tip block row at height {height}"))?
     } else {
         0
     };
@@ -1544,12 +1551,15 @@ async fn restore_indexer_state(
     let mut entries = Vec::with_capacity(rows.len());
     for row in rows {
         let txid: Vec<u8> = row.try_get("txid")?;
-        let txid: [u8; 32] = txid
-            .try_into()
-            .map_err(|v: Vec<u8>| anyhow::anyhow!("invalid txid length in p2tr_utxo_lookup: {}", v.len()))?;
+        let txid: [u8; 32] = txid.try_into().map_err(|v: Vec<u8>| {
+            anyhow::anyhow!("invalid txid length in p2tr_utxo_lookup: {}", v.len())
+        })?;
         let key: Vec<u8> = row.try_get("p2tr_xonly_key")?;
         let p2tr_xonly_key = key.try_into().map_err(|v: Vec<u8>| {
-            anyhow::anyhow!("invalid p2tr_xonly_key length in p2tr_utxo_lookup: {}", v.len())
+            anyhow::anyhow!(
+                "invalid p2tr_xonly_key length in p2tr_utxo_lookup: {}",
+                v.len()
+            )
         })?;
         let vout: i64 = row.try_get("vout")?;
         let uid: i64 = row.try_get("uid")?;
@@ -1557,9 +1567,13 @@ async fn restore_indexer_state(
         let created_height: Option<i64> = row.try_get("created_height")?;
         let created_tx_index: Option<i64> = row.try_get("created_tx_index")?;
         let created_block_hash: Vec<u8> = row.try_get("created_block_hash")?;
-        let created_block_hash: [u8; 32] = created_block_hash.try_into().map_err(|v: Vec<u8>| {
-            anyhow::anyhow!("invalid created_block_hash length in p2tr_utxo_lookup: {}", v.len())
-        })?;
+        let created_block_hash: [u8; 32] =
+            created_block_hash.try_into().map_err(|v: Vec<u8>| {
+                anyhow::anyhow!(
+                    "invalid created_block_hash length in p2tr_utxo_lookup: {}",
+                    v.len()
+                )
+            })?;
         let script_pubkey: Option<Vec<u8>> = row.try_get("script_pubkey")?;
 
         entries.push(ScopedUtxoEntry {
@@ -1585,7 +1599,6 @@ async fn restore_indexer_state(
         entries,
     ))
 }
-
 
 fn collect_spent_outpoints(blocks: &[BlockScanInput]) -> Vec<OutPointKey> {
     let mut outpoints = Vec::new();
@@ -1635,7 +1648,6 @@ fn collect_scan_point_outpoints(blocks: &[BlockScanInput]) -> Vec<OutPointKey> {
 fn is_coinbase_prevout(outpoint: &OutPointKey) -> bool {
     outpoint.vout == u32::MAX && outpoint.txid.as_bytes().iter().all(|b| *b == 0)
 }
-
 
 async fn get_meta(archive: &SqliteArchive, key: &str) -> anyhow::Result<Option<String>> {
     let value = sqlx::query_scalar::<_, String>(r#"SELECT value FROM meta WHERE key = ?"#)
@@ -1714,12 +1726,11 @@ async fn validate_resume_boundary(
         expected_count
     );
 
-    let block_hash: Vec<u8> = sqlx::query_scalar(
-        r#"SELECT block_hash FROM blocks WHERE height = ?"#,
-    )
-    .bind(i64::try_from(served_tip)?)
-    .fetch_one(archive.pool())
-    .await?;
+    let block_hash: Vec<u8> =
+        sqlx::query_scalar(r#"SELECT block_hash FROM blocks WHERE height = ?"#)
+            .bind(i64::try_from(served_tip)?)
+            .fetch_one(archive.pool())
+            .await?;
 
     if let Some(served_tip_hash) = served_tip_hash {
         anyhow::ensure!(

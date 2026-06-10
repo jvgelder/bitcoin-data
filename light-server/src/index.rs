@@ -1,5 +1,8 @@
 use crate::codec::elias_delta::encode_elias_delta_values;
-use crate::light_capnp::{light_block, output_ref, snapshot_block, snapshot_output_ref, uid_checkpoint, SpentIdCodec, UidSetCodec};
+use crate::light_capnp::{
+    light_block, output_ref, snapshot_block, snapshot_output_ref, uid_checkpoint, SpentIdCodec,
+    UidSetCodec,
+};
 use crate::profile::Profile;
 use crate::types::{BlockHashBytes, TxTweak};
 use crate::WIRE_VERSION;
@@ -260,7 +263,10 @@ pub fn encode_snapshot_block(input: &SnapshotBlockInput) -> anyhow::Result<Build
         let mut last_vout = None;
         for output in &tx.outputs {
             if let Some(prev) = last_vout {
-                anyhow::ensure!(prev < output.vout, "snapshot outputs must be sorted by vout");
+                anyhow::ensure!(
+                    prev < output.vout,
+                    "snapshot outputs must be sorted by vout"
+                );
             }
             last_vout = Some(output.vout);
             anyhow::ensure!(
@@ -301,10 +307,7 @@ pub fn encode_snapshot_block(input: &SnapshotBlockInput) -> anyhow::Result<Build
     Ok(msg)
 }
 
-fn fill_snapshot_output_ref(
-    mut b: snapshot_output_ref::Builder<'_>,
-    src: &SnapshotOutputRefInput,
-) {
+fn fill_snapshot_output_ref(mut b: snapshot_output_ref::Builder<'_>, src: &SnapshotOutputRefInput) {
     b.set_vout(src.vout);
     b.set_uid(src.uid);
 }

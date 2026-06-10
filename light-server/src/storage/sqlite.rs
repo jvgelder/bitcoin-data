@@ -1,11 +1,14 @@
-use crate::index::{encode_light_block, encode_snapshot_block, LightBlockInput, OutputRefInput, SnapshotBlockInput, SnapshotOutputRefInput, SnapshotTxInput, MAX_P2TR_OUTPUT_ID_BYTES};
+use crate::index::{
+    encode_light_block, encode_snapshot_block, LightBlockInput, OutputRefInput, SnapshotBlockInput,
+    SnapshotOutputRefInput, SnapshotTxInput, MAX_P2TR_OUTPUT_ID_BYTES,
+};
 use crate::output_id::{choose_output_id_bytes, truncate_into_packed};
 use crate::p2tr_indexer::output_identifier_hash;
 use crate::profile::{ArchiveScope, Profile};
-use crate::types::{BlockHashBytes, OutputIdHash, TxTweak};
 use crate::range::frame_snapshot;
 use crate::storage::{ArchiveBackend, CutthroughDeltaBlocks, CutthroughSnapshot, ServedProfile};
 use crate::storage::{ChainTip, Manifest, ManifestCutthroughSnapshot, ManifestProfile};
+use crate::types::{BlockHashBytes, OutputIdHash, TxTweak};
 use crate::{DEFAULT_MAX_RANGE_COUNT, WIRE_VERSION};
 use async_trait::async_trait;
 use serde_json::json;
@@ -68,12 +71,15 @@ impl SqliteArchive {
         max_end_height: u64,
         target_response_bytes: usize,
     ) -> anyhow::Result<u64> {
-        anyhow::ensure!(known_height < max_end_height, "known_height must be below max_end_height");
+        anyhow::ensure!(
+            known_height < max_end_height,
+            "known_height must be below max_end_height"
+        );
 
         let created_limit = (target_response_bytes / APPROX_BYTES_PER_DELTA_OUTPUT)
             .max(MIN_DELTA_CREATED_ROW_LIMIT);
-        let spent_limit = (target_response_bytes / APPROX_BYTES_PER_DELTA_SPEND)
-            .max(MIN_DELTA_SPENT_ROW_LIMIT);
+        let spent_limit =
+            (target_response_bytes / APPROX_BYTES_PER_DELTA_SPEND).max(MIN_DELTA_SPENT_ROW_LIMIT);
 
         let mut candidate_end = self
             .end_height_from_created_row_limit(known_height, max_end_height, created_limit)
@@ -147,7 +153,6 @@ impl SqliteArchive {
     }
 }
 
-
 fn blob32(row: &sqlx::sqlite::SqliteRow, column: &str) -> anyhow::Result<BlockHashBytes> {
     let bytes: Vec<u8> = row.try_get(column)?;
     anyhow::ensure!(bytes.len() == 32, "column {column} must be 32 bytes");
@@ -157,7 +162,11 @@ fn blob32(row: &sqlx::sqlite::SqliteRow, column: &str) -> anyhow::Result<BlockHa
 }
 
 fn tx_tweak_from_blob(bytes: Vec<u8>) -> anyhow::Result<TxTweak> {
-    anyhow::ensure!(bytes.len() == TxTweak::LEN, "tx tweak must be {} bytes", TxTweak::LEN);
+    anyhow::ensure!(
+        bytes.len() == TxTweak::LEN,
+        "tx tweak must be {} bytes",
+        TxTweak::LEN
+    );
     let mut out = [0u8; TxTweak::LEN];
     out.copy_from_slice(&bytes);
     Ok(TxTweak::from(out))
@@ -238,10 +247,7 @@ impl ArchiveBackend for SqliteArchive {
                     height: tip.height,
                     block_hash: tip.block_hash.clone(),
                     latest_endpoint: "/blocks/light/cutthrough/snapshot/latest".to_string(),
-                    endpoint: format!(
-                        "/blocks/light/cutthrough/snapshot/{}.bdss",
-                        tip.height
-                    ),
+                    endpoint: format!("/blocks/light/cutthrough/snapshot/{}.bdss", tip.height),
                 })
             })
             .collect();
@@ -391,11 +397,7 @@ impl ArchiveBackend for SqliteArchive {
         );
 
         let end_height = self
-            .choose_cutthrough_delta_end_height(
-                known_height,
-                max_end_height,
-                target_response_bytes,
-            )
+            .choose_cutthrough_delta_end_height(known_height, max_end_height, target_response_bytes)
             .await?;
 
         let mut tx = self.pool.begin().await?;
@@ -662,7 +664,9 @@ impl ArchiveBackend for SqliteArchive {
                 output_id_bytes,
                 txs,
             };
-            messages.push(crate::index::to_packed_bytes(&encode_snapshot_block(&block)?)?);
+            messages.push(crate::index::to_packed_bytes(&encode_snapshot_block(
+                &block,
+            )?)?);
             rows.clear();
             Ok(())
         }

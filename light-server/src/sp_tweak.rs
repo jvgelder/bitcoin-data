@@ -16,9 +16,8 @@ use sha2::{Digest, Sha256};
 
 const BIP352_INPUTS_TAG: &str = "BIP0352/Inputs";
 const TAPROOT_NUMS_H_XONLY: [u8; 32] = [
-    0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a,
-    0x5e, 0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80,
-    0x3a, 0xc0,
+    0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a, 0x5e,
+    0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80, 0x3a, 0xc0,
 ];
 
 #[derive(Debug, Clone)]
@@ -47,7 +46,11 @@ pub enum ScanPointStatus {
 }
 
 pub fn compute_tx_scan_point(inputs: &[TxInputContext]) -> anyhow::Result<ScanPointStatus> {
-    if inputs.is_empty() || inputs.iter().all(|input| is_coinbase_prevout(&input.previous_output)) {
+    if inputs.is_empty()
+        || inputs
+            .iter()
+            .all(|input| is_coinbase_prevout(&input.previous_output))
+    {
         return Ok(ScanPointStatus::Ineligible);
     }
 
@@ -85,7 +88,8 @@ pub fn compute_tx_scan_point(inputs: &[TxInputContext]) -> anyhow::Result<ScanPo
     }
 
     let pubkey_refs = eligible_pubkeys.iter().collect::<Vec<_>>();
-    let sum = PublicKey::combine_keys(&pubkey_refs).context("eligible input public-key sum is infinity")?;
+    let sum = PublicKey::combine_keys(&pubkey_refs)
+        .context("eligible input public-key sum is infinity")?;
 
     let outpoint_l = smallest_non_coinbase_outpoint(inputs)
         .ok_or_else(|| anyhow!("non-empty non-coinbase input set expected"))?;
@@ -101,7 +105,9 @@ pub fn compute_tx_scan_point(inputs: &[TxInputContext]) -> anyhow::Result<ScanPo
         .mul_tweak(&secp, &scalar)
         .context("BIP352 scan point multiplication failed")?;
 
-    Ok(ScanPointStatus::Computed(TxTweak::from(scan_point.serialize())))
+    Ok(ScanPointStatus::Computed(TxTweak::from(
+        scan_point.serialize(),
+    )))
 }
 
 fn is_coinbase_prevout(outpoint: &OutPointKey) -> bool {
@@ -113,7 +119,10 @@ fn spends_witness_version_greater_than_one(inputs: &[TxInputContext]) -> bool {
         input.prevout.as_ref().is_some_and(|prevout| {
             matches!(
                 classify_script(prevout.script_pubkey.as_slice()),
-                ScriptKind::WitnessUnknown { version: 2..=16, .. }
+                ScriptKind::WitnessUnknown {
+                    version: 2..=16,
+                    ..
+                }
             )
         })
     })
@@ -161,7 +170,11 @@ fn extract_p2sh_p2wpkh_input_pubkey(
     expected_script_hash: [u8; 20],
 ) -> anyhow::Result<Option<PublicKey>> {
     let pushes = parse_script_pushes(&input.script_sig);
-    let Some(redeem_script) = pushes.iter().rev().find(|push| matches!(classify_script(push), ScriptKind::P2wpkh { .. })) else {
+    let Some(redeem_script) = pushes
+        .iter()
+        .rev()
+        .find(|push| matches!(classify_script(push), ScriptKind::P2wpkh { .. }))
+    else {
         return Ok(None);
     };
 
@@ -196,7 +209,9 @@ fn parse_compressed_pubkey_matching_hash(
     if hash160_bytes(bytes) != expected_hash {
         return Ok(None);
     }
-    Ok(Some(PublicKey::from_slice(bytes).context("invalid compressed input public key")?))
+    Ok(Some(
+        PublicKey::from_slice(bytes).context("invalid compressed input public key")?,
+    ))
 }
 
 fn taproot_script_path_internal_key(witness: &[Vec<u8>]) -> Option<[u8; 32]> {
@@ -209,7 +224,6 @@ fn taproot_script_path_internal_key(witness: &[Vec<u8>]) -> Option<[u8; 32]> {
     internal_key.copy_from_slice(&control_block[1..33]);
     Some(internal_key)
 }
-
 
 fn smallest_non_coinbase_outpoint(inputs: &[TxInputContext]) -> Option<[u8; 36]> {
     inputs
@@ -269,7 +283,9 @@ fn parse_script_pushes(script: &[u8]) -> Vec<Vec<u8>> {
                 if i + 4 > script.len() {
                     break;
                 }
-                let len = u32::from_le_bytes([script[i], script[i + 1], script[i + 2], script[i + 3]]) as usize;
+                let len =
+                    u32::from_le_bytes([script[i], script[i + 1], script[i + 2], script[i + 3]])
+                        as usize;
                 i += 4;
                 len
             }
@@ -292,14 +308,14 @@ mod tests {
     use crate::types::TxidBytes;
 
     const GENERATOR_COMPRESSED: [u8; 33] = [
-        0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce,
-        0x87, 0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81,
-        0x5b, 0x16, 0xf8, 0x17, 0x98,
+        0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87,
+        0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16,
+        0xf8, 0x17, 0x98,
     ];
     const GENERATOR_XONLY: [u8; 32] = [
-        0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87,
-        0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b,
-        0x16, 0xf8, 0x17, 0x98,
+        0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87, 0x0b,
+        0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16, 0xf8,
+        0x17, 0x98,
     ];
 
     fn outpoint(n: u8) -> OutPointKey {
@@ -323,7 +339,10 @@ mod tests {
 
     #[test]
     fn empty_prevouts_are_ineligible() {
-        assert_eq!(compute_tx_scan_point(&[]).unwrap(), ScanPointStatus::Ineligible);
+        assert_eq!(
+            compute_tx_scan_point(&[]).unwrap(),
+            ScanPointStatus::Ineligible
+        );
     }
 
     #[test]

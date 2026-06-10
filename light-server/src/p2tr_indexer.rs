@@ -175,7 +175,6 @@ impl P2trIndexerState {
         state
     }
 
-
     pub fn restore_without_reuse_tracking(
         last_uid: u64,
         live_entries: impl IntoIterator<Item = ScopedUtxoEntry>,
