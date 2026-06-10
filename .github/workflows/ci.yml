@@ -15,7 +15,7 @@ jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
-    container: rust:stable
+    container: rust:latest
     steps:
       - uses: actions/checkout@v4
       - run: rustup component add rustfmt
@@ -24,7 +24,7 @@ jobs:
   build-test:
     name: Build & Test
     runs-on: ubuntu-latest
-    container: rust:stable
+    container: rust:latest
     steps:
       - uses: actions/checkout@v4
 
@@ -68,7 +68,7 @@ jobs:
   smoke:
     name: Smoke
     runs-on: ubuntu-latest
-    container: rust:stable
+    container: rust:latest
     needs: build-test
     steps:
       - uses: actions/checkout@v4
