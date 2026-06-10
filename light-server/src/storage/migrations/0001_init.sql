@@ -102,22 +102,8 @@ ON p2tr_outputs(created_height, tx_index, vout);
 CREATE UNIQUE INDEX IF NOT EXISTS p2tr_outputs_location_idx
 ON p2tr_outputs(created_height, created_block_hash, tx_index, vout);
 
-CREATE TABLE IF NOT EXISTS p2tr_utxo_lookup (
-  txid BLOB NOT NULL CHECK(length(txid) = 32),
-  vout INTEGER NOT NULL CHECK(vout >= 0),
-  uid INTEGER NOT NULL CHECK(uid > 0),
-  value_sat INTEGER NOT NULL CHECK(value_sat >= 0),
-  script_pubkey BLOB NOT NULL CHECK(length(script_pubkey) > 0),
-  p2tr_xonly_key BLOB NOT NULL CHECK(length(p2tr_xonly_key) = 32),
-  created_height INTEGER NOT NULL CHECK(created_height >= 0),
-  created_block_hash BLOB NOT NULL CHECK(length(created_block_hash) = 32),
-  created_tx_index INTEGER NOT NULL CHECK(created_tx_index >= 0),
-  PRIMARY KEY(txid, vout),
-  FOREIGN KEY(uid) REFERENCES p2tr_outputs(uid)
-) WITHOUT ROWID;
-
-CREATE INDEX IF NOT EXISTS p2tr_utxo_lookup_uid_idx
-ON p2tr_utxo_lookup(uid);
+-- p2tr_utxo_lookup removed: live UID set is rebuilt at startup from
+-- p2tr_outputs LEFT JOIN p2tr_spends instead of a mirror table.
 
 CREATE TABLE IF NOT EXISTS p2tr_spends (
   uid INTEGER PRIMARY KEY CHECK(uid > 0),
@@ -128,14 +114,8 @@ CREATE TABLE IF NOT EXISTS p2tr_spends (
   FOREIGN KEY(spent_height) REFERENCES blocks(height)
 );
 
-CREATE INDEX IF NOT EXISTS p2tr_spends_spent_height_idx
-ON p2tr_spends(spent_height);
-
 CREATE INDEX IF NOT EXISTS p2tr_spends_spent_order_idx
 ON p2tr_spends(spent_height, uid);
-
-CREATE INDEX IF NOT EXISTS p2tr_spends_uid_spent_idx
-ON p2tr_spends(uid, spent_height);
 
 CREATE TABLE IF NOT EXISTS p2tr_key_stats (
   output_key BLOB PRIMARY KEY CHECK(length(output_key) = 32),
