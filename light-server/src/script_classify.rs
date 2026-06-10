@@ -59,7 +59,10 @@ pub fn classify_script(script_bytes: &[u8]) -> ScriptKind {
             _ => return ScriptKind::Other,
         };
         let program_len = script_bytes.get(1).copied().unwrap_or_default() as usize;
-        return ScriptKind::WitnessUnknown { version, program_len };
+        return ScriptKind::WitnessUnknown {
+            version,
+            program_len,
+        };
     }
 
     if script.is_op_return() {
@@ -95,7 +98,12 @@ mod tests {
 
         assert_eq!(extract_p2tr_xonly(&script), Some([7u8; 32]));
         assert!(is_p2tr(&script));
-        assert_eq!(classify_script(&script), ScriptKind::P2tr { xonly_key: [7u8; 32] });
+        assert_eq!(
+            classify_script(&script),
+            ScriptKind::P2tr {
+                xonly_key: [7u8; 32]
+            }
+        );
     }
 
     #[test]

@@ -1,15 +1,15 @@
-use anyhow::Context;
-use bitcoin::hashes::Hash as _;
-use bitcoin::{key::XOnlyPublicKey, PubkeyHash, ScriptBuf, ScriptHash, WPubkeyHash};
 use crate::p2tr_indexer::{BlockScanInput, OutPointKey};
 use crate::script_classify::{classify_script, ScriptKind};
 use crate::sp_tweak::{compute_tx_scan_point, PrevoutInfo, ScanPointStatus, TxInputContext};
 use crate::types::BlockHashBytes;
+use anyhow::Context;
+use bitcoin::hashes::Hash as _;
+use bitcoin::opcodes::all::OP_PUSHNUM_1;
+use bitcoin::{key::XOnlyPublicKey, PubkeyHash, ScriptBuf, ScriptHash, WPubkeyHash};
 use rocksdb::{Options as RocksOptions, WriteBatch, DB};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use bitcoin::opcodes::all::OP_PUSHNUM_1;
 
 const HASH160_LEN: usize = 20;
 const XONLY_KEY_LEN: usize = 32;
@@ -42,14 +42,20 @@ impl CompactPrevoutScriptKind {
 }
 
 fn hash160_from_payload(payload: &[u8], context: &str) -> anyhow::Result<[u8; HASH160_LEN]> {
-    anyhow::ensure!(payload.len() == HASH160_LEN, "invalid {context} payload length");
+    anyhow::ensure!(
+        payload.len() == HASH160_LEN,
+        "invalid {context} payload length"
+    );
     let mut bytes = [0u8; HASH160_LEN];
     bytes.copy_from_slice(payload);
     Ok(bytes)
 }
 
 fn xonly_key_from_payload(payload: &[u8]) -> anyhow::Result<XOnlyPublicKey> {
-    anyhow::ensure!(payload.len() == XONLY_KEY_LEN, "invalid p2tr prevout payload length");
+    anyhow::ensure!(
+        payload.len() == XONLY_KEY_LEN,
+        "invalid p2tr prevout payload length"
+    );
     XOnlyPublicKey::from_slice(payload).context("invalid p2tr x-only output key")
 }
 
@@ -155,21 +161,13 @@ struct StandardScriptPubkey {
 impl StandardScriptPubkey {
     fn from_compact(script: CompactPrevoutScript) -> Self {
         let script = match script {
-            CompactPrevoutScript::P2pkh { pubkey_hash } => {
-                ScriptBuf::new_p2pkh(&pubkey_hash)
-            }
-            CompactPrevoutScript::P2sh { script_hash } => {
-                ScriptBuf::new_p2sh(&script_hash)
-            }
-            CompactPrevoutScript::P2wpkh { pubkey_hash } => {
-                ScriptBuf::new_p2wpkh(&pubkey_hash)
-            }
-            CompactPrevoutScript::P2tr { output_key } => {
-                ScriptBuf::builder()
-                    .push_opcode(OP_PUSHNUM_1)
-                    .push_slice(output_key.serialize())
-                    .into_script()
-            }
+            CompactPrevoutScript::P2pkh { pubkey_hash } => ScriptBuf::new_p2pkh(&pubkey_hash),
+            CompactPrevoutScript::P2sh { script_hash } => ScriptBuf::new_p2sh(&script_hash),
+            CompactPrevoutScript::P2wpkh { pubkey_hash } => ScriptBuf::new_p2wpkh(&pubkey_hash),
+            CompactPrevoutScript::P2tr { output_key } => ScriptBuf::builder()
+                .push_opcode(OP_PUSHNUM_1)
+                .push_slice(output_key.serialize())
+                .into_script(),
         };
         let script_bytes = script.as_bytes();
         debug_assert!(script_bytes.len() <= STANDARD_SCRIPT_PUBKEY_MAX_LEN);
@@ -185,7 +183,6 @@ impl StandardScriptPubkey {
         self.bytes[..self.len].to_vec()
     }
 }
-
 
 pub struct PrevoutStore {
     db: DB,
@@ -249,7 +246,10 @@ fn compact_prevout_script(script_pubkey: &[u8]) -> Option<CompactPrevoutScript> 
 }
 
 fn decode_prevout_entry(bytes: &[u8]) -> anyhow::Result<ChainUtxoEntry> {
-    anyhow::ensure!(bytes.len() >= ENCODED_PREVOUT_HEADER_LEN, "prevout entry is too short");
+    anyhow::ensure!(
+        bytes.len() >= ENCODED_PREVOUT_HEADER_LEN,
+        "prevout entry is too short"
+    );
 
     // v1 RocksDB entries stored an unused u64 value before the script kind.
     // The scan-point code only needs script context, so new entries omit it.
@@ -272,13 +272,22 @@ fn decode_prevout_entry(bytes: &[u8]) -> anyhow::Result<ChainUtxoEntry> {
 
     let script = match CompactPrevoutScriptKind::from_byte(kind)? {
         CompactPrevoutScriptKind::P2pkh => CompactPrevoutScript::P2pkh {
-            pubkey_hash: PubkeyHash::from_byte_array(hash160_from_payload(payload, "p2pkh prevout")?),
+            pubkey_hash: PubkeyHash::from_byte_array(hash160_from_payload(
+                payload,
+                "p2pkh prevout",
+            )?),
         },
         CompactPrevoutScriptKind::P2sh => CompactPrevoutScript::P2sh {
-            script_hash: ScriptHash::from_byte_array(hash160_from_payload(payload, "p2sh prevout")?),
+            script_hash: ScriptHash::from_byte_array(hash160_from_payload(
+                payload,
+                "p2sh prevout",
+            )?),
         },
         CompactPrevoutScriptKind::P2wpkh => CompactPrevoutScript::P2wpkh {
-            pubkey_hash: WPubkeyHash::from_byte_array(hash160_from_payload(payload, "p2wpkh prevout")?),
+            pubkey_hash: WPubkeyHash::from_byte_array(hash160_from_payload(
+                payload,
+                "p2wpkh prevout",
+            )?),
         },
         CompactPrevoutScriptKind::P2tr => CompactPrevoutScript::P2tr {
             output_key: xonly_key_from_payload(payload)?,
@@ -295,13 +304,17 @@ impl PrevoutStore {
         opts.set_max_open_files(1024);
         opts.set_use_fsync(false);
         opts.set_keep_log_file_num(8);
-        let db = DB::open(&opts, path)
-            .with_context(|| format!("failed to open RocksDB prevout store at {}", path.display()))?;
+        let db = DB::open(&opts, path).with_context(|| {
+            format!("failed to open RocksDB prevout store at {}", path.display())
+        })?;
 
         let tip_height = db
             .get(META_TIP_HEIGHT_KEY)?
             .map(|bytes| {
-                anyhow::ensure!(bytes.len() == 8, "invalid prevout store tip height metadata");
+                anyhow::ensure!(
+                    bytes.len() == 8,
+                    "invalid prevout store tip height metadata"
+                );
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(&bytes);
                 Ok::<_, anyhow::Error>(u64::from_le_bytes(buf))
@@ -317,7 +330,11 @@ impl PrevoutStore {
             })
             .transpose()?;
 
-        Ok(Self { db, tip_height, tip_hash })
+        Ok(Self {
+            db,
+            tip_height,
+            tip_hash,
+        })
     }
 
     pub fn tip(&self) -> (Option<u64>, Option<BlockHashBytes>) {
@@ -349,7 +366,6 @@ impl PrevoutStore {
             .transpose()
     }
 
-
     pub fn apply_pending(
         &mut self,
         pending: PendingPrevoutWrites,
@@ -361,7 +377,10 @@ impl PrevoutStore {
             batch.delete(RocksPrevoutKey::from_outpoint(&outpoint));
         }
         for (outpoint, entry) in pending.puts {
-            batch.put(RocksPrevoutKey::from_outpoint(&outpoint), EncodedPrevoutEntry::new(entry));
+            batch.put(
+                RocksPrevoutKey::from_outpoint(&outpoint),
+                EncodedPrevoutEntry::new(entry),
+            );
         }
         batch.put(META_TIP_HEIGHT_KEY, height.to_le_bytes());
         batch.put(META_TIP_HASH_KEY, block_hash.as_bytes());
@@ -432,7 +451,6 @@ impl PrevoutStore {
         Ok(delta)
     }
 }
-
 
 #[derive(Debug, Default)]
 pub struct ChainUtxoDelta {

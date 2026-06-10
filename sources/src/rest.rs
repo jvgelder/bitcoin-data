@@ -139,11 +139,12 @@ impl BlockSource for RestSource {
         start_height: u64,
         count: usize,
     ) -> anyhow::Result<Vec<RawBlockFrame>> {
-        let mut frames: Vec<RawBlockFrame> = stream::iter(start_height..start_height + count as u64)
-            .map(|h| self.get_block_by_height(h))
-            .buffer_unordered(count.min(16))
-            .collect::<Vec<anyhow::Result<RawBlockFrame>>>()
-            .await
+        let mut frames: Vec<RawBlockFrame> =
+            stream::iter(start_height..start_height + count as u64)
+                .map(|h| self.get_block_by_height(h))
+                .buffer_unordered(count.min(16))
+                .collect::<Vec<anyhow::Result<RawBlockFrame>>>()
+                .await
                 .into_iter()
                 .collect::<anyhow::Result<Vec<_>>>()?;
         frames.sort_by_key(|f| f.height);

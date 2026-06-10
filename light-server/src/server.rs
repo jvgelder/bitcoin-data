@@ -130,9 +130,18 @@ pub async fn serve(config: ServerConfig, archive: Arc<dyn ArchiveBackend>) -> an
         .route("/manifest", get(manifest))
         .route("/tip", get(tip))
         .route("/blocks/light", get(block_range))
-        .route("/blocks/light/cutthrough/delta", get(cutthrough_delta_range))
-        .route("/blocks/light/cutthrough/snapshot/latest", get(cutthrough_snapshot_latest))
-        .route("/blocks/light/cutthrough/snapshot/:file", get(cutthrough_snapshot_by_height))
+        .route(
+            "/blocks/light/cutthrough/delta",
+            get(cutthrough_delta_range),
+        )
+        .route(
+            "/blocks/light/cutthrough/snapshot/latest",
+            get(cutthrough_snapshot_latest),
+        )
+        .route(
+            "/blocks/light/cutthrough/snapshot/:file",
+            get(cutthrough_snapshot_by_height),
+        )
         .route("/blocks/:height/light", get(single_block))
         .route("/checkpoints/latest", get(latest_checkpoint))
         .route("/checkpoints/:height", get(checkpoint))
@@ -181,7 +190,8 @@ async fn single_block(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let format = response_format(&headers)?;
-    let profile = select_profile(&state.archive, q.scope, StreamProfile::Full, Some(height)).await?;
+    let profile =
+        select_profile(&state.archive, q.scope, StreamProfile::Full, Some(height)).await?;
     ensure_height_served(height, &profile)?;
     let (payload, block_hash) = state.archive.read_block(height, &profile).await?;
     let mut response = match format {
@@ -210,7 +220,8 @@ async fn block_range(
         )));
     }
     let format = response_format(&headers)?;
-    let profile = select_profile(&state.archive, q.scope, StreamProfile::Full, Some(q.start)).await?;
+    let profile =
+        select_profile(&state.archive, q.scope, StreamProfile::Full, Some(q.start)).await?;
     let tip = profile
         .served_tip
         .as_ref()
@@ -289,7 +300,8 @@ async fn cutthrough_delta_range(
             &profile,
         )
         .await?;
-    let count = u32::try_from(delta.messages.len()).map_err(|err| ApiError::internal(err.into()))?;
+    let count =
+        u32::try_from(delta.messages.len()).map_err(|err| ApiError::internal(err.into()))?;
     let mut response = match format {
         ResponseFormat::Capnp => binary_response(frame_range(&delta.messages)?, "no-cache"),
         ResponseFormat::Json => {
@@ -368,7 +380,13 @@ async fn cutthrough_snapshot_by_height(
     let height = height_text
         .parse::<u64>()
         .map_err(|_| ApiError::bad_request("snapshot file must be {height}.bdss"))?;
-    let profile = select_profile(&state.archive, q.scope, StreamProfile::CutThrough, Some(height)).await?;
+    let profile = select_profile(
+        &state.archive,
+        q.scope,
+        StreamProfile::CutThrough,
+        Some(height),
+    )
+    .await?;
     ensure_height_served(height, &profile)?;
     ensure_cutthrough_height_allowed(&state.archive, height, q.scope).await?;
     let snapshot = state
@@ -387,7 +405,8 @@ async fn checkpoint(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let format = response_format(&headers)?;
-    let profile = select_profile(&state.archive, q.scope, StreamProfile::Full, Some(height)).await?;
+    let profile =
+        select_profile(&state.archive, q.scope, StreamProfile::Full, Some(height)).await?;
     ensure_height_served(height, &profile)?;
     let body = state.archive.read_checkpoint(height, &profile).await?;
     let mut response = match format {
@@ -407,7 +426,13 @@ async fn latest_checkpoint(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let format = response_format(&headers)?;
-    let profile = select_profile(&state.archive, q.scope, StreamProfile::Full, Some(q.height_lte)).await?;
+    let profile = select_profile(
+        &state.archive,
+        q.scope,
+        StreamProfile::Full,
+        Some(q.height_lte),
+    )
+    .await?;
     let height_lte = match profile.served_tip.as_ref() {
         Some(tip) => q.height_lte.min(tip.height),
         None => q.height_lte,
@@ -533,7 +558,9 @@ async fn ensure_cutthrough_height_allowed(
     let Some(tip) = &full_profile.tip else {
         return Ok(());
     };
-    let max_cutthrough_height = tip.height.saturating_sub(manifest.suggested_reorg_cache_depth);
+    let max_cutthrough_height = tip
+        .height
+        .saturating_sub(manifest.suggested_reorg_cache_depth);
     if height > max_cutthrough_height {
         return Err(ApiError::bad_request(format!(
             "cut-through requests must end at or below height {max_cutthrough_height} for scope {}; full tip is {}, recent_full_depth is {}",
