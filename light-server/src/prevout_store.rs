@@ -27,6 +27,13 @@ enum CompactPrevoutScriptKind {
     P2sh = 1,
     P2wpkh = 2,
     P2tr = 3,
+    // Spendable but not BIP352-eligible (P2WSH, bare, low-version unknown
+    // witness). Stored so a spend resolves to "skip this input" instead of
+    // "prevout unknown".
+    NonEligible = 4,
+    // Spends a segwit > v1 output: per BIP352 this makes the whole tx
+    // ineligible. The version byte is retained for the eligibility check.
+    WitnessGtV1 = 5,
 }
 
 impl CompactPrevoutScriptKind {
@@ -36,6 +43,8 @@ impl CompactPrevoutScriptKind {
             1 => Ok(Self::P2sh),
             2 => Ok(Self::P2wpkh),
             3 => Ok(Self::P2tr),
+            4 => Ok(Self::NonEligible),
+            5 => Ok(Self::WitnessGtV1),
             other => anyhow::bail!("unsupported prevout entry script kind {other}"),
         }
     }
@@ -68,6 +77,10 @@ enum CompactPrevoutScript {
     P2sh { script_hash: ScriptHash },
     P2wpkh { pubkey_hash: WPubkeyHash },
     P2tr { output_key: XOnlyPublicKey },
+    /// Seen + spendable but not a BIP352-eligible input type.
+    NonEligible,
+    /// Spends a segwit version > 1 output (carries the version).
+    WitnessGtV1 { version: u8 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -140,6 +153,15 @@ impl EncodedPrevoutEntry {
                 bytes[0] = CompactPrevoutScriptKind::P2tr as u8;
                 bytes[1..1 + XONLY_KEY_LEN].copy_from_slice(&output_key.serialize());
                 ENCODED_PREVOUT_HEADER_LEN + XONLY_KEY_LEN
+            }
+            CompactPrevoutScript::NonEligible => {
+                bytes[0] = CompactPrevoutScriptKind::NonEligible as u8;
+                ENCODED_PREVOUT_HEADER_LEN
+            }
+            CompactPrevoutScript::WitnessGtV1 { version } => {
+                bytes[0] = CompactPrevoutScriptKind::WitnessGtV1 as u8;
+                bytes[1] = version;
+                ENCODED_PREVOUT_HEADER_LEN + 1
             }
         };
         Self { bytes, len }
@@ -216,10 +238,20 @@ fn compact_prevout_script(script_pubkey: &[u8]) -> Option<CompactPrevoutScript> 
         ScriptKind::P2tr { xonly_key } => Some(CompactPrevoutScript::P2tr {
             output_key: XOnlyPublicKey::from_slice(&xonly_key).ok()?,
         }),
-        ScriptKind::P2wsh { .. }
-        | ScriptKind::WitnessUnknown { .. }
-        | ScriptKind::OpReturn
-        | ScriptKind::Other => None,
+        // Segwit > v1: spending such an output makes the tx ineligible, so the
+        // version must survive to the eligibility check rather than vanish.
+        ScriptKind::WitnessUnknown { version, .. } if version >= 2 => {
+            Some(CompactPrevoutScript::WitnessGtV1 { version })
+        }
+        // Spendable but never a BIP352 input (P2WSH, bare/non-standard, and
+        // low-version unknown witness programs). Stored so a later spend is
+        // "skip this input", not "prevout unknown".
+        ScriptKind::P2wsh { .. } | ScriptKind::WitnessUnknown { .. } | ScriptKind::Other => {
+            Some(CompactPrevoutScript::NonEligible)
+        }
+        // Provably unspendable: it can never appear as a spent prevout, so
+        // storing it would be pure waste.
+        ScriptKind::OpReturn => None,
     }
 }
 
@@ -237,6 +269,10 @@ fn prevout_info_from_compact(script: CompactPrevoutScript) -> PrevoutInfo {
         CompactPrevoutScript::P2tr { output_key } => PrevoutScript::P2tr {
             xonly_key: output_key,
         },
+        CompactPrevoutScript::NonEligible => PrevoutScript::Other,
+        CompactPrevoutScript::WitnessGtV1 { version } => {
+            PrevoutScript::WitnessUnknown { version }
+        }
     };
     PrevoutInfo { script }
 }
@@ -253,7 +289,11 @@ fn decode_prevout_entry(bytes: &[u8]) -> anyhow::Result<CompactPrevoutContext> {
     // entries naturally disappear as their outpoints are spent or the store is
     // rebuilt.
     let (kind, payload) = match bytes.len() {
-        len if len == ENCODED_PREVOUT_HEADER_LEN + HASH160_LEN
+        // New compact entries: kind byte + optional payload. NonEligible has no
+        // payload (len 1); WitnessGtV1 carries a 1-byte version (len 2).
+        len if len == ENCODED_PREVOUT_HEADER_LEN
+            || len == ENCODED_PREVOUT_HEADER_LEN + 1
+            || len == ENCODED_PREVOUT_HEADER_LEN + HASH160_LEN
             || len == ENCODED_PREVOUT_HEADER_LEN + XONLY_KEY_LEN =>
         {
             (bytes[0], &bytes[1..])
@@ -288,6 +328,14 @@ fn decode_prevout_entry(bytes: &[u8]) -> anyhow::Result<CompactPrevoutContext> {
         CompactPrevoutScriptKind::P2tr => CompactPrevoutScript::P2tr {
             output_key: xonly_key_from_payload(payload)?,
         },
+        CompactPrevoutScriptKind::NonEligible => CompactPrevoutScript::NonEligible,
+        CompactPrevoutScriptKind::WitnessGtV1 => {
+            anyhow::ensure!(
+                payload.len() == 1,
+                "invalid witness>v1 prevout payload length"
+            );
+            CompactPrevoutScript::WitnessGtV1 { version: payload[0] }
+        }
     };
     Ok(CompactPrevoutContext { script })
 }

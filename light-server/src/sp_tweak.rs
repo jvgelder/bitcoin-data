@@ -398,4 +398,36 @@ mod tests {
 
         assert_eq!(status, ScanPointStatus::Ineligible);
     }
+
+    #[test]
+    fn non_eligible_input_is_skipped_not_treated_as_missing() {
+        // Regression: a tx spending an eligible P2WPKH input alongside a
+        // non-eligible (e.g. P2WSH) input must still produce a scan point from
+        // the eligible input. Previously the non-eligible prevout was never
+        // stored, read back as `None`, and wrongly reported MissingPrevout,
+        // dropping the tweak for the whole transaction.
+        let status = compute_tx_scan_point(&[
+            TxInputContext {
+                previous_output: outpoint(4),
+                script_sig: Vec::new(),
+                witness: vec![vec![1; 64], GENERATOR_COMPRESSED.to_vec()],
+                prevout: Some(PrevoutInfo {
+                    script: PrevoutScript::P2wpkh {
+                        hash160: hash160_bytes(&GENERATOR_COMPRESSED),
+                    },
+                }),
+            },
+            TxInputContext {
+                previous_output: outpoint(5),
+                script_sig: Vec::new(),
+                witness: Vec::new(),
+                prevout: Some(PrevoutInfo {
+                    script: PrevoutScript::Other,
+                }),
+            },
+        ])
+        .unwrap();
+
+        assert!(matches!(status, ScanPointStatus::Computed(_)));
+    }
 }
