@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install build deps
-        run: apt-get update && apt-get install -y capnproto libcapnp-dev
+        run: apt-get update && apt-get install -y capnproto libcapnp-dev clang libclang-dev
 
       - run: rustup component add clippy
 
@@ -74,7 +74,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install build deps
-        run: apt-get update && apt-get install -y capnproto libcapnp-dev
+        run: apt-get update && apt-get install -y capnproto libcapnp-dev clang libclang-dev
 
       - name: Restore cache
         uses: actions/cache/restore@v4
