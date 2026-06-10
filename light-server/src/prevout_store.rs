@@ -73,14 +73,24 @@ const META_TIP_HASH_KEY: &[u8] = b"m:tip_hash";
 
 #[derive(Debug, Clone, Copy)]
 enum CompactPrevoutScript {
-    P2pkh { pubkey_hash: PubkeyHash },
-    P2sh { script_hash: ScriptHash },
-    P2wpkh { pubkey_hash: WPubkeyHash },
-    P2tr { output_key: XOnlyPublicKey },
+    P2pkh {
+        pubkey_hash: PubkeyHash,
+    },
+    P2sh {
+        script_hash: ScriptHash,
+    },
+    P2wpkh {
+        pubkey_hash: WPubkeyHash,
+    },
+    P2tr {
+        output_key: XOnlyPublicKey,
+    },
     /// Seen + spendable but not a BIP352-eligible input type.
     NonEligible,
     /// Spends a segwit version > 1 output (carries the version).
-    WitnessGtV1 { version: u8 },
+    WitnessGtV1 {
+        version: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -270,9 +280,7 @@ fn prevout_info_from_compact(script: CompactPrevoutScript) -> PrevoutInfo {
             xonly_key: output_key,
         },
         CompactPrevoutScript::NonEligible => PrevoutScript::Other,
-        CompactPrevoutScript::WitnessGtV1 { version } => {
-            PrevoutScript::WitnessUnknown { version }
-        }
+        CompactPrevoutScript::WitnessGtV1 { version } => PrevoutScript::WitnessUnknown { version },
     };
     PrevoutInfo { script }
 }
@@ -334,7 +342,9 @@ fn decode_prevout_entry(bytes: &[u8]) -> anyhow::Result<CompactPrevoutContext> {
                 payload.len() == 1,
                 "invalid witness>v1 prevout payload length"
             );
-            CompactPrevoutScript::WitnessGtV1 { version: payload[0] }
+            CompactPrevoutScript::WitnessGtV1 {
+                version: payload[0],
+            }
         }
     };
     Ok(CompactPrevoutContext { script })

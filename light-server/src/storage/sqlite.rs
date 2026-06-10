@@ -12,7 +12,7 @@ use crate::types::{BlockHashBytes, OutputIdHash, TxTweak};
 use crate::{DEFAULT_MAX_RANGE_COUNT, WIRE_VERSION};
 use async_trait::async_trait;
 use serde_json::json;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 
@@ -34,7 +34,16 @@ impl SqliteArchive {
     pub async fn connect(database_url: &str, create_if_missing: bool) -> anyhow::Result<Self> {
         let options = SqliteConnectOptions::from_str(database_url)?
             .create_if_missing(create_if_missing)
-            .foreign_keys(true);
+            .foreign_keys(true)
+            // Write-heavy indexer: WAL + NORMAL fsync removes the per-commit
+            // rollback-journal + FULL-sync cost (dominant `commit_ms`), a large
+            // page cache absorbs the B-tree churn, and temp tables stay in RAM.
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(std::time::Duration::from_secs(30))
+            .pragma("cache_size", "-1048576")
+            .pragma("mmap_size", "268435456")
+            .pragma("temp_store", "MEMORY");
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
             .connect_with(options)

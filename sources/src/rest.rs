@@ -13,7 +13,7 @@
 //! decoding of the full block body.
 
 use async_trait::async_trait;
-use btc_data_core::block::RawBlockFrame;
+use btc_data_core::block::{decode_spent_txouts_payload, BlockSpentTxOuts, RawBlockFrame};
 use btc_data_core::source::BlockSource;
 use bytes::Bytes;
 use futures::{stream, StreamExt};
@@ -110,6 +110,19 @@ impl BlockSource for RestSource {
         self.get_bytes(&format!("/rest/block/{hash_hex}.bin")).await
     }
 
+    async fn get_block_spent_txouts(
+        &self,
+        hash: [u8; 32],
+    ) -> anyhow::Result<Option<BlockSpentTxOuts>> {
+        let mut display = hash;
+        display.reverse();
+        let hash_hex = hex::encode(display);
+        let bytes = self
+            .get_bytes(&format!("/rest/spenttxouts/{hash_hex}.bin"))
+            .await?;
+        Ok(Some(decode_spent_txouts_payload(bytes.as_ref())?))
+    }
+
     async fn get_block_by_height(
         &self,
         height: u64,
@@ -121,10 +134,12 @@ impl BlockSource for RestSource {
         let bytes = self
             .get_bytes(&format!("/rest/block/{hash_hex}.bin"))
             .await?;
+        let spent_txouts = self.get_block_spent_txouts(hash).await?;
         Ok(btc_data_core::block::RawBlockFrame {
             height,
             hash,
             bytes,
+            spent_txouts,
         })
     }
 
@@ -134,24 +149,96 @@ impl BlockSource for RestSource {
         Ok(info.blocks)
     }
 
+    async fn get_block_hashes_by_height(
+        &self,
+        start_height: u64,
+        count: usize,
+    ) -> anyhow::Result<Vec<[u8; 32]>> {
+        let mut hashes = stream::iter((0..count).map(|offset| start_height + offset as u64))
+            .map(|height| async move { (height, self.get_block_hash(height).await) })
+            .buffer_unordered(count.min(16))
+            .collect::<Vec<(u64, anyhow::Result<[u8; 32]>)>>()
+            .await;
+
+        hashes.sort_by_key(|(height, _)| *height);
+        hashes
+            .into_iter()
+            .map(|(_, result)| result)
+            .collect::<anyhow::Result<Vec<_>>>()
+    }
+
+    async fn get_blocks_raw(&self, hashes: &[[u8; 32]]) -> anyhow::Result<Vec<Bytes>> {
+        let mut blocks = stream::iter(hashes.iter().copied().enumerate())
+            .map(|(index, hash)| async move { (index, self.get_block_raw(hash).await) })
+            .buffer_unordered(hashes.len().min(16))
+            .collect::<Vec<(usize, anyhow::Result<Bytes>)>>()
+            .await;
+
+        blocks.sort_by_key(|(index, _)| *index);
+        blocks
+            .into_iter()
+            .map(|(_, result)| result)
+            .collect::<anyhow::Result<Vec<_>>>()
+    }
+
+    async fn get_blocks_spent_txouts(
+        &self,
+        hashes: &[[u8; 32]],
+    ) -> anyhow::Result<Vec<Option<BlockSpentTxOuts>>> {
+        let mut undo = stream::iter(hashes.iter().copied().enumerate())
+            .map(|(index, hash)| async move { (index, self.get_block_spent_txouts(hash).await) })
+            .buffer_unordered(hashes.len().min(16))
+            .collect::<Vec<(usize, anyhow::Result<Option<BlockSpentTxOuts>>)>>()
+            .await;
+
+        undo.sort_by_key(|(index, _)| *index);
+        undo.into_iter()
+            .map(|(_, result)| result)
+            .collect::<anyhow::Result<Vec<_>>>()
+    }
+
     async fn get_block_range_by_height(
         &self,
         start_height: u64,
         count: usize,
     ) -> anyhow::Result<Vec<RawBlockFrame>> {
-        let mut frames: Vec<RawBlockFrame> =
-            stream::iter(start_height..start_height + count as u64)
-                .map(|h| self.get_block_by_height(h))
-                .buffer_unordered(count.min(16))
-                .collect::<Vec<anyhow::Result<RawBlockFrame>>>()
-                .await
-                .into_iter()
-                .collect::<anyhow::Result<Vec<_>>>()?;
-        frames.sort_by_key(|f| f.height);
-        Ok(frames)
+        let hashes = self.get_block_hashes_by_height(start_height, count).await?;
+        let blocks = self.get_blocks_raw(&hashes).await?;
+        let spent_txouts = self.get_blocks_spent_txouts(&hashes).await?;
+        if blocks.len() != hashes.len() {
+            anyhow::bail!(
+                "REST batch returned {} blocks for {} hashes",
+                blocks.len(),
+                hashes.len()
+            );
+        }
+        if spent_txouts.len() != hashes.len() {
+            anyhow::bail!(
+                "REST batch returned {} spenttxouts payloads for {} hashes",
+                spent_txouts.len(),
+                hashes.len()
+            );
+        }
+
+        Ok(hashes
+            .into_iter()
+            .zip(blocks)
+            .zip(spent_txouts)
+            .enumerate()
+            .map(|(offset, ((hash, bytes), spent_txouts))| RawBlockFrame {
+                height: start_height + offset as u64,
+                hash,
+                bytes,
+                spent_txouts,
+            })
+            .collect())
     }
 
     fn supports_block_range_batches(&self) -> bool {
+        true
+    }
+
+    fn supports_block_spent_txouts(&self) -> bool {
         true
     }
 
