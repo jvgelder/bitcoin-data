@@ -18,7 +18,7 @@ use btc_data_light_server::storage::{
 use btc_data_light_server::types::{BlockHashBytes, TxTweak, TxidBytes};
 use btc_data_sources::{IpcSource, PollingTipWatcher, RestSource};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
-use futures::{stream, StreamExt};
+use futures::{stream, StreamExt, TryStreamExt};
 use sqlx::Row;
 use std::mem;
 use std::path::PathBuf;
@@ -53,6 +53,11 @@ async fn delete_p2tr_outpoints(
         return Ok(());
     }
 
+    // Delete by full primary-key equality so SQLite drives each term off the
+    // p2tr_utxo_lookup (txid, vout) PK index (its OR-by-index optimization),
+    // rather than scanning the whole live-UTXO table. A temp-table + correlated
+    // `EXISTS` delete reads cleaner but makes the target table the outer loop,
+    // i.e. a full scan per batch -- the opposite of what this hot path needs.
     for chunk in outpoints.chunks(SQL_P2TR_DELETE_CHUNK) {
         let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new("DELETE FROM p2tr_utxo_lookup WHERE ");
 
@@ -324,7 +329,7 @@ async fn main() -> anyhow::Result<()> {
                 index_p2tr_key_stats,
                 once,
             )
-            .await
+                .await
         }
 
         Command::SourceTip { source } => source_tip_command(source).await,
@@ -408,20 +413,40 @@ async fn run_command(
         .filter(|h| *h >= emit_start_height);
     let mut state = restore_indexer_state(&archive, committed_profile_tip).await?;
     let mut prevout_store = PrevoutStore::open(&prevout_db_dir)?;
-    let (prevout_tip, prevout_tip_hash) = prevout_store.tip();
+    let (mut prevout_tip, mut prevout_tip_hash) = prevout_store.tip();
 
     if let Some(committed_profile_tip) = committed_profile_tip {
-        anyhow::ensure!(
-            prevout_tip == Some(committed_profile_tip),
-            "committed served profile tip {} requires matching RocksDB prevout tip; found {:?}",
-            committed_profile_tip,
-            prevout_tip
-        );
+        match prevout_tip {
+            Some(tip) if tip > committed_profile_tip => {
+                anyhow::bail!(
+                    "RocksDB prevout tip {tip} is ahead of committed SQLite profile tip {committed_profile_tip}; \
+                     refusing to continue because the mutable prevout store cannot be safely rewound"
+                );
+            }
+            Some(tip) if tip < committed_profile_tip => {
+                catch_up_prevout_store_to_tip(
+                    bundle.source.clone(),
+                    &mut prevout_store,
+                    tip + 1,
+                    committed_profile_tip,
+                    catchup_batch_size,
+                )
+                    .await?;
+                (prevout_tip, prevout_tip_hash) = prevout_store.tip();
+            }
+            None => {
+                anyhow::bail!(
+                    "SQLite has committed profile tip {committed_profile_tip}, but RocksDB prevout store is empty; \
+                     refusing to rebuild prevout context from genesis automatically"
+                );
+            }
+            _ => {}
+        }
     }
 
     let initial_next_height = prevout_tip.map_or(GENESIS_HEIGHT, |height| height + 1);
     println!(
-        "restored indexer state profile_tip={} prevout_tip={} prevout_tip_hash={} next_height={} emit_start_height={} last_uid={} live_p2tr_utxos={} eligible_prevouts_estimate={} fetch_blocks={} flush_blocks={} flush_prevout_mutations={} index_p2tr_key_stats={} prevout_db_dir={}",
+        "restored indexer state profile_tip={} prevout_tip={} prevout_tip_hash={} next_height={} emit_start_height={} last_uid={} live_p2tr_utxos={} prevout_contexts_live_estimate={} fetch_blocks={} flush_blocks={} flush_prevout_mutations={} index_p2tr_key_stats={} prevout_db_dir={}",
         committed_profile_tip
             .map(|h| h.to_string())
             .unwrap_or_else(|| "none".to_string()),
@@ -478,7 +503,7 @@ async fn run_command(
                 flush_prevout_mutations,
                 index_p2tr_key_stats,
             )
-            .await?;
+                .await?;
 
             // Continue immediately after catch-up work. While processing a large
             // historical range, Core may advance again; do not wait until there
@@ -535,91 +560,56 @@ async fn catch_up_ranges(
 
     let first_height = start_height;
     let mut last_height = None;
-    let mut last_hash = None;
+    let mut last_hash: Option<BlockHashBytes> = None;
     let mut total_bytes = 0usize;
     let mut total_fetch_elapsed = Duration::ZERO;
     let mut total_decode_elapsed = Duration::ZERO;
     let mut total_apply_elapsed = Duration::ZERO;
-    let mut spent_outpoints_count = 0usize;
-    let mut scan_point_outpoints_count = 0usize;
-    let mut chain_created = 0usize;
-    let mut chain_spent = 0usize;
+    let mut scan_point_prevout_lookups = 0usize;
+    let mut prevout_contexts_created = 0usize;
+    let mut prevout_delete_attempts = 0usize;
     let mut pending: Vec<Pending> = Vec::with_capacity(flush_count);
     let mut pending_prevouts = PendingPrevoutWrites::default();
     let mut total_prevout_store_elapsed = Duration::ZERO;
 
+    // Seeded from the resume point so the first chunk's parent linkage is
+    // checked against the committed/prevout tip, not against itself.
+    let mut previous_tip_hash: Option<BlockHashBytes> = prevout_store.tip().1;
     let mut chunk_start = start_height;
     while chunk_start <= flush_end_height {
         let chunk_remaining = flush_end_height - chunk_start + 1;
         let chunk_count = usize::try_from(chunk_remaining.min(fetch_batch_size as u64))?;
 
-        // Stage 1a: fetch raw blocks for this bounded source chunk.
-        let fetch_started = Instant::now();
-        let frames = source
-            .get_block_range_by_height(chunk_start, chunk_count)
-            .await?;
-        let fetch_elapsed = fetch_started.elapsed();
-        total_fetch_elapsed += fetch_elapsed;
-        if frames.is_empty() {
-            anyhow::bail!("source returned an empty block range at height {chunk_start}");
-        }
+        // Stage 1: fetch + decode this bounded source chunk. The helper consumes
+        // the raw frames instead of cloning their byte buffers, keeping peak
+        // memory bounded to one source chunk plus its decoded block inputs.
+        let chunk = fetch_and_decode_chunk(source, chunk_start, chunk_count).await?;
+        total_fetch_elapsed += chunk.fetch_elapsed;
+        total_decode_elapsed += chunk.decode_elapsed;
+        total_bytes += chunk.raw_bytes;
+        let decoded = chunk.blocks;
 
-        let chunk_first_height = frames.first().expect("non-empty").height;
-        let last_frame = frames.last().expect("non-empty");
-        last_height = Some(last_frame.height);
-        last_hash = Some(last_frame.hash);
-        let chunk_bytes: usize = frames.iter().map(|f| f.bytes.len()).sum();
-        total_bytes += chunk_bytes;
+        validate_decoded_chunk(&decoded, chunk_start, previous_tip_hash)?;
 
-        // Stage 1b: decode raw blocks. Consume the raw frames instead of
-        // cloning their byte buffers; this keeps peak memory bounded to the
-        // source chunk plus decoded block inputs, not two copies of each raw
-        // block range.
-        let decode_started = Instant::now();
-        let mut decoded: Vec<BlockScanInput> = stream::iter(frames)
-            .map(|frame| {
-                let height = frame.height;
-                let hash = frame.hash;
-                let bytes = frame.bytes;
-                async move {
-                    tokio::task::spawn_blocking(move || {
-                        decode_block_frame(height, hash, bytes.as_ref())
-                    })
-                    .await
-                    .map_err(|e| anyhow::anyhow!("decode worker failed: {e}"))?
-                }
-            })
-            .buffer_unordered(8)
-            .collect::<Vec<anyhow::Result<BlockScanInput>>>()
-            .await
-            .into_iter()
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        decoded.sort_by_key(|d| d.height);
-        let decode_elapsed = decode_started.elapsed();
-        total_decode_elapsed += decode_elapsed;
+        let chunk_first_height = decoded.first().expect("non-empty").height;
+        let chunk_last = decoded.last().expect("non-empty");
+        last_height = Some(chunk_last.height);
+        last_hash = Some(chunk_last.block_hash);
+        previous_tip_hash = Some(chunk_last.block_hash);
+
         println!(
             "fetched finalized chunk {}..={} count={} bytes={} flush_target={}..={} buffered_blocks={} pending_prevout_writes={}",
             chunk_first_height,
             last_height.expect("last height set"),
             decoded.len(),
-            chunk_bytes,
+            chunk.raw_bytes,
             first_height,
             flush_end_height,
             pending.len(),
             pending_prevouts.len()
         );
 
-        // Stage 2a: count inputs that could require prevout lookup without
-        // probing RocksDB just for diagnostics. Accurate hit/miss counters are
-        // intentionally avoided: txs without SP-candidate outputs can use blind
-        // RocksDB deletes, and txs with SP-candidate outputs will perform the
-        // required lookups during ordered apply.
-        let spent_outpoints = collect_spent_outpoints(&decoded);
-        let scan_point_outpoints = collect_scan_point_outpoints(&decoded);
-        spent_outpoints_count += spent_outpoints.len();
-        scan_point_outpoints_count += scan_point_outpoints.len();
-
-        // Stage 2b: serial, ordered apply. State advances in memory until the
+        // Stage 2a: serial, ordered apply. State advances in memory until the
         // flush transaction commits. A crash before commit will reprocess from
         // the last committed profile tip.
         let apply_started = Instant::now();
@@ -627,8 +617,9 @@ async fn catch_up_ranges(
             let emit_light_payload = scan.height >= emit_start_height;
             let chain_delta =
                 prevout_store.enrich_block_scan_points(&mut pending_prevouts, &mut scan)?;
-            chain_created += chain_delta.created.len();
-            chain_spent += chain_delta.spent.len();
+            prevout_contexts_created += chain_delta.contexts_created;
+            prevout_delete_attempts += chain_delta.delete_attempts;
+            scan_point_prevout_lookups += chain_delta.scan_point_prevout_lookups;
 
             if emit_light_payload {
                 let applied = state.apply_block_with_stats(scan, profile)?;
@@ -650,7 +641,7 @@ async fn catch_up_ranges(
             prevout_store.apply_pending(
                 mem::take(&mut pending_prevouts),
                 chunk_last_height,
-                BlockHashBytes::from(chunk_last_hash),
+                chunk_last_hash,
             )?;
             total_prevout_store_elapsed += prevout_store_started.elapsed();
         }
@@ -674,24 +665,24 @@ async fn catch_up_ranges(
     for chunk in pending.chunks(SQL_INSERT_CHUNK) {
         {
             let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-                "INSERT OR REPLACE INTO blocks \
+                "INSERT INTO blocks \
                  (height, block_hash, previous_block_hash, p2tr_created_count, p2tr_spent_count, anchor_last_uid) ",
             );
             qb.push_values(chunk, |mut b, p| {
                 let block = &p.applied.light_block;
                 let stats = &p.applied.stats;
-                b.push_bind(block.height as i64)
+                b.push_bind(i64::try_from(block.height).expect("height fits in i64"))
                     .push_bind(block.block_hash.as_bytes().to_vec())
                     .push_bind(block.previous_block_hash.as_bytes().to_vec())
                     .push_bind(i64::from(stats.indexed_output_count))
                     .push_bind(i64::from(stats.indexed_spent_count))
-                    .push_bind(block.block_anchor_last_uid as i64);
+                    .push_bind(i64::try_from(block.block_anchor_last_uid).expect("UID fits in i64"));
             });
             qb.build().execute(&mut *tx).await?;
         }
         {
             let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-                "INSERT OR REPLACE INTO block_stats \
+                "INSERT INTO block_stats \
                  (height, tx_count, output_count_total, p2tr_output_count, p2tr_sp_candidate_count, \
                   p2tr_nums_count, p2tr_reused_count, p2tr_excluded_by_scope_count, \
                   indexed_output_count, indexed_spent_count, tx_with_p2tr_output_count, \
@@ -700,7 +691,7 @@ async fn catch_up_ranges(
             qb.push_values(chunk, |mut b, p| {
                 let block = &p.applied.light_block;
                 let s = &p.applied.stats;
-                b.push_bind(block.height as i64)
+                b.push_bind(i64::try_from(block.height).expect("height fits in i64"))
                     .push_bind(i64::from(s.tx_count))
                     .push_bind(i64::from(s.output_count_total))
                     .push_bind(i64::from(s.p2tr_output_count))
@@ -718,16 +709,16 @@ async fn catch_up_ranges(
         }
         {
             let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-                "INSERT OR REPLACE INTO payload_cache \
+                "INSERT INTO payload_cache \
                  (profile_id, height, block_hash, payload, payload_len, created_at) ",
             );
             qb.push_values(chunk, |mut b, p| {
                 let block = &p.applied.light_block;
                 b.push_bind(profile_id)
-                    .push_bind(block.height as i64)
+                    .push_bind(i64::try_from(block.height).expect("height fits in i64"))
                     .push_bind(block.block_hash.as_bytes().to_vec())
                     .push_bind(p.payload.clone())
-                    .push_bind(p.payload.len() as i64)
+                    .push_bind(i64::try_from(p.payload.len()).expect("payload length fits in i64"))
                     .push("unixepoch()");
             });
             qb.build().execute(&mut *tx).await?;
@@ -746,7 +737,7 @@ async fn catch_up_ranges(
     let p2tr_output_started = Instant::now();
     for chunk in p2tr_created.chunks(SQL_UTXO_MUTATION_CHUNK) {
         let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-            r#"INSERT OR REPLACE INTO p2tr_outputs
+            r#"INSERT INTO p2tr_outputs
                (uid, created_height, created_block_hash, tx_index, vout, value_sat, is_nums, is_reused,
                 reuse_count_at_creation, txid, script_pubkey, p2tr_xonly_key) "#,
         );
@@ -775,7 +766,7 @@ async fn catch_up_ranges(
     let p2tr_utxo_insert_started = Instant::now();
     for chunk in p2tr_created.chunks(SQL_UTXO_MUTATION_CHUNK) {
         let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-            r#"INSERT OR REPLACE INTO p2tr_utxo_lookup
+            r#"INSERT INTO p2tr_utxo_lookup
                (txid, vout, uid, value_sat, script_pubkey, p2tr_xonly_key,
                 created_height, created_block_hash, created_tx_index) "#,
         );
@@ -831,7 +822,7 @@ async fn catch_up_ranges(
     let p2tr_spend_started = Instant::now();
     for chunk in p2tr_spent.chunks(SQL_UTXO_MUTATION_CHUNK) {
         let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-            r#"INSERT OR REPLACE INTO p2tr_spends
+            r#"INSERT INTO p2tr_spends
                (uid, spent_height, spent_block_hash, spend_tx_index) "#,
         );
         qb.push_values(chunk, |mut b, spent| {
@@ -868,7 +859,7 @@ async fn catch_up_ranges(
         .collect::<Vec<_>>();
     for chunk in tx_tweaks.chunks(SQL_UTXO_MUTATION_CHUNK) {
         let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-            r#"INSERT OR REPLACE INTO tx_tweaks
+            r#"INSERT INTO tx_tweaks
                (height, tx_index, tweak) "#,
         );
         qb.push_values(chunk, |mut b, (height, tx_index, tweak)| {
@@ -883,7 +874,7 @@ async fn catch_up_ranges(
     // checkpoint + profile tip: once per emitted range. During genesis warmup
     // before the archive scope begins, only the UTXO checkpoint is advanced.
     let checkpoint_profile_started = Instant::now();
-    let checkpoint_hash = BlockHashBytes::from(last_hash);
+    let checkpoint_hash = last_hash;
     let checkpoint_bytes = if pending.is_empty() {
         Vec::new()
     } else {
@@ -897,48 +888,59 @@ async fn catch_up_ranges(
         let checkpoint_bytes = to_packed_bytes(&encode_uid_checkpoint(&checkpoint)?)?;
 
         sqlx::query(
-            r#"INSERT OR REPLACE INTO checkpoint_cache
+            r#"INSERT INTO checkpoint_cache
                (profile_id, height, block_hash, checkpoint, checkpoint_len, created_at)
                VALUES (?, ?, ?, ?, ?, unixepoch())"#,
         )
-        .bind(profile_id)
-        .bind(i64::try_from(last_height)?)
-        .bind(checkpoint_hash.as_bytes().to_vec())
-        .bind(checkpoint_bytes.clone())
-        .bind(i64::try_from(checkpoint_bytes.len())?)
-        .execute(&mut *tx)
-        .await?;
+            .bind(profile_id)
+            .bind(i64::try_from(last_height)?)
+            .bind(checkpoint_hash.as_bytes().to_vec())
+            .bind(checkpoint_bytes.clone())
+            .bind(i64::try_from(checkpoint_bytes.len())?)
+            .execute(&mut *tx)
+            .await?;
 
         sqlx::query(
             r#"UPDATE profiles
                SET served_tip_height = ?, served_tip_hash = ?
                WHERE profile_id = ?"#,
         )
-        .bind(i64::try_from(last_height)?)
-        .bind(checkpoint_hash.as_bytes().to_vec())
-        .bind(profile_id)
-        .execute(&mut *tx)
-        .await?;
+            .bind(i64::try_from(last_height)?)
+            .bind(checkpoint_hash.as_bytes().to_vec())
+            .bind(profile_id)
+            .execute(&mut *tx)
+            .await?;
 
         checkpoint_bytes
     };
     sql_timing.checkpoint_profile_ms = checkpoint_profile_started.elapsed().as_millis();
 
     let pending_prevout_write_count = pending_prevouts.len();
-    let prevout_store_started = Instant::now();
-    if pending_prevout_write_count > 0 || prevout_store.tip().0 != Some(last_height) {
-        prevout_store.apply_pending(
-            mem::take(&mut pending_prevouts),
-            last_height,
-            checkpoint_hash,
-        )?;
-    }
-    total_prevout_store_elapsed += prevout_store_started.elapsed();
-    sql_timing.prevout_store_ms = total_prevout_store_elapsed.as_millis();
+    let should_apply_prevouts = pending_prevout_write_count > 0 || prevout_store.tip().0 != Some(last_height);
+    let pending_prevouts_to_apply = if should_apply_prevouts {
+        Some(mem::take(&mut pending_prevouts))
+    } else {
+        None
+    };
 
+    // Durability ordering: commit SQLite first, then advance the RocksDB
+    // prevout tip. The served archive is the authority on progress, so SQLite
+    // tables use plain INSERT (no OR REPLACE) and never expect to re-write a
+    // committed height. A crash in this window leaves RocksDB *behind* SQLite,
+    // which restart repairs by rolling the prevout store forward
+    // (catch_up_prevout_store_to_tip); RocksDB can never be left ahead, so it
+    // never needs an unsafe rewind. Do not reorder these two steps without also
+    // revisiting that recovery path and the INSERT-vs-INSERT-OR-REPLACE choice.
     let commit_started = Instant::now();
     tx.commit().await?;
     let commit_elapsed = commit_started.elapsed();
+
+    let prevout_store_started = Instant::now();
+    if let Some(pending_prevouts_to_apply) = pending_prevouts_to_apply {
+        prevout_store.apply_pending(pending_prevouts_to_apply, last_height, checkpoint_hash)?;
+    }
+    total_prevout_store_elapsed += prevout_store_started.elapsed();
+    sql_timing.prevout_store_ms = total_prevout_store_elapsed.as_millis();
 
     let sql_elapsed = sql_started.elapsed();
     let total_elapsed = range_started.elapsed();
@@ -965,7 +967,7 @@ async fn catch_up_ranges(
     let processed_blocks = last_height - first_height + 1;
 
     println!(
-        "indexed finalized range {}..={} blocks={} served_blocks={} flush_blocks={} raw_bytes={} payload_bytes={} checkpoint_bytes={} txs={} outputs={} p2tr_outputs={} indexed_created={} indexed_spent={} tx_tweaks={} eligible_prevouts_created={} eligible_prevouts_spent={} last_uid={} live_uids={} eligible_prevouts={} spent_outpoints={} scan_point_outpoints={} pending_prevout_writes={} fetch_ms={} decode_ms={} apply_ms={} sql_ms={} sql_core_cache_ms={} prevout_store_ms={} sql_p2tr_output_ms={} sql_p2tr_utxo_insert_ms={} sql_p2tr_key_stats_ms={} sql_p2tr_spend_ms={} sql_p2tr_utxo_delete_ms={} sql_tx_tweak_ms={} sql_checkpoint_profile_ms={} commit_ms={} total_ms={}",
+        "indexed finalized range {}..={} blocks={} served_blocks={} flush_blocks={} raw_bytes={} payload_bytes={} checkpoint_bytes={} txs={} outputs={} p2tr_outputs={} indexed_created={} indexed_spent={} tx_tweaks={} prevout_contexts_created={} prevout_delete_attempts={} last_uid={} live_uids={} prevout_contexts_live_estimate={} scan_point_prevout_lookups={} pending_prevout_writes={} fetch_ms={} decode_ms={} apply_ms={} sql_ms={} sql_core_cache_ms={} prevout_store_ms={} sql_p2tr_output_ms={} sql_p2tr_utxo_insert_ms={} sql_p2tr_key_stats_ms={} sql_p2tr_spend_ms={} sql_p2tr_utxo_delete_ms={} sql_tx_tweak_ms={} sql_checkpoint_profile_ms={} commit_ms={} total_ms={}",
         first_height,
         last_height,
         processed_blocks,
@@ -980,13 +982,12 @@ async fn catch_up_ranges(
         totals.indexed_output_count,
         totals.indexed_spent_count,
         totals.tweak_count,
-        chain_created,
-        chain_spent,
+        prevout_contexts_created,
+        prevout_delete_attempts,
         state.last_uid(),
         state.live_uid_count(),
         prevout_store.len_estimate(),
-        spent_outpoints_count,
-        scan_point_outpoints_count,
+        scan_point_prevout_lookups,
         pending_prevout_write_count,
         total_fetch_elapsed.as_millis(),
         total_decode_elapsed.as_millis(),
@@ -1006,6 +1007,149 @@ async fn catch_up_ranges(
     );
 
     Ok(last_height + 1)
+}
+
+async fn catch_up_prevout_store_to_tip(
+    source: Arc<dyn BlockSource>,
+    prevout_store: &mut PrevoutStore,
+    start_height: u64,
+    target_height: u64,
+    fetch_batch_size: usize,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        start_height <= target_height,
+        "invalid prevout replay range {start_height}..={target_height}"
+    );
+
+    let mut pending_prevouts = PendingPrevoutWrites::default();
+    let mut chunk_start = start_height;
+    let mut previous_hash = prevout_store.tip().1;
+
+    while chunk_start <= target_height {
+        let chunk_remaining = target_height - chunk_start + 1;
+        let chunk_count = usize::try_from(chunk_remaining.min(fetch_batch_size as u64))?;
+        let decoded = fetch_and_decode_chunk(source.as_ref(), chunk_start, chunk_count)
+            .await?
+            .blocks;
+        validate_decoded_chunk(&decoded, chunk_start, previous_hash)?;
+
+        let chunk_last = decoded.last().expect("non-empty decoded chunk");
+        let chunk_last_height = chunk_last.height;
+        let chunk_last_hash = chunk_last.block_hash;
+
+        for mut scan in decoded {
+            prevout_store.enrich_block_scan_points(&mut pending_prevouts, &mut scan)?;
+        }
+
+        prevout_store.apply_pending(
+            mem::take(&mut pending_prevouts),
+            chunk_last_height,
+            chunk_last_hash,
+        )?;
+        previous_hash = Some(chunk_last_hash);
+        chunk_start = chunk_last_height + 1;
+    }
+
+    Ok(())
+}
+
+/// One fetched-and-decoded source chunk plus the fetch/decode telemetry the
+/// caller needs for range logging. Frames are consumed during decode so peak
+/// memory stays at one source chunk's worth of bytes.
+struct DecodedChunk {
+    blocks: Vec<BlockScanInput>,
+    raw_bytes: usize,
+    fetch_elapsed: Duration,
+    decode_elapsed: Duration,
+}
+
+async fn fetch_and_decode_chunk(
+    source: &dyn BlockSource,
+    chunk_start: u64,
+    chunk_count: usize,
+) -> anyhow::Result<DecodedChunk> {
+    let fetch_started = Instant::now();
+    let frames = source
+        .get_block_range_by_height(chunk_start, chunk_count)
+        .await?;
+    let fetch_elapsed = fetch_started.elapsed();
+    anyhow::ensure!(
+        !frames.is_empty(),
+        "source returned an empty block range at height {chunk_start}"
+    );
+    let raw_bytes: usize = frames.iter().map(|frame| frame.bytes.len()).sum();
+
+    let decode_started = Instant::now();
+    let mut blocks: Vec<BlockScanInput> = stream::iter(frames)
+        .map(|frame| {
+            let height = frame.height;
+            let hash = frame.hash;
+            let bytes = frame.bytes;
+            async move {
+                tokio::task::spawn_blocking(move || decode_block_frame(height, hash, bytes.as_ref()))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("decode worker failed: {e}"))?
+            }
+        })
+        .buffer_unordered(8)
+        .collect::<Vec<anyhow::Result<BlockScanInput>>>()
+        .await
+        .into_iter()
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    blocks.sort_by_key(|block| block.height);
+    let decode_elapsed = decode_started.elapsed();
+
+    Ok(DecodedChunk {
+        blocks,
+        raw_bytes,
+        fetch_elapsed,
+        decode_elapsed,
+    })
+}
+
+fn validate_decoded_chunk(
+    decoded: &[BlockScanInput],
+    expected_start_height: u64,
+    expected_previous_hash: Option<BlockHashBytes>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !decoded.is_empty(),
+        "decoded block chunk at height {expected_start_height} is empty"
+    );
+
+    let first = &decoded[0];
+    anyhow::ensure!(
+        first.height == expected_start_height,
+        "decoded block chunk starts at height {}, expected {expected_start_height}",
+        first.height
+    );
+
+    if let Some(expected_previous_hash) = expected_previous_hash {
+        anyhow::ensure!(
+            first.previous_block_hash == expected_previous_hash,
+            "decoded block at height {} does not connect to previous chunk tip",
+            first.height
+        );
+    }
+
+    for pair in decoded.windows(2) {
+        let prev = &pair[0];
+        let current = &pair[1];
+        anyhow::ensure!(
+            current.height == prev.height + 1,
+            "decoded block heights are not contiguous: {} followed by {}",
+            prev.height,
+            current.height
+        );
+        anyhow::ensure!(
+            current.previous_block_hash == prev.block_hash,
+            "decoded block at height {} does not connect to height {}",
+            current.height,
+            prev.height
+        );
+    }
+
+    Ok(())
 }
 
 fn decode_block_frame(
@@ -1384,7 +1528,7 @@ async fn write_fixture_db(
 
     for (height, hash, prev_hash, anchor_last_uid, bytes, stats) in blocks {
         sqlx::query(
-            r#"INSERT OR REPLACE INTO blocks
+            r#"INSERT INTO blocks
                (height, block_hash, previous_block_hash, p2tr_created_count, p2tr_spent_count, anchor_last_uid)
                VALUES (?, ?, ?, ?, ?, ?)"#,
         )
@@ -1398,66 +1542,66 @@ async fn write_fixture_db(
             .await?;
 
         sqlx::query(
-            r#"INSERT OR REPLACE INTO block_stats
+            r#"INSERT INTO block_stats
                (height, tx_count, output_count_total, p2tr_output_count, p2tr_sp_candidate_count,
                 p2tr_nums_count, p2tr_reused_count, p2tr_excluded_by_scope_count,
                 indexed_output_count, indexed_spent_count, tx_with_p2tr_output_count,
                 tx_with_indexed_output_count, tweak_count)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
-        .bind(i64::try_from(height)?)
-        .bind(i64::from(stats.tx_count))
-        .bind(i64::from(stats.output_count_total))
-        .bind(i64::from(stats.p2tr_output_count))
-        .bind(i64::from(stats.p2tr_sp_candidate_count))
-        .bind(i64::from(stats.p2tr_nums_count))
-        .bind(i64::from(stats.p2tr_reused_count))
-        .bind(i64::from(stats.p2tr_excluded_by_scope_count))
-        .bind(i64::from(stats.indexed_output_count))
-        .bind(i64::from(stats.indexed_spent_count))
-        .bind(i64::from(stats.tx_with_p2tr_output_count))
-        .bind(i64::from(stats.tx_with_indexed_output_count))
-        .bind(i64::from(stats.tweak_count))
-        .execute(&mut *tx)
-        .await?;
+            .bind(i64::try_from(height)?)
+            .bind(i64::from(stats.tx_count))
+            .bind(i64::from(stats.output_count_total))
+            .bind(i64::from(stats.p2tr_output_count))
+            .bind(i64::from(stats.p2tr_sp_candidate_count))
+            .bind(i64::from(stats.p2tr_nums_count))
+            .bind(i64::from(stats.p2tr_reused_count))
+            .bind(i64::from(stats.p2tr_excluded_by_scope_count))
+            .bind(i64::from(stats.indexed_output_count))
+            .bind(i64::from(stats.indexed_spent_count))
+            .bind(i64::from(stats.tx_with_p2tr_output_count))
+            .bind(i64::from(stats.tx_with_indexed_output_count))
+            .bind(i64::from(stats.tweak_count))
+            .execute(&mut *tx)
+            .await?;
 
         sqlx::query(
-            r#"INSERT OR REPLACE INTO payload_cache
+            r#"INSERT INTO payload_cache
                (profile_id, height, block_hash, payload, payload_len, created_at)
                VALUES (?, ?, ?, ?, ?, unixepoch())"#,
         )
-        .bind(db_profile.profile_id)
-        .bind(i64::try_from(height)?)
-        .bind(hash.as_bytes().to_vec())
-        .bind(bytes.clone())
-        .bind(i64::try_from(bytes.len())?)
-        .execute(&mut *tx)
-        .await?;
+            .bind(db_profile.profile_id)
+            .bind(i64::try_from(height)?)
+            .bind(hash.as_bytes().to_vec())
+            .bind(bytes.clone())
+            .bind(i64::try_from(bytes.len())?)
+            .execute(&mut *tx)
+            .await?;
     }
 
     sqlx::query(
-        r#"INSERT OR REPLACE INTO checkpoint_cache
+        r#"INSERT INTO checkpoint_cache
            (profile_id, height, block_hash, checkpoint, checkpoint_len, created_at)
            VALUES (?, ?, ?, ?, ?, unixepoch())"#,
     )
-    .bind(db_profile.profile_id)
-    .bind(i64::try_from(checkpoint_height)?)
-    .bind(tip_hash.as_bytes().to_vec())
-    .bind(checkpoint_bytes.clone())
-    .bind(i64::try_from(checkpoint_bytes.len())?)
-    .execute(&mut *tx)
-    .await?;
+        .bind(db_profile.profile_id)
+        .bind(i64::try_from(checkpoint_height)?)
+        .bind(tip_hash.as_bytes().to_vec())
+        .bind(checkpoint_bytes.clone())
+        .bind(i64::try_from(checkpoint_bytes.len())?)
+        .execute(&mut *tx)
+        .await?;
 
     sqlx::query(
         r#"UPDATE profiles
            SET served_tip_height = ?, served_tip_hash = ?
            WHERE profile_id = ?"#,
     )
-    .bind(i64::try_from(checkpoint_height)?)
-    .bind(tip_hash.as_bytes().to_vec())
-    .bind(db_profile.profile_id)
-    .execute(&mut *tx)
-    .await?;
+        .bind(i64::try_from(checkpoint_height)?)
+        .bind(tip_hash.as_bytes().to_vec())
+        .bind(db_profile.profile_id)
+        .execute(&mut *tx)
+        .await?;
 
     tx.commit().await?;
 
@@ -1513,11 +1657,11 @@ async fn ensure_archive_meta(
              ('scope', ?),
              ('start_height', ?)"#,
     )
-    .bind(network.to_string())
-    .bind(scope.to_string())
-    .bind(start_height.to_string())
-    .execute(archive.pool())
-    .await?;
+        .bind(network.to_string())
+        .bind(scope.to_string())
+        .bind(start_height.to_string())
+        .execute(archive.pool())
+        .await?;
 
     Ok(())
 }
@@ -1530,32 +1674,31 @@ async fn restore_indexer_state(
         let value = sqlx::query_scalar::<_, Option<i64>>(
             r#"SELECT anchor_last_uid FROM blocks WHERE height = ?"#,
         )
-        .bind(i64::try_from(height)?)
-        .fetch_one(archive.pool())
-        .await?;
+            .bind(i64::try_from(height)?)
+            .fetch_one(archive.pool())
+            .await?;
         value
             .ok_or_else(|| anyhow::anyhow!("missing committed tip block row at height {height}"))?
     } else {
         0
     };
 
-    let rows = sqlx::query(
+    let mut rows = sqlx::query(
         r#"SELECT txid, vout, uid, value_sat, script_pubkey, p2tr_xonly_key,
                   created_height, created_block_hash, created_tx_index
            FROM p2tr_utxo_lookup
            ORDER BY uid"#,
     )
-    .fetch_all(archive.pool())
-    .await?;
+        .fetch(archive.pool());
 
-    let mut entries = Vec::with_capacity(rows.len());
-    for row in rows {
+    let mut entries = Vec::new();
+    while let Some(row) = rows.try_next().await? {
         let txid: Vec<u8> = row.try_get("txid")?;
         let txid: [u8; 32] = txid.try_into().map_err(|v: Vec<u8>| {
             anyhow::anyhow!("invalid txid length in p2tr_utxo_lookup: {}", v.len())
         })?;
         let key: Vec<u8> = row.try_get("p2tr_xonly_key")?;
-        let p2tr_xonly_key = key.try_into().map_err(|v: Vec<u8>| {
+        let p2tr_xonly_key: [u8; 32] = key.try_into().map_err(|v: Vec<u8>| {
             anyhow::anyhow!(
                 "invalid p2tr_xonly_key length in p2tr_utxo_lookup: {}",
                 v.len()
@@ -1563,9 +1706,9 @@ async fn restore_indexer_state(
         })?;
         let vout: i64 = row.try_get("vout")?;
         let uid: i64 = row.try_get("uid")?;
-        let value_sat: Option<i64> = row.try_get("value_sat")?;
-        let created_height: Option<i64> = row.try_get("created_height")?;
-        let created_tx_index: Option<i64> = row.try_get("created_tx_index")?;
+        let value_sat: i64 = row.try_get("value_sat")?;
+        let created_height: i64 = row.try_get("created_height")?;
+        let created_tx_index: i64 = row.try_get("created_tx_index")?;
         let created_block_hash: Vec<u8> = row.try_get("created_block_hash")?;
         let created_block_hash: [u8; 32] =
             created_block_hash.try_into().map_err(|v: Vec<u8>| {
@@ -1574,7 +1717,7 @@ async fn restore_indexer_state(
                     v.len()
                 )
             })?;
-        let script_pubkey: Option<Vec<u8>> = row.try_get("script_pubkey")?;
+        let script_pubkey: Vec<u8> = row.try_get("script_pubkey")?;
 
         entries.push(ScopedUtxoEntry {
             outpoint: OutPointKey {
@@ -1582,11 +1725,11 @@ async fn restore_indexer_state(
                 vout: u32::try_from(vout)?,
             },
             uid: u64::try_from(uid)?,
-            created_height: u64::try_from(created_height.unwrap_or(0))?,
+            created_height: u64::try_from(created_height)?,
             created_block_hash: BlockHashBytes::from(created_block_hash),
-            tx_index: u32::try_from(created_tx_index.unwrap_or(0))?,
-            value_sat: u64::try_from(value_sat.unwrap_or(0))?,
-            script_pubkey: script_pubkey.unwrap_or_default(),
+            tx_index: u32::try_from(created_tx_index)?,
+            value_sat: u64::try_from(value_sat)?,
+            script_pubkey,
             p2tr_xonly_key,
         });
     }
@@ -1598,55 +1741,6 @@ async fn restore_indexer_state(
         u64::try_from(last_uid)?,
         entries,
     ))
-}
-
-fn collect_spent_outpoints(blocks: &[BlockScanInput]) -> Vec<OutPointKey> {
-    let mut outpoints = Vec::new();
-    for block in blocks {
-        for tx in &block.txs {
-            for input in &tx.inputs {
-                if !is_coinbase_prevout(&input.previous_output) {
-                    outpoints.push(input.previous_output);
-                }
-            }
-        }
-    }
-    outpoints.sort_by(|a, b| {
-        a.txid
-            .as_bytes()
-            .cmp(b.txid.as_bytes())
-            .then_with(|| a.vout.cmp(&b.vout))
-    });
-    outpoints.dedup();
-    outpoints
-}
-
-fn collect_scan_point_outpoints(blocks: &[BlockScanInput]) -> Vec<OutPointKey> {
-    let mut outpoints = Vec::new();
-    for block in blocks {
-        for tx in &block.txs {
-            if !tx.outputs.iter().any(|output| output.is_p2tr) {
-                continue;
-            }
-            for input in &tx.inputs {
-                if !is_coinbase_prevout(&input.previous_output) {
-                    outpoints.push(input.previous_output);
-                }
-            }
-        }
-    }
-    outpoints.sort_by(|a, b| {
-        a.txid
-            .as_bytes()
-            .cmp(b.txid.as_bytes())
-            .then_with(|| a.vout.cmp(&b.vout))
-    });
-    outpoints.dedup();
-    outpoints
-}
-
-fn is_coinbase_prevout(outpoint: &OutPointKey) -> bool {
-    outpoint.vout == u32::MAX && outpoint.txid.as_bytes().iter().all(|b| *b == 0)
 }
 
 async fn get_meta(archive: &SqliteArchive, key: &str) -> anyhow::Result<Option<String>> {
@@ -1668,9 +1762,9 @@ async fn validate_resume_boundary(
            FROM profiles
            WHERE profile_id = ?"#,
     )
-    .bind(profile_id)
-    .fetch_one(archive.pool())
-    .await?;
+        .bind(profile_id)
+        .fetch_one(archive.pool())
+        .await?;
 
     let served_tip_height: i64 = row.try_get("served_tip_height")?;
     let served_tip_hash: Option<Vec<u8>> = row.try_get("served_tip_hash")?;
@@ -1693,10 +1787,10 @@ async fn validate_resume_boundary(
            FROM blocks
            WHERE height >= ? AND height <= ?"#,
     )
-    .bind(i64::try_from(start_height)?)
-    .bind(i64::try_from(served_tip)?)
-    .fetch_one(archive.pool())
-    .await?;
+        .bind(i64::try_from(start_height)?)
+        .bind(i64::try_from(served_tip)?)
+        .fetch_one(archive.pool())
+        .await?;
     anyhow::ensure!(
         u64::try_from(block_count)? == expected_count,
         "database has a gap in committed blocks for {}..={} (rows={}, expected={})",
@@ -1711,11 +1805,11 @@ async fn validate_resume_boundary(
            FROM payload_cache
            WHERE profile_id = ? AND height >= ? AND height <= ?"#,
     )
-    .bind(profile_id)
-    .bind(i64::try_from(start_height)?)
-    .bind(i64::try_from(served_tip)?)
-    .fetch_one(archive.pool())
-    .await?;
+        .bind(profile_id)
+        .bind(i64::try_from(start_height)?)
+        .bind(i64::try_from(served_tip)?)
+        .fetch_one(archive.pool())
+        .await?;
     anyhow::ensure!(
         u64::try_from(payload_count)? == expected_count,
         "database has a gap in committed payloads for profile {} over {}..={} (rows={}, expected={})",
@@ -1745,10 +1839,10 @@ async fn validate_resume_boundary(
            FROM checkpoint_cache
            WHERE profile_id = ? AND height = ?"#,
     )
-    .bind(profile_id)
-    .bind(i64::try_from(served_tip)?)
-    .fetch_one(archive.pool())
-    .await?;
+        .bind(profile_id)
+        .bind(i64::try_from(served_tip)?)
+        .fetch_one(archive.pool())
+        .await?;
     anyhow::ensure!(
         checkpoint_exists == 1,
         "missing checkpoint at committed profile tip height {} for profile {}",
@@ -1767,9 +1861,9 @@ async fn next_index_height(
     let served_tip_height = sqlx::query_scalar::<_, i64>(
         r#"SELECT served_tip_height FROM profiles WHERE profile_id = ?"#,
     )
-    .bind(profile_id)
-    .fetch_one(archive.pool())
-    .await?;
+        .bind(profile_id)
+        .fetch_one(archive.pool())
+        .await?;
 
     if served_tip_height <= 0 {
         Ok(start_height)

@@ -20,9 +20,19 @@ const TAPROOT_NUMS_H_XONLY: [u8; 32] = [
     0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80, 0x3a, 0xc0,
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct PrevoutInfo {
-    pub script_pubkey: Vec<u8>,
+    pub script: PrevoutScript,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrevoutScript {
+    P2pkh { hash160: [u8; 20] },
+    P2sh { hash160: [u8; 20] },
+    P2wpkh { hash160: [u8; 20] },
+    P2tr { xonly_key: XOnlyPublicKey },
+    WitnessUnknown { version: u8 },
+    Other,
 }
 
 #[derive(Debug, Clone)]
@@ -49,14 +59,14 @@ pub fn compute_tx_scan_point(inputs: &[TxInputContext]) -> anyhow::Result<ScanPo
     if inputs.is_empty()
         || inputs
             .iter()
-            .all(|input| is_coinbase_prevout(&input.previous_output))
+            .all(|input| input.previous_output.is_coinbase())
     {
         return Ok(ScanPointStatus::Ineligible);
     }
 
     let missing_count = inputs
         .iter()
-        .filter(|input| !is_coinbase_prevout(&input.previous_output) && input.prevout.is_none())
+        .filter(|input| !input.previous_output.is_coinbase() && input.prevout.is_none())
         .count();
     if missing_count > 0 {
         return Ok(ScanPointStatus::MissingPrevout { missing_count });
@@ -70,7 +80,7 @@ pub fn compute_tx_scan_point(inputs: &[TxInputContext]) -> anyhow::Result<ScanPo
     let mut eligible_pubkeys = Vec::<PublicKey>::new();
 
     for input in inputs {
-        if is_coinbase_prevout(&input.previous_output) {
+        if input.previous_output.is_coinbase() {
             continue;
         }
         let prevout = input
@@ -110,19 +120,12 @@ pub fn compute_tx_scan_point(inputs: &[TxInputContext]) -> anyhow::Result<ScanPo
     )))
 }
 
-fn is_coinbase_prevout(outpoint: &OutPointKey) -> bool {
-    outpoint.txid.as_bytes() == &[0u8; 32] && outpoint.vout == u32::MAX
-}
-
 fn spends_witness_version_greater_than_one(inputs: &[TxInputContext]) -> bool {
     inputs.iter().any(|input| {
         input.prevout.as_ref().is_some_and(|prevout| {
             matches!(
-                classify_script(prevout.script_pubkey.as_slice()),
-                ScriptKind::WitnessUnknown {
-                    version: 2..=16,
-                    ..
-                }
+                prevout.script,
+                PrevoutScript::WitnessUnknown { version: 2..=16 }
             )
         })
     })
@@ -132,18 +135,18 @@ fn extract_bip352_input_pubkey(
     input: &TxInputContext,
     prevout: &PrevoutInfo,
 ) -> anyhow::Result<Option<PublicKey>> {
-    match classify_script(prevout.script_pubkey.as_slice()) {
-        ScriptKind::P2tr { xonly_key } => extract_p2tr_input_pubkey(input, xonly_key),
-        ScriptKind::P2wpkh { hash160 } => extract_p2wpkh_input_pubkey(input, hash160),
-        ScriptKind::P2sh { hash160 } => extract_p2sh_p2wpkh_input_pubkey(input, hash160),
-        ScriptKind::P2pkh { hash160 } => extract_p2pkh_input_pubkey(input, hash160),
-        _ => Ok(None),
+    match prevout.script {
+        PrevoutScript::P2tr { xonly_key } => extract_p2tr_input_pubkey(input, xonly_key),
+        PrevoutScript::P2wpkh { hash160 } => extract_p2wpkh_input_pubkey(input, hash160),
+        PrevoutScript::P2sh { hash160 } => extract_p2sh_p2wpkh_input_pubkey(input, hash160),
+        PrevoutScript::P2pkh { hash160 } => extract_p2pkh_input_pubkey(input, hash160),
+        PrevoutScript::WitnessUnknown { .. } | PrevoutScript::Other => Ok(None),
     }
 }
 
 fn extract_p2tr_input_pubkey(
     input: &TxInputContext,
-    xonly_key: [u8; 32],
+    xonly_key: XOnlyPublicKey,
 ) -> anyhow::Result<Option<PublicKey>> {
     if let Some(internal_key) = taproot_script_path_internal_key(&input.witness) {
         if internal_key == TAPROOT_NUMS_H_XONLY {
@@ -151,8 +154,7 @@ fn extract_p2tr_input_pubkey(
         }
     }
 
-    let xonly = XOnlyPublicKey::from_slice(&xonly_key).context("invalid P2TR x-only output key")?;
-    Ok(Some(xonly.public_key(Parity::Even)))
+    Ok(Some(xonly_key.public_key(Parity::Even)))
 }
 
 fn extract_p2wpkh_input_pubkey(
@@ -228,7 +230,7 @@ fn taproot_script_path_internal_key(witness: &[Vec<u8>]) -> Option<[u8; 32]> {
 fn smallest_non_coinbase_outpoint(inputs: &[TxInputContext]) -> Option<[u8; 36]> {
     inputs
         .iter()
-        .filter(|input| !is_coinbase_prevout(&input.previous_output))
+        .filter(|input| !input.previous_output.is_coinbase())
         .map(serialize_outpoint)
         .min()
 }
@@ -325,18 +327,6 @@ mod tests {
         }
     }
 
-    fn p2wpkh_script(pubkey: &[u8]) -> Vec<u8> {
-        let mut script = vec![0x00, 0x14];
-        script.extend(hash160_bytes(pubkey));
-        script
-    }
-
-    fn p2tr_script(xonly: [u8; 32]) -> Vec<u8> {
-        let mut script = vec![0x51, 0x20];
-        script.extend(xonly);
-        script
-    }
-
     #[test]
     fn empty_prevouts_are_ineligible() {
         assert_eq!(
@@ -364,7 +354,9 @@ mod tests {
             script_sig: Vec::new(),
             witness: vec![vec![1; 64]],
             prevout: Some(PrevoutInfo {
-                script_pubkey: p2tr_script(GENERATOR_XONLY),
+                script: PrevoutScript::P2tr {
+                    xonly_key: XOnlyPublicKey::from_slice(&GENERATOR_XONLY).unwrap(),
+                },
             }),
         }])
         .unwrap();
@@ -382,7 +374,9 @@ mod tests {
             script_sig: Vec::new(),
             witness: vec![vec![1; 64], GENERATOR_COMPRESSED.to_vec()],
             prevout: Some(PrevoutInfo {
-                script_pubkey: p2wpkh_script(&GENERATOR_COMPRESSED),
+                script: PrevoutScript::P2wpkh {
+                    hash160: hash160_bytes(&GENERATOR_COMPRESSED),
+                },
             }),
         }])
         .unwrap();
@@ -392,14 +386,12 @@ mod tests {
 
     #[test]
     fn segwit_version_greater_than_one_makes_transaction_ineligible() {
-        let mut v2_script = vec![0x52, 0x20];
-        v2_script.extend([3u8; 32]);
         let status = compute_tx_scan_point(&[TxInputContext {
             previous_output: outpoint(3),
             script_sig: Vec::new(),
             witness: Vec::new(),
             prevout: Some(PrevoutInfo {
-                script_pubkey: v2_script,
+                script: PrevoutScript::WitnessUnknown { version: 2 },
             }),
         }])
         .unwrap();

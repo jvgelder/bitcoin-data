@@ -25,6 +25,12 @@ pub struct OutPointKey {
     pub vout: u32,
 }
 
+impl OutPointKey {
+    pub fn is_coinbase(&self) -> bool {
+        self.vout == u32::MAX && self.txid.as_bytes() == &[0u8; 32]
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ScopedUtxoEntry {
     /// Canonical-chain outpoint key for spend lookup. A tx can appear in
@@ -39,7 +45,10 @@ pub struct ScopedUtxoEntry {
     pub value_sat: u64,
     pub script_pubkey: Vec<u8>,
     /// Required for the p2tr-sp scope: this is the previous-output key needed
-    /// later for BIP352 input scan-point construction.
+    /// later for BIP352 input scan-point construction. Stored as the raw 32-byte
+    /// x-only program: a Taproot output key is only an identifier here and is
+    /// not required to be a valid curve point (consensus permits non-point
+    /// outputs), so it must never be eagerly parsed into an `XOnlyPublicKey`.
     pub p2tr_xonly_key: [u8; 32],
 }
 
@@ -61,7 +70,7 @@ pub struct SpentScopedUtxo {
 
 #[derive(Debug, Clone)]
 pub struct SeenP2trKey {
-    pub output_key: Vec<u8>,
+    pub output_key: [u8; 32],
     pub first_height: u64,
     pub last_height: u64,
     pub seen_count: u64,
@@ -144,7 +153,7 @@ pub struct P2trIndexerState {
     next_uid: u64,
     outpoint_to_entry: HashMap<OutPointKey, ScopedUtxoEntry>,
     live_uids: BTreeSet<u64>,
-    seen_p2tr_keys: Option<HashSet<Vec<u8>>>,
+    seen_p2tr_keys: Option<HashSet<[u8; 32]>>,
 }
 
 impl P2trIndexerState {
@@ -160,7 +169,7 @@ impl P2trIndexerState {
     pub fn restore(
         last_uid: u64,
         live_entries: impl IntoIterator<Item = ScopedUtxoEntry>,
-        seen_keys: impl IntoIterator<Item = Vec<u8>>,
+        seen_keys: impl IntoIterator<Item = [u8; 32]>,
     ) -> Self {
         let mut state = Self {
             next_uid: last_uid,
@@ -270,7 +279,10 @@ impl P2trIndexerState {
             for output in &tx.outputs {
                 stats.output_count_total += 1;
                 let mut is_reused_output = false;
-                if output.is_p2tr {
+                // Compute the P2TR output identity once and reuse it for the
+                // reuse-set probe, the output-id hash, and the stored x-only key.
+                let p2tr_identity = if output.is_p2tr {
+                    let identity = p2tr_output_identity(output, block.height, tx.tx_index)?;
                     tx_has_p2tr_output = true;
                     stats.p2tr_output_count += 1;
                     if output.is_nums {
@@ -282,14 +294,16 @@ impl P2trIndexerState {
                     // input-side eligibility determines whether a tx scan point
                     // can be produced.
                     stats.p2tr_sp_candidate_count += 1;
-                    let output_identity = p2tr_output_identity(output, block.height, tx.tx_index)?;
                     if let Some(seen_p2tr_keys) = self.seen_p2tr_keys.as_mut() {
-                        is_reused_output = !seen_p2tr_keys.insert(output_identity);
+                        is_reused_output = !seen_p2tr_keys.insert(identity);
                         if is_reused_output {
                             stats.p2tr_reused_count += 1;
                         }
                     }
-                }
+                    Some(identity)
+                } else {
+                    None
+                };
                 let include = profile.scope.include_output(output.is_p2tr, output.is_nums);
                 if !include {
                     if output.is_p2tr {
@@ -298,8 +312,8 @@ impl P2trIndexerState {
                     continue;
                 }
 
-                let output_identity = output_identity_bytes(output, block.height, tx.tx_index)?;
-                let p2tr_xonly_key = output.p2tr_xonly_key.ok_or_else(|| {
+                let output_identity = output_identity_bytes(output, p2tr_identity);
+                let p2tr_xonly_key = p2tr_identity.ok_or_else(|| {
                     anyhow::anyhow!(
                         "indexed P2TR output at height {} tx_index {} vout {} is missing x-only key",
                         block.height,
@@ -396,25 +410,21 @@ fn p2tr_output_identity(
     output: &TxOutputScan,
     height: u64,
     tx_index: u32,
-) -> anyhow::Result<Vec<u8>> {
-    let key = output.p2tr_xonly_key.ok_or_else(|| {
+) -> anyhow::Result<[u8; 32]> {
+    output.p2tr_xonly_key.ok_or_else(|| {
         anyhow::anyhow!(
             "P2TR output at height {height} tx_index {tx_index} vout {} is missing x-only key",
             output.vout
         )
-    })?;
-    Ok(key.to_vec())
+    })
 }
 
-fn output_identity_bytes(
-    output: &TxOutputScan,
-    height: u64,
-    tx_index: u32,
-) -> anyhow::Result<Vec<u8>> {
-    if output.is_p2tr {
-        p2tr_output_identity(output, height, tx_index)
-    } else {
-        Ok(output.script_pubkey.clone())
+fn output_identity_bytes(output: &TxOutputScan, p2tr_identity: Option<[u8; 32]>) -> Vec<u8> {
+    // For P2TR the caller has already resolved the identity (caught the missing
+    // key above), so reuse it; everything else is identified by its scriptPubKey.
+    match p2tr_identity {
+        Some(key) => key.to_vec(),
+        None => output.script_pubkey.clone(),
     }
 }
 
@@ -432,6 +442,10 @@ mod tests {
 
     fn txid(n: u8) -> TxidBytes {
         [n; 32].into()
+    }
+
+    fn xonly_key(n: u8) -> [u8; 32] {
+        [n; 32]
     }
 
     #[test]
@@ -452,7 +466,7 @@ mod tests {
                         vout: 0,
                         value_sat: 0,
                         script_pubkey: Vec::new(),
-                        p2tr_xonly_key: Some([1; 32]),
+                        p2tr_xonly_key: Some(xonly_key(1)),
                         is_p2tr: true,
                         is_nums: false,
                     },
@@ -460,7 +474,7 @@ mod tests {
                         vout: 1,
                         value_sat: 0,
                         script_pubkey: Vec::new(),
-                        p2tr_xonly_key: Some([1; 32]),
+                        p2tr_xonly_key: Some(xonly_key(1)),
                         is_p2tr: true,
                         is_nums: false,
                     },
@@ -468,7 +482,7 @@ mod tests {
                         vout: 2,
                         value_sat: 0,
                         script_pubkey: Vec::new(),
-                        p2tr_xonly_key: Some([2; 32]),
+                        p2tr_xonly_key: Some(xonly_key(2)),
                         is_p2tr: true,
                         is_nums: true,
                     },
@@ -511,7 +525,7 @@ mod tests {
                         vout: 1,
                         value_sat: 0,
                         script_pubkey: Vec::new(),
-                        p2tr_xonly_key: Some([1; 32]),
+                        p2tr_xonly_key: Some(xonly_key(1)),
                         is_p2tr: true,
                         is_nums: false,
                     },
@@ -543,7 +557,7 @@ mod tests {
                     vout: 0,
                     value_sat: 0,
                     script_pubkey: Vec::new(),
-                    p2tr_xonly_key: Some([2; 32]),
+                    p2tr_xonly_key: Some(xonly_key(2)),
                     is_p2tr: true,
                     is_nums: false,
                 }],

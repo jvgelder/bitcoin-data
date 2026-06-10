@@ -1,11 +1,12 @@
 use crate::p2tr_indexer::{BlockScanInput, OutPointKey};
 use crate::script_classify::{classify_script, ScriptKind};
-use crate::sp_tweak::{compute_tx_scan_point, PrevoutInfo, ScanPointStatus, TxInputContext};
+use crate::sp_tweak::{
+    compute_tx_scan_point, PrevoutInfo, PrevoutScript, ScanPointStatus, TxInputContext,
+};
 use crate::types::BlockHashBytes;
 use anyhow::Context;
 use bitcoin::hashes::Hash as _;
-use bitcoin::opcodes::all::OP_PUSHNUM_1;
-use bitcoin::{key::XOnlyPublicKey, PubkeyHash, ScriptBuf, ScriptHash, WPubkeyHash};
+use bitcoin::{key::XOnlyPublicKey, PubkeyHash, ScriptHash, WPubkeyHash};
 use rocksdb::{Options as RocksOptions, WriteBatch, DB};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -18,7 +19,6 @@ const ROCKS_PREVOUT_KEY_LEN: usize = 2 + OUTPOINT_KEY_LEN;
 const ENCODED_PREVOUT_HEADER_LEN: usize = 1;
 const ENCODED_PREVOUT_MAX_LEN: usize = ENCODED_PREVOUT_HEADER_LEN + XONLY_KEY_LEN;
 const LEGACY_ENCODED_PREVOUT_HEADER_LEN: usize = 8 + 1;
-const STANDARD_SCRIPT_PUBKEY_MAX_LEN: usize = 34;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -71,7 +71,7 @@ enum CompactPrevoutScript {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ChainUtxoEntry {
+struct CompactPrevoutContext {
     script: CompactPrevoutScript,
 }
 
@@ -118,7 +118,7 @@ struct EncodedPrevoutEntry {
 }
 
 impl EncodedPrevoutEntry {
-    fn new(entry: ChainUtxoEntry) -> Self {
+    fn new(entry: CompactPrevoutContext) -> Self {
         let mut bytes = [0u8; ENCODED_PREVOUT_MAX_LEN];
         let len = match entry.script {
             CompactPrevoutScript::P2pkh { pubkey_hash } => {
@@ -152,38 +152,6 @@ impl AsRef<[u8]> for EncodedPrevoutEntry {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct StandardScriptPubkey {
-    bytes: [u8; STANDARD_SCRIPT_PUBKEY_MAX_LEN],
-    len: usize,
-}
-
-impl StandardScriptPubkey {
-    fn from_compact(script: CompactPrevoutScript) -> Self {
-        let script = match script {
-            CompactPrevoutScript::P2pkh { pubkey_hash } => ScriptBuf::new_p2pkh(&pubkey_hash),
-            CompactPrevoutScript::P2sh { script_hash } => ScriptBuf::new_p2sh(&script_hash),
-            CompactPrevoutScript::P2wpkh { pubkey_hash } => ScriptBuf::new_p2wpkh(&pubkey_hash),
-            CompactPrevoutScript::P2tr { output_key } => ScriptBuf::builder()
-                .push_opcode(OP_PUSHNUM_1)
-                .push_slice(output_key.serialize())
-                .into_script(),
-        };
-        let script_bytes = script.as_bytes();
-        debug_assert!(script_bytes.len() <= STANDARD_SCRIPT_PUBKEY_MAX_LEN);
-        let mut bytes = [0u8; STANDARD_SCRIPT_PUBKEY_MAX_LEN];
-        bytes[..script_bytes.len()].copy_from_slice(script_bytes);
-        Self {
-            bytes,
-            len: script_bytes.len(),
-        }
-    }
-
-    fn into_vec(self) -> Vec<u8> {
-        self.bytes[..self.len].to_vec()
-    }
-}
-
 pub struct PrevoutStore {
     db: DB,
     tip_height: Option<u64>,
@@ -192,8 +160,15 @@ pub struct PrevoutStore {
 
 #[derive(Debug, Default)]
 pub struct PendingPrevoutWrites {
-    puts: HashMap<OutPointKey, ChainUtxoEntry>,
+    puts: HashMap<OutPointKey, CompactPrevoutContext>,
     deletes: HashSet<OutPointKey>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PendingPrevoutLookup {
+    Present(CompactPrevoutContext),
+    Tombstoned,
+    Absent,
 }
 
 impl PendingPrevoutWrites {
@@ -205,14 +180,17 @@ impl PendingPrevoutWrites {
         self.puts.len() + self.deletes.len()
     }
 
-    fn get(&self, outpoint: &OutPointKey) -> Option<ChainUtxoEntry> {
-        if self.deletes.contains(outpoint) {
-            return None;
+    fn lookup(&self, outpoint: &OutPointKey) -> PendingPrevoutLookup {
+        if let Some(entry) = self.puts.get(outpoint).copied() {
+            return PendingPrevoutLookup::Present(entry);
         }
-        self.puts.get(outpoint).copied()
+        if self.deletes.contains(outpoint) {
+            return PendingPrevoutLookup::Tombstoned;
+        }
+        PendingPrevoutLookup::Absent
     }
 
-    fn put(&mut self, outpoint: OutPointKey, entry: ChainUtxoEntry) {
+    fn put(&mut self, outpoint: OutPointKey, entry: CompactPrevoutContext) {
         self.deletes.remove(&outpoint);
         self.puts.insert(outpoint, entry);
     }
@@ -245,7 +223,25 @@ fn compact_prevout_script(script_pubkey: &[u8]) -> Option<CompactPrevoutScript> 
     }
 }
 
-fn decode_prevout_entry(bytes: &[u8]) -> anyhow::Result<ChainUtxoEntry> {
+fn prevout_info_from_compact(script: CompactPrevoutScript) -> PrevoutInfo {
+    let script = match script {
+        CompactPrevoutScript::P2pkh { pubkey_hash } => PrevoutScript::P2pkh {
+            hash160: pubkey_hash.to_byte_array(),
+        },
+        CompactPrevoutScript::P2sh { script_hash } => PrevoutScript::P2sh {
+            hash160: script_hash.to_byte_array(),
+        },
+        CompactPrevoutScript::P2wpkh { pubkey_hash } => PrevoutScript::P2wpkh {
+            hash160: pubkey_hash.to_byte_array(),
+        },
+        CompactPrevoutScript::P2tr { output_key } => PrevoutScript::P2tr {
+            xonly_key: output_key,
+        },
+    };
+    PrevoutInfo { script }
+}
+
+fn decode_prevout_entry(bytes: &[u8]) -> anyhow::Result<CompactPrevoutContext> {
     anyhow::ensure!(
         bytes.len() >= ENCODED_PREVOUT_HEADER_LEN,
         "prevout entry is too short"
@@ -293,7 +289,7 @@ fn decode_prevout_entry(bytes: &[u8]) -> anyhow::Result<ChainUtxoEntry> {
             output_key: xonly_key_from_payload(payload)?,
         },
     };
-    Ok(ChainUtxoEntry { script })
+    Ok(CompactPrevoutContext { script })
 }
 
 impl PrevoutStore {
@@ -353,17 +349,16 @@ impl PrevoutStore {
         &self,
         pending: &PendingPrevoutWrites,
         outpoint: &OutPointKey,
-    ) -> anyhow::Result<Option<ChainUtxoEntry>> {
-        if let Some(entry) = pending.get(outpoint) {
-            return Ok(Some(entry));
+    ) -> anyhow::Result<Option<CompactPrevoutContext>> {
+        match pending.lookup(outpoint) {
+            PendingPrevoutLookup::Present(entry) => Ok(Some(entry)),
+            PendingPrevoutLookup::Tombstoned => Ok(None),
+            PendingPrevoutLookup::Absent => self
+                .db
+                .get(RocksPrevoutKey::from_outpoint(outpoint))?
+                .map(|bytes| decode_prevout_entry(&bytes))
+                .transpose(),
         }
-        if pending.deletes.contains(outpoint) {
-            return Ok(None);
-        }
-        self.db
-            .get(RocksPrevoutKey::from_outpoint(outpoint))?
-            .map(|bytes| decode_prevout_entry(&bytes))
-            .transpose()
     }
 
     pub fn apply_pending(
@@ -395,69 +390,90 @@ impl PrevoutStore {
         &self,
         pending: &mut PendingPrevoutWrites,
         block: &mut BlockScanInput,
-    ) -> anyhow::Result<ChainUtxoDelta> {
-        let mut delta = ChainUtxoDelta::default();
+    ) -> anyhow::Result<PrevoutMutationStats> {
+        let mut stats = PrevoutMutationStats::default();
 
         for tx in &mut block.txs {
-            let needs_scan_point = tx.outputs.iter().any(|output| output.is_p2tr);
+            self.enrich_tx_scan_point(pending, tx, &mut stats)?;
+            Self::apply_tx_spends(pending, tx, &mut stats);
+            Self::apply_tx_outputs(pending, tx, &mut stats);
+        }
 
-            if needs_scan_point {
-                let mut input_context = Vec::with_capacity(tx.inputs.len());
+        Ok(stats)
+    }
 
-                for input in &tx.inputs {
-                    let entry = self.lookup_prevout(pending, &input.previous_output)?;
-                    let prevout = entry.as_ref().map(|entry| PrevoutInfo {
-                        script_pubkey: StandardScriptPubkey::from_compact(entry.script).into_vec(),
-                    });
-                    input_context.push(TxInputContext {
-                        previous_output: input.previous_output,
-                        script_sig: input.script_sig.clone(),
-                        witness: input.witness.clone(),
-                        prevout,
-                    });
-                }
+    fn enrich_tx_scan_point(
+        &self,
+        pending: &PendingPrevoutWrites,
+        tx: &mut crate::p2tr_indexer::TxScanInput,
+        stats: &mut PrevoutMutationStats,
+    ) -> anyhow::Result<()> {
+        let needs_scan_point = tx.outputs.iter().any(|output| output.is_p2tr);
+        if !needs_scan_point {
+            tx.silent_payment_tweak = None;
+            return Ok(());
+        }
 
-                match compute_tx_scan_point(&input_context)? {
-                    ScanPointStatus::Computed(tweak) => tx.silent_payment_tweak = Some(tweak),
-                    ScanPointStatus::Ineligible | ScanPointStatus::MissingPrevout { .. } => {
-                        tx.silent_payment_tweak = None
-                    }
-                }
-            } else {
-                tx.silent_payment_tweak = None;
+        let mut input_context = Vec::with_capacity(tx.inputs.len());
+        for input in &tx.inputs {
+            if !input.previous_output.is_coinbase() {
+                stats.scan_point_prevout_lookups += 1;
             }
+            let entry = self.lookup_prevout(pending, &input.previous_output)?;
+            let prevout = entry.map(|entry| prevout_info_from_compact(entry.script));
+            input_context.push(TxInputContext {
+                previous_output: input.previous_output,
+                script_sig: input.script_sig.clone(),
+                witness: input.witness.clone(),
+                prevout,
+            });
+        }
 
-            for input in &tx.inputs {
-                if !is_coinbase_prevout(&input.previous_output) {
-                    pending.delete(input.previous_output);
-                    delta.spent.push(input.previous_output);
-                }
-            }
-
-            for output in &tx.outputs {
-                let Some(script) = compact_prevout_script(&output.script_pubkey) else {
-                    continue;
-                };
-                let outpoint = OutPointKey {
-                    txid: tx.txid,
-                    vout: output.vout,
-                };
-                let entry = ChainUtxoEntry { script };
-                pending.put(outpoint, entry);
-                delta.created.push(outpoint);
+        match compute_tx_scan_point(&input_context)? {
+            ScanPointStatus::Computed(tweak) => tx.silent_payment_tweak = Some(tweak),
+            ScanPointStatus::Ineligible | ScanPointStatus::MissingPrevout { .. } => {
+                tx.silent_payment_tweak = None
             }
         }
 
-        Ok(delta)
+        Ok(())
+    }
+
+    fn apply_tx_spends(
+        pending: &mut PendingPrevoutWrites,
+        tx: &crate::p2tr_indexer::TxScanInput,
+        stats: &mut PrevoutMutationStats,
+    ) {
+        for input in &tx.inputs {
+            if !input.previous_output.is_coinbase() {
+                pending.delete(input.previous_output);
+                stats.delete_attempts += 1;
+            }
+        }
+    }
+
+    fn apply_tx_outputs(
+        pending: &mut PendingPrevoutWrites,
+        tx: &crate::p2tr_indexer::TxScanInput,
+        stats: &mut PrevoutMutationStats,
+    ) {
+        for output in &tx.outputs {
+            let Some(script) = compact_prevout_script(&output.script_pubkey) else {
+                continue;
+            };
+            let outpoint = OutPointKey {
+                txid: tx.txid,
+                vout: output.vout,
+            };
+            pending.put(outpoint, CompactPrevoutContext { script });
+            stats.contexts_created += 1;
+        }
     }
 }
 
 #[derive(Debug, Default)]
-pub struct ChainUtxoDelta {
-    pub created: Vec<OutPointKey>,
-    pub spent: Vec<OutPointKey>,
-}
-
-fn is_coinbase_prevout(outpoint: &OutPointKey) -> bool {
-    outpoint.vout == u32::MAX && outpoint.txid.as_bytes().iter().all(|b| *b == 0)
+pub struct PrevoutMutationStats {
+    pub contexts_created: usize,
+    pub delete_attempts: usize,
+    pub scan_point_prevout_lookups: usize,
 }
