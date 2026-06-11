@@ -795,7 +795,7 @@ async fn catch_up_ranges(
         .collect::<Vec<_>>();
     for chunk in tx_tweaks.chunks(SQL_UTXO_MUTATION_CHUNK) {
         let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-            r#"INSERT INTO tx_tweaks
+            r#"INSERT OR REPLACE INTO tx_tweaks
                (height, tx_index, tweak) "#,
         );
         qb.push_values(chunk, |mut b, (height, tx_index, tweak)| {
