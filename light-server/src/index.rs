@@ -1,7 +1,6 @@
 use crate::codec::elias_delta::encode_elias_delta_values;
 use crate::light_capnp::{
-    light_block, output_ref, snapshot_block, snapshot_output_ref, uid_checkpoint, SpentIdCodec,
-    UidSetCodec,
+    light_block, output_ref, snapshot_block, snapshot_output_ref, SpentIdCodec,
 };
 use crate::profile::Profile;
 use crate::types::{BlockHashBytes, TxTweak};
@@ -62,14 +61,6 @@ pub struct SnapshotBlockInput {
     pub txs: Vec<SnapshotTxInput>,
 }
 
-#[derive(Debug, Clone)]
-pub struct UidCheckpointInput {
-    pub height: u64,
-    pub block_hash: BlockHashBytes,
-    pub last_uid: u64,
-    pub profile: Profile,
-    pub unspent_uids_sorted: Vec<u64>,
-}
 
 pub fn encode_spent_uids(
     block_anchor_last_uid: u64,
@@ -318,38 +309,7 @@ fn fill_output_ref(mut b: output_ref::Builder<'_>, src: &OutputRefInput) {
     b.set_uid(src.uid);
 }
 
-pub fn encode_uid_checkpoint(input: &UidCheckpointInput) -> anyhow::Result<Builder<HeapAllocator>> {
-    validate_sorted_unique(&input.unspent_uids_sorted)?;
-    for &uid in &input.unspent_uids_sorted {
-        anyhow::ensure!(uid <= input.last_uid, "checkpoint UID exceeds last_uid");
-    }
-    let unspent = encode_elias_delta_values(&deltas_first_plus_one(&input.unspent_uids_sorted))?;
-    let mut msg = Builder::new_default();
-    {
-        let mut b = msg.init_root::<uid_checkpoint::Builder>();
-        b.set_version(WIRE_VERSION);
-        b.set_height(input.height);
-        b.set_block_hash(input.block_hash.as_bytes());
-        b.set_last_uid(input.last_uid);
-        input.profile.fill_capnp(b.reborrow().init_profile());
-        b.set_uid_codec(UidSetCodec::EliasDeltaSorted);
-        b.set_unspent_count(input.unspent_uids_sorted.len() as u64);
-        b.set_unspent_uids(&unspent);
-    }
-    Ok(msg)
-}
 
-fn deltas_first_plus_one(values: &[u64]) -> Vec<u64> {
-    if values.is_empty() {
-        return Vec::new();
-    }
-    let mut out = Vec::with_capacity(values.len());
-    out.push(values[0] + 1);
-    for pair in values.windows(2) {
-        out.push(pair[1] - pair[0]);
-    }
-    out
-}
 
 fn validate_sorted_unique(values: &[u64]) -> anyhow::Result<()> {
     for pair in values.windows(2) {

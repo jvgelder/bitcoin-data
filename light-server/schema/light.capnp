@@ -59,7 +59,7 @@ struct SnapshotOutputRef {
 struct LightBlockProfile {
   scope @0 :ArchiveScope;
   # 0 means raw/no cut-through. Non-zero cut-through profiles are materialized
-  # on fixed boundaries and have their own checkpoints and served tips.
+  # on fixed boundaries and have their own served tips.
   cutThroughBlocks @1 :UInt32;
 }
 
@@ -77,19 +77,3 @@ enum SpentIdCodec {
   eliasDeltaSorted @0;
 }
 
-struct UidCheckpoint {
-  version @0 :UInt16;
-  height @1 :UInt64;
-  blockHash @2 :Data;
-  lastUid @3 :UInt64;
-  profile @4 :LightBlockProfile;
-  uidCodec @5 :UidSetCodec;
-  unspentCount @6 :UInt64;
-  unspentUids @7 :Data;
-}
-
-enum UidSetCodec {
-  chunkedAdaptive @0;
-  eliasDeltaSorted @1;
-  leb128Sorted @2;
-}

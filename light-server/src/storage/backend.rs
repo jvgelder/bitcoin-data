@@ -82,17 +82,6 @@ pub trait ArchiveBackend: Send + Sync {
         profile: &ServedProfile,
     ) -> anyhow::Result<CutthroughSnapshot>;
 
-    async fn read_checkpoint(
-        &self,
-        height: u64,
-        profile: &ServedProfile,
-    ) -> anyhow::Result<Vec<u8>>;
-
-    async fn latest_checkpoint_height(
-        &self,
-        height_lte: u64,
-        profile: &ServedProfile,
-    ) -> anyhow::Result<Option<u64>>;
 
     async fn block_stats(&self, height: u64) -> anyhow::Result<serde_json::Value>;
 }

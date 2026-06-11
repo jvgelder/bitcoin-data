@@ -111,13 +111,6 @@ struct CutthroughDeltaQuery {
     scope: Option<ArchiveScope>,
 }
 
-#[derive(Debug, Deserialize)]
-struct LatestCheckpointQuery {
-    height_lte: u64,
-    /// Archive scope requested by the client. Defaults to p2tr-sp when omitted.
-    /// If the server did not index the requested scope, the request fails.
-    scope: Option<ArchiveScope>,
-}
 
 pub async fn serve(config: ServerConfig, archive: Arc<dyn ArchiveBackend>) -> anyhow::Result<()> {
     let state = AppState {
@@ -143,8 +136,6 @@ pub async fn serve(config: ServerConfig, archive: Arc<dyn ArchiveBackend>) -> an
             get(cutthrough_snapshot_by_height),
         )
         .route("/blocks/:height/light", get(single_block))
-        .route("/checkpoints/latest", get(latest_checkpoint))
-        .route("/checkpoints/:height", get(checkpoint))
         .route("/debug/blocks/:height/stats", get(block_stats))
         // .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -398,61 +389,6 @@ async fn cutthrough_snapshot_by_height(
     Ok(response)
 }
 
-async fn checkpoint(
-    State(state): State<AppState>,
-    Path(height): Path<u64>,
-    Query(q): Query<ClientProfileQuery>,
-    headers: HeaderMap,
-) -> ApiResult<Response> {
-    let format = response_format(&headers)?;
-    let profile =
-        select_profile(&state.archive, q.scope, StreamProfile::Full, Some(height)).await?;
-    ensure_height_served(height, &profile)?;
-    let body = state.archive.read_checkpoint(height, &profile).await?;
-    let mut response = match format {
-        ResponseFormat::Capnp => binary_response(body, cache_control(height, &profile)),
-        ResponseFormat::Json => json_response(
-            serde_json::to_vec_pretty(&json_wire::checkpoint_to_json(&body, Some(&profile))?)?,
-            cache_control(height, &profile),
-        ),
-    };
-    add_checkpoint_headers(&mut response, height, &profile);
-    Ok(response)
-}
-
-async fn latest_checkpoint(
-    State(state): State<AppState>,
-    Query(q): Query<LatestCheckpointQuery>,
-    headers: HeaderMap,
-) -> ApiResult<Response> {
-    let format = response_format(&headers)?;
-    let profile = select_profile(
-        &state.archive,
-        q.scope,
-        StreamProfile::Full,
-        Some(q.height_lte),
-    )
-    .await?;
-    let height_lte = match profile.served_tip.as_ref() {
-        Some(tip) => q.height_lte.min(tip.height),
-        None => q.height_lte,
-    };
-    let height = state
-        .archive
-        .latest_checkpoint_height(height_lte, &profile)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("no checkpoint <= {height_lte}"))?;
-    let body = state.archive.read_checkpoint(height, &profile).await?;
-    let mut response = match format {
-        ResponseFormat::Capnp => binary_response(body, cache_control(height, &profile)),
-        ResponseFormat::Json => json_response(
-            serde_json::to_vec_pretty(&json_wire::checkpoint_to_json(&body, Some(&profile))?)?,
-            cache_control(height, &profile),
-        ),
-    };
-    add_checkpoint_headers(&mut response, height, &profile);
-    Ok(response)
-}
 
 async fn block_stats(
     State(state): State<AppState>,
@@ -825,29 +761,3 @@ fn add_cutthrough_snapshot_headers(
     );
 }
 
-fn add_checkpoint_headers(response: &mut Response, height: u64, profile: &ServedProfile) {
-    response.headers_mut().insert(
-        HeaderName::from_static("x-bitcoin-checkpoint-height"),
-        HeaderValue::from_str(&height.to_string()).unwrap(),
-    );
-    response.headers_mut().insert(
-        HeaderName::from_static("x-bitcoindata-profile"),
-        HeaderValue::from_str(&profile.name).unwrap(),
-    );
-    response.headers_mut().insert(
-        HeaderName::from_static("x-bitcoindata-scope"),
-        HeaderValue::from_str(profile.profile.scope.as_str()).unwrap(),
-    );
-    response.headers_mut().insert(
-        HeaderName::from_static("x-bitcoindata-cutthrough-blocks"),
-        HeaderValue::from_str(&profile.profile.cutthrough_blocks.to_string()).unwrap(),
-    );
-    response.headers_mut().insert(
-        HeaderName::from_static("x-bitcoindata-stream"),
-        HeaderValue::from_static(if profile.profile.cutthrough_blocks == 0 {
-            "full"
-        } else {
-            "cutthrough"
-        }),
-    );
-}

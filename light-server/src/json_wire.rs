@@ -4,9 +4,8 @@
 //! cached Cap'n Proto bytes into stable, human-readable JSON for debugging,
 //! interoperability, and simple clients.
 
-use crate::codec::elias_delta::decode_elias_delta_values;
 use crate::index::{decode_spent_uids, decode_tx_tweak_indexes};
-use crate::light_capnp::{light_block, uid_checkpoint};
+use crate::light_capnp::light_block;
 use crate::storage::ServedProfile;
 use capnp::message::ReaderOptions;
 use serde::Serialize;
@@ -27,16 +26,6 @@ pub struct JsonLightBlock {
     pub spent_uids: Vec<u64>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct JsonUidCheckpoint {
-    pub version: u16,
-    pub height: u64,
-    pub block_hash: String,
-    pub last_uid: u64,
-    pub profile: JsonProfile,
-    pub uid_codec: &'static str,
-    pub unspent_uids: Vec<u64>,
-}
 
 #[derive(Debug, Serialize)]
 pub struct JsonProfile {
@@ -128,48 +117,6 @@ pub fn light_block_to_json(
         spent_id_codec: "eliasDeltaSorted",
         spent_uids,
     })
-}
-
-pub fn checkpoint_to_json(
-    bytes: &[u8],
-    profile: Option<&ServedProfile>,
-) -> anyhow::Result<JsonUidCheckpoint> {
-    let mut cursor = Cursor::new(bytes);
-    let message = capnp::serialize_packed::read_message(&mut cursor, ReaderOptions::new())?;
-    let checkpoint = message.get_root::<uid_checkpoint::Reader>()?;
-    let count = usize::try_from(checkpoint.get_unspent_count())?;
-    let values = decode_elias_delta_values(checkpoint.get_unspent_uids()?, count)?;
-    let unspent_uids = decode_first_plus_one_deltas(&values)?;
-
-    Ok(JsonUidCheckpoint {
-        version: checkpoint.get_version(),
-        height: checkpoint.get_height(),
-        block_hash: hex::encode(checkpoint.get_block_hash()?),
-        last_uid: checkpoint.get_last_uid(),
-        profile: json_profile(profile),
-        uid_codec: "eliasDeltaSorted",
-        unspent_uids,
-    })
-}
-
-fn decode_first_plus_one_deltas(values: &[u64]) -> anyhow::Result<Vec<u64>> {
-    if values.is_empty() {
-        return Ok(Vec::new());
-    }
-    let first = values[0]
-        .checked_sub(1)
-        .ok_or_else(|| anyhow::anyhow!("invalid first UID delta"))?;
-    let mut out = Vec::with_capacity(values.len());
-    out.push(first);
-    for delta in &values[1..] {
-        let next = out
-            .last()
-            .unwrap()
-            .checked_add(*delta)
-            .ok_or_else(|| anyhow::anyhow!("UID delta overflow"))?;
-        out.push(next);
-    }
-    Ok(out)
 }
 
 fn json_profile(profile: Option<&ServedProfile>) -> JsonProfile {
