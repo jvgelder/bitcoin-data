@@ -25,11 +25,25 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_CATCHUP_BATCH_SIZE: usize = 16;
 const DEFAULT_FLUSH_BLOCKS: usize = 128;
-const DEFAULT_MAX_BUFFERED_RAW_MB: usize = 256;
+const DEFAULT_MEMORY_BUDGET_MB: usize = 4096;
 const DEFAULT_INDEX_P2TR_KEY_STATS: bool = false;
-
 fn mb_to_bytes(mb: usize) -> usize {
     mb.saturating_mul(1024).saturating_mul(1024)
+}
+
+const ESTIMATED_PENDING_RAW_MULTIPLIER: usize = 4;
+const ESTIMATED_PENDING_PAYLOAD_MULTIPLIER: usize = 2;
+const ESTIMATED_PENDING_BLOCK_OVERHEAD_BYTES: usize = 64 * 1024;
+
+fn estimate_pending_memory_bytes(
+    processed_raw_bytes_since_flush: usize,
+    pending_payload_bytes: usize,
+    pending_blocks: usize,
+) -> usize {
+    processed_raw_bytes_since_flush
+        .saturating_mul(ESTIMATED_PENDING_RAW_MULTIPLIER)
+        .saturating_add(pending_payload_bytes.saturating_mul(ESTIMATED_PENDING_PAYLOAD_MULTIPLIER))
+        .saturating_add(pending_blocks.saturating_mul(ESTIMATED_PENDING_BLOCK_OVERHEAD_BYTES))
 }
 
 #[derive(Debug, Default)]
@@ -194,17 +208,20 @@ enum Command {
         catchup_batch_size: usize,
 
         /// Maximum number of applied blocks kept in RAM before one atomic SQLite flush.
-        /// The indexer may flush earlier when the raw bytes fetched since the
-        /// last commit exceed --max-buffered-raw-mb. Larger values reduce
-        /// write/commit overhead but increase crash rework and peak memory.
+        /// Larger values reduce write/commit overhead but increase crash rework
+        /// and peak memory. The indexer may flush earlier when estimated pending
+        /// memory reaches --memory-budget-mb.
         #[arg(long, default_value_t = DEFAULT_FLUSH_BLOCKS)]
         flush_blocks: usize,
 
-        /// Byte cap for source data fetched since the last SQLite flush. This
-        /// bounds peak RAM even when --flush-blocks is large. The cap is checked
-        /// after each source chunk, so peak raw bytes can exceed it by one chunk.
-        #[arg(long, default_value_t = DEFAULT_MAX_BUFFERED_RAW_MB)]
-        max_buffered_raw_mb: usize,
+        /// Estimated pending-memory budget in MiB. The indexer checks this after
+        /// each fetched+decoded chunk and flushes early when the pending batch is
+        /// estimated to be at or above the budget. Set to 0 to disable
+        /// memory-budget flushing.
+        ///
+        /// Deprecated alias: --max-buffered-raw-mb.
+        #[arg(long, default_value_t = DEFAULT_MEMORY_BUDGET_MB, alias = "max-buffered-raw-mb")]
+        memory_budget_mb: usize,
 
         /// Maintain historical output-key reuse/debug counters in SQLite.
         /// Disabled by default because it is not needed for served light payload
@@ -283,7 +300,7 @@ async fn main() -> anyhow::Result<()> {
             finality_depth,
             catchup_batch_size,
             flush_blocks,
-            max_buffered_raw_mb,
+            memory_budget_mb,
             index_p2tr_key_stats,
             once,
         } => {
@@ -297,7 +314,7 @@ async fn main() -> anyhow::Result<()> {
                 finality_depth,
                 catchup_batch_size,
                 flush_blocks,
-                mb_to_bytes(max_buffered_raw_mb),
+                mb_to_bytes(memory_budget_mb),
                 index_p2tr_key_stats,
                 once,
             )
@@ -350,7 +367,7 @@ async fn run_command(
     finality_depth: u64,
     catchup_batch_size: usize,
     flush_blocks: usize,
-    max_buffered_raw_bytes: usize,
+    memory_budget_bytes: usize,
     index_p2tr_key_stats: bool,
     once: bool,
 ) -> anyhow::Result<()> {
@@ -359,10 +376,6 @@ async fn run_command(
         "catchup_batch_size must be greater than zero"
     );
     anyhow::ensure!(flush_blocks > 0, "flush_blocks must be greater than zero");
-    anyhow::ensure!(
-        max_buffered_raw_bytes > 0,
-        "max_buffered_raw_mb must be greater than zero"
-    );
 
     let bundle = source.build_bundle()?;
     anyhow::ensure!(
@@ -389,7 +402,7 @@ async fn run_command(
     let mut state = restore_indexer_state(&archive, committed_profile_tip).await?;
     let initial_next_height = profile_next_height;
     println!(
-        "restored indexer state profile_tip={} next_height={} emit_start_height={} last_uid={} live_p2tr_utxos={} fetch_blocks={} flush_blocks={} max_buffered_raw_mb={} index_p2tr_key_stats={}",
+        "restored indexer state profile_tip={} next_height={} emit_start_height={} last_uid={} live_p2tr_utxos={} fetch_blocks={} flush_blocks={} memory_budget_mb={} index_p2tr_key_stats={}",
         committed_profile_tip
             .map(|h| h.to_string())
             .unwrap_or_else(|| "none".to_string()),
@@ -399,7 +412,7 @@ async fn run_command(
         state.live_uid_count(),
         catchup_batch_size,
         flush_blocks,
-        max_buffered_raw_bytes / 1024 / 1024,
+        memory_budget_bytes / 1024 / 1024,
         index_p2tr_key_stats,
     );
 
@@ -434,7 +447,7 @@ async fn run_command(
                     emit_start_height,
                     fetch_batch_size: catchup_batch_size,
                     flush_blocks,
-                    max_buffered_raw_bytes,
+                    memory_budget_bytes,
                     index_p2tr_key_stats,
                 },
                 next_height,
@@ -476,7 +489,7 @@ struct CatchUpConfig {
     emit_start_height: u64,
     fetch_batch_size: usize,
     flush_blocks: usize,
-    max_buffered_raw_bytes: usize,
+    memory_budget_bytes: usize,
     index_p2tr_key_stats: bool,
 }
 
@@ -495,7 +508,7 @@ async fn catch_up_ranges(
         emit_start_height,
         fetch_batch_size,
         flush_blocks,
-        max_buffered_raw_bytes,
+        memory_budget_bytes,
         index_p2tr_key_stats,
     } = config;
     let remaining = finalized_tip - start_height + 1;
@@ -513,6 +526,7 @@ async fn catch_up_ranges(
     let mut last_height = None;
     let mut last_hash: Option<BlockHashBytes> = None;
     let mut processed_raw_bytes_since_flush = 0usize;
+    let mut pending_payload_bytes = 0usize;
     let mut total_fetch_elapsed = Duration::ZERO;
     let mut total_decode_elapsed = Duration::ZERO;
     let mut total_apply_elapsed = Duration::ZERO;
@@ -549,8 +563,13 @@ async fn catch_up_ranges(
         last_hash = Some(chunk_last.block_hash);
         previous_tip_hash = Some(chunk_last.block_hash);
 
+        let estimated_pending_memory_before_apply = estimate_pending_memory_bytes(
+            processed_raw_bytes_since_flush,
+            pending_payload_bytes,
+            pending.len(),
+        );
         println!(
-            "fetched finalized chunk {}..={} count={} bytes={} live_raw_bytes=0 processed_raw_bytes_since_flush={} flush_target={}..={} pending_blocks={}",
+            "fetched finalized chunk {}..={} count={} bytes={} live_raw_bytes=0 processed_raw_bytes_since_flush={} flush_target={}..={} pending_blocks={} estimated_pending_mb={}",
             chunk_first_height,
             last_height.expect("last height set"),
             decoded.len(),
@@ -558,7 +577,8 @@ async fn catch_up_ranges(
             processed_raw_bytes_since_flush,
             first_height,
             flush_end_height,
-            pending.len()
+            pending.len(),
+            estimated_pending_memory_before_apply / 1024 / 1024
         );
 
         // Stage 2a: serial, ordered apply. State advances in memory until the
@@ -570,6 +590,7 @@ async fn catch_up_ranges(
             if emit_light_payload {
                 let applied = state.apply_block_with_stats(scan, profile)?;
                 let payload = to_packed_bytes(&encode_light_block(&applied.light_block)?)?;
+                pending_payload_bytes = pending_payload_bytes.saturating_add(payload.len());
                 pending.push(Pending { applied, payload });
             }
         }
@@ -578,15 +599,24 @@ async fn catch_up_ranges(
         let chunk_last_height = last_height.expect("last height set");
         chunk_start = chunk_last_height + 1;
 
-        if processed_raw_bytes_since_flush >= max_buffered_raw_bytes && chunk_start <= flush_end_height {
-            println!(
-                "processed-raw-byte flush budget reached at height {} processed_raw_bytes_since_flush={} budget_bytes={} live_raw_bytes=0 pending_blocks={}",
-                chunk_last_height,
+        if memory_budget_bytes > 0 && chunk_start <= flush_end_height {
+            let estimated_pending_memory = estimate_pending_memory_bytes(
                 processed_raw_bytes_since_flush,
-                max_buffered_raw_bytes,
-                pending.len()
+                pending_payload_bytes,
+                pending.len(),
             );
-            break;
+            if estimated_pending_memory >= memory_budget_bytes {
+                println!(
+                    "memory budget reached at height {} estimated_pending_mb={} budget_mb={} live_raw_bytes=0 processed_raw_bytes_since_flush={} pending_payload_bytes={} pending_blocks={}",
+                    chunk_last_height,
+                    estimated_pending_memory / 1024 / 1024,
+                    memory_budget_bytes / 1024 / 1024,
+                    processed_raw_bytes_since_flush,
+                    pending_payload_bytes,
+                    pending.len()
+                );
+                break;
+            }
         }
     }
 
@@ -826,14 +856,20 @@ async fn catch_up_ranges(
 
     let processed_blocks = last_height - first_height + 1;
 
+    let estimated_pending_memory = estimate_pending_memory_bytes(
+        processed_raw_bytes_since_flush,
+        pending_payload_bytes,
+        pending.len(),
+    );
     println!(
-        "indexed finalized range {}..={} blocks={} served_blocks={} flush_blocks={} processed_raw_byte_budget={} processed_raw_bytes={} live_raw_bytes=0 payload_bytes={} txs={} outputs={} p2tr_outputs={} indexed_created={} indexed_spent={} tx_tweaks={} last_uid={} live_uids={} fetch_ms={} decode_ms={} apply_ms={} sql_ms={} sql_core_cache_ms={} sql_p2tr_output_ms={} sql_p2tr_key_stats_ms={} sql_p2tr_spend_ms={} sql_tx_tweak_ms={} sql_profile_tip_ms={} commit_ms={} total_ms={}",
+        "indexed finalized range {}..={} blocks={} served_blocks={} flush_blocks={} memory_budget_mb={} estimated_pending_mb={} processed_raw_bytes={} live_raw_bytes=0 payload_bytes={} txs={} outputs={} p2tr_outputs={} indexed_created={} indexed_spent={} tx_tweaks={} last_uid={} live_uids={} fetch_ms={} decode_ms={} apply_ms={} sql_ms={} sql_core_cache_ms={} sql_p2tr_output_ms={} sql_p2tr_key_stats_ms={} sql_p2tr_spend_ms={} sql_tx_tweak_ms={} sql_profile_tip_ms={} commit_ms={} total_ms={}",
         first_height,
         last_height,
         processed_blocks,
         pending.len(),
         flush_blocks,
-        max_buffered_raw_bytes,
+        memory_budget_bytes / 1024 / 1024,
+        estimated_pending_memory / 1024 / 1024,
         processed_raw_bytes_since_flush,
         payload_bytes,
         totals.tx_count,
