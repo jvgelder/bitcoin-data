@@ -70,6 +70,38 @@ impl RestSource {
         }
         Ok(resp.bytes().await?)
     }
+
+    async fn get_block_hashes_by_height(
+        &self,
+        start_height: u64,
+        count: usize,
+    ) -> anyhow::Result<Vec<[u8; 32]>> {
+        let mut hashes = stream::iter((0..count).map(|offset| start_height + offset as u64))
+            .map(|height| async move { (height, self.get_block_hash(height).await) })
+            .buffer_unordered(count.min(16))
+            .collect::<Vec<(u64, anyhow::Result<[u8; 32]>)>>()
+            .await;
+
+        hashes.sort_by_key(|(height, _)| *height);
+        hashes
+            .into_iter()
+            .map(|(_, result)| result)
+            .collect::<anyhow::Result<Vec<_>>>()
+    }
+
+    async fn get_blocks_raw(&self, hashes: &[[u8; 32]]) -> anyhow::Result<Vec<Bytes>> {
+        let mut blocks = stream::iter(hashes.iter().copied().enumerate())
+            .map(|(index, hash)| async move { (index, self.get_block_raw(hash).await) })
+            .buffer_unordered(hashes.len().min(16))
+            .collect::<Vec<(usize, anyhow::Result<Bytes>)>>()
+            .await;
+
+        blocks.sort_by_key(|(index, _)| *index);
+        blocks
+            .into_iter()
+            .map(|(_, result)| result)
+            .collect::<anyhow::Result<Vec<_>>>()
+    }
 }
 
 fn normalize_base(mut base: String) -> String {
@@ -77,6 +109,33 @@ fn normalize_base(mut base: String) -> String {
         base.pop();
     }
     base
+}
+
+fn decode_rest_binary_or_hex(bytes: Bytes, what: &str) -> anyhow::Result<Bytes> {
+    let trimmed = bytes
+        .iter()
+        .copied()
+        .skip_while(|b| b.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    let trimmed = trimmed
+        .iter()
+        .copied()
+        .rev()
+        .skip_while(|b| b.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    let mut trimmed = trimmed;
+    trimmed.reverse();
+
+    if !trimmed.is_empty()
+        && trimmed.len() % 2 == 0
+        && trimmed.iter().all(|b| b.is_ascii_hexdigit())
+    {
+        let decoded = hex::decode(&trimmed)
+            .map_err(|e| anyhow::anyhow!("REST {what} looked like hex but failed to decode: {e}"))?;
+        return Ok(Bytes::from(decoded));
+    }
+
+    Ok(bytes)
 }
 
 #[async_trait]
@@ -120,6 +179,7 @@ impl BlockSource for RestSource {
         let bytes = self
             .get_bytes(&format!("/rest/spenttxouts/{hash_hex}.bin"))
             .await?;
+        let bytes = decode_rest_binary_or_hex(bytes, "spenttxouts")?;
         Ok(Some(decode_spent_txouts_payload(bytes.as_ref())?))
     }
 
@@ -128,13 +188,10 @@ impl BlockSource for RestSource {
         height: u64,
     ) -> anyhow::Result<btc_data_core::block::RawBlockFrame> {
         let hash = self.get_block_hash(height).await?;
-        let mut display = hash;
-        display.reverse();
-        let hash_hex = hex::encode(display);
-        let bytes = self
-            .get_bytes(&format!("/rest/block/{hash_hex}.bin"))
-            .await?;
-        let spent_txouts = self.get_block_spent_txouts(hash).await?;
+        let (bytes, spent_txouts) = tokio::try_join!(
+            self.get_block_raw(hash),
+            self.get_block_spent_txouts(hash),
+        )?;
         Ok(btc_data_core::block::RawBlockFrame {
             height,
             hash,
@@ -149,37 +206,6 @@ impl BlockSource for RestSource {
         Ok(info.blocks)
     }
 
-    async fn get_block_hashes_by_height(
-        &self,
-        start_height: u64,
-        count: usize,
-    ) -> anyhow::Result<Vec<[u8; 32]>> {
-        let mut hashes = stream::iter((0..count).map(|offset| start_height + offset as u64))
-            .map(|height| async move { (height, self.get_block_hash(height).await) })
-            .buffer_unordered(count.min(16))
-            .collect::<Vec<(u64, anyhow::Result<[u8; 32]>)>>()
-            .await;
-
-        hashes.sort_by_key(|(height, _)| *height);
-        hashes
-            .into_iter()
-            .map(|(_, result)| result)
-            .collect::<anyhow::Result<Vec<_>>>()
-    }
-
-    async fn get_blocks_raw(&self, hashes: &[[u8; 32]]) -> anyhow::Result<Vec<Bytes>> {
-        let mut blocks = stream::iter(hashes.iter().copied().enumerate())
-            .map(|(index, hash)| async move { (index, self.get_block_raw(hash).await) })
-            .buffer_unordered(hashes.len().min(16))
-            .collect::<Vec<(usize, anyhow::Result<Bytes>)>>()
-            .await;
-
-        blocks.sort_by_key(|(index, _)| *index);
-        blocks
-            .into_iter()
-            .map(|(_, result)| result)
-            .collect::<anyhow::Result<Vec<_>>>()
-    }
 
     async fn get_blocks_spent_txouts(
         &self,
@@ -203,8 +229,10 @@ impl BlockSource for RestSource {
         count: usize,
     ) -> anyhow::Result<Vec<RawBlockFrame>> {
         let hashes = self.get_block_hashes_by_height(start_height, count).await?;
-        let blocks = self.get_blocks_raw(&hashes).await?;
-        let spent_txouts = self.get_blocks_spent_txouts(&hashes).await?;
+        let (blocks, spent_txouts) = tokio::try_join!(
+            self.get_blocks_raw(&hashes),
+            self.get_blocks_spent_txouts(&hashes),
+        )?;
         if blocks.len() != hashes.len() {
             anyhow::bail!(
                 "REST batch returned {} blocks for {} hashes",
@@ -214,7 +242,7 @@ impl BlockSource for RestSource {
         }
         if spent_txouts.len() != hashes.len() {
             anyhow::bail!(
-                "REST batch returned {} spenttxouts payloads for {} hashes",
+                "REST batch returned {} spenttxouts entries for {} hashes",
                 spent_txouts.len(),
                 hashes.len()
             );

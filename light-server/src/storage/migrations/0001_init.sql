@@ -81,7 +81,6 @@ CREATE TABLE IF NOT EXISTS p2tr_outputs (
   uid INTEGER PRIMARY KEY CHECK(uid > 0),
   txid BLOB NOT NULL CHECK(length(txid) = 32),
   created_height INTEGER NOT NULL CHECK(created_height >= 0),
-  created_block_hash BLOB NOT NULL CHECK(length(created_block_hash) = 32),
   tx_index INTEGER NOT NULL CHECK(tx_index >= 0),
   vout INTEGER NOT NULL CHECK(vout >= 0),
   value_sat INTEGER NOT NULL CHECK(value_sat >= 0),
@@ -100,7 +99,7 @@ CREATE INDEX IF NOT EXISTS p2tr_outputs_created_order_idx
 ON p2tr_outputs(created_height, tx_index, vout);
 
 CREATE UNIQUE INDEX IF NOT EXISTS p2tr_outputs_location_idx
-ON p2tr_outputs(created_height, created_block_hash, tx_index, vout);
+ON p2tr_outputs(created_height, tx_index, vout);
 
 -- p2tr_utxo_lookup removed: live UID set is rebuilt at startup from
 -- p2tr_outputs LEFT JOIN p2tr_spends instead of a mirror table.

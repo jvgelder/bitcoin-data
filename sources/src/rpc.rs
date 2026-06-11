@@ -211,6 +211,7 @@ impl BlockSource for RpcSource {
                 height: start_height + offset as u64,
                 hash,
                 bytes: Bytes::from(bytes),
+                spent_txouts: None,
             })
             .collect())
     }

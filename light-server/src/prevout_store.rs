@@ -472,6 +472,13 @@ impl PrevoutStore {
             return Ok(());
         }
 
+        // Sources that expose Bitcoin Core undo data can compute the BIP352
+        // scan point during block decoding. Keep that authoritative value and
+        // only use RocksDB as a fallback for sources without spent prevouts.
+        if tx.silent_payment_tweak.is_some() {
+            return Ok(());
+        }
+
         let mut input_context = Vec::with_capacity(tx.inputs.len());
         for input in &tx.inputs {
             if !input.previous_output.is_coinbase() {

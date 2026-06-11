@@ -455,6 +455,7 @@ async fn get_block_by_height(
         height,
         hash,
         bytes,
+        spent_txouts: None,
     })
 }
 

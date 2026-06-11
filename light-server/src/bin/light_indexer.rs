@@ -1,6 +1,7 @@
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash as BitcoinHash;
 use bitcoin::Block;
+use btc_data_core::block::{BlockSpentTxOuts, SpentTxOut};
 use btc_data_core::source::{BlockSource, TipWatcher};
 use btc_data_light_server::index::{
     encode_light_block, encode_uid_checkpoint, to_packed_bytes, UidCheckpointInput,
@@ -9,9 +10,9 @@ use btc_data_light_server::p2tr_indexer::{
     BlockScanInput, BlockScopeStats, OutPointKey, P2trIndexerState, ScopedUtxoEntry, TxInputScan,
     TxOutputScan, TxScanInput,
 };
-use btc_data_light_server::prevout_store::{PendingPrevoutWrites, PrevoutStore};
 use btc_data_light_server::profile::{ArchiveNetwork, ArchiveScope, Profile};
-use btc_data_light_server::script_classify::extract_p2tr_xonly;
+use btc_data_light_server::script_classify::{classify_script, extract_p2tr_xonly, ScriptKind};
+use btc_data_light_server::sp_tweak::{compute_tx_scan_point, PrevoutInfo, PrevoutScript, ScanPointStatus, TxInputContext};
 use btc_data_light_server::storage::{
     ArchiveBackend, ChainTip, FileArchive, Manifest, ManifestProfile, SqliteArchive,
 };
@@ -20,22 +21,22 @@ use btc_data_sources::{IpcSource, PollingTipWatcher, RestSource};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use futures::{stream, StreamExt, TryStreamExt};
 use sqlx::Row;
-use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const DEFAULT_CATCHUP_BATCH_SIZE: usize = 128;
-const DEFAULT_FLUSH_BLOCKS: usize = 1024;
-const DEFAULT_PREVOUT_DB_DIR: &str = "light-prevouts-rocksdb";
-const DEFAULT_FLUSH_PREVOUT_MUTATIONS: usize = 1_000_000;
+const DEFAULT_CATCHUP_BATCH_SIZE: usize = 16;
+const DEFAULT_FLUSH_BLOCKS: usize = 128;
+const DEFAULT_MAX_BUFFERED_RAW_MB: usize = 256;
 const DEFAULT_INDEX_P2TR_KEY_STATS: bool = false;
-const GENESIS_HEIGHT: u64 = 0;
+
+fn mb_to_bytes(mb: usize) -> usize {
+    mb.saturating_mul(1024).saturating_mul(1024)
+}
 
 #[derive(Debug, Default)]
 struct SqlTiming {
     core_cache_ms: u128,
-    prevout_store_ms: u128,
     p2tr_output_ms: u128,
     p2tr_utxo_insert_ms: u128,
     p2tr_key_stats_ms: u128,
@@ -55,7 +56,7 @@ struct Args {
 enum SourceKind {
     /// Bitcoin Core multiprocess IPC source from btc-data-sources.
     Ipc,
-    /// Bitcoin Core REST source. Useful fallback/local development mode.
+    /// Bitcoin Core REST source.
     Rest,
 }
 
@@ -73,9 +74,9 @@ struct SourceCli {
     #[arg(long, default_value_t = 8)]
     ipc_threads: usize,
 
-    /// Bitcoin Core REST base URL. Only used with --source rest.
-    #[arg(long, default_value = "http://127.0.0.1:8332")]
-    rest_url: String,
+    /// Bitcoin Core REST base URL. Required for --source rest blocks and for --source ipc undo data.
+    #[arg(long)]
+    rest_url: Option<String>,
 
     /// Polling fallback interval in seconds. Only used by REST/fallback watchers.
     #[arg(long, default_value_t = 10)]
@@ -85,6 +86,7 @@ struct SourceCli {
 struct SourceBundle {
     source: Arc<dyn BlockSource>,
     watcher: Arc<dyn TipWatcher>,
+    undo_source: Arc<dyn BlockSource>,
 }
 
 impl SourceCli {
@@ -96,12 +98,19 @@ impl SourceCli {
         match self.source {
             SourceKind::Ipc => self.build_ipc_bundle(),
             SourceKind::Rest => {
-                let source: Arc<dyn BlockSource> = Arc::new(RestSource::new(self.rest_url.clone()));
+                let rest_url = self.rest_url.clone().ok_or_else(|| {
+                    anyhow::anyhow!("--rest-url is required when --source rest is selected")
+                })?;
+                let source: Arc<dyn BlockSource> = Arc::new(RestSource::new(rest_url));
                 let watcher: Arc<dyn TipWatcher> = Arc::new(PollingTipWatcher::new(
                     source.clone(),
                     Duration::from_secs(self.poll_interval_secs),
                 ));
-                Ok(SourceBundle { source, watcher })
+                Ok(SourceBundle {
+                    source: source.clone(),
+                    watcher,
+                    undo_source: source,
+                })
             }
         }
     }
@@ -111,12 +120,18 @@ impl SourceCli {
             anyhow::anyhow!("--ipc-socket is required when --source ipc is selected")
         })?;
 
+        let rest_url = self.rest_url.clone().ok_or_else(|| {
+            anyhow::anyhow!("--rest-url is required when --source ipc is selected because undo data is fetched from /rest/spenttxouts")
+        })?;
+
         let source: Arc<IpcSource> =
             Arc::new(IpcSource::connect_with_threads(socket, self.ipc_threads)?);
+        let undo_source: Arc<dyn BlockSource> = Arc::new(RestSource::new(rest_url));
 
         Ok(SourceBundle {
             source: source.clone(),
             watcher: source,
+            undo_source,
         })
     }
 }
@@ -182,22 +197,18 @@ enum Command {
         #[arg(long, default_value_t = DEFAULT_CATCHUP_BATCH_SIZE)]
         catchup_batch_size: usize,
 
-        /// Number of applied blocks kept in RAM before one atomic SQLite flush.
-        /// Larger values reduce write/commit overhead but increase crash rework
-        /// and peak memory. This is an upper bound; the indexer may flush
-        /// earlier when the pending prevout mutation cap is reached.
+        /// Maximum number of applied blocks kept in RAM before one atomic SQLite flush.
+        /// The indexer may flush earlier when the raw bytes fetched since the
+        /// last commit exceed --max-buffered-raw-mb. Larger values reduce
+        /// write/commit overhead but increase crash rework and peak memory.
         #[arg(long, default_value_t = DEFAULT_FLUSH_BLOCKS)]
         flush_blocks: usize,
 
-        /// Maximum pending RocksDB prevout puts/deletes kept in RAM before an
-        /// early flush. This bounds memory even when --flush-blocks is large.
-        #[arg(long, default_value_t = DEFAULT_FLUSH_PREVOUT_MUTATIONS)]
-        flush_prevout_mutations: usize,
-
-        /// RocksDB directory for compact BIP352 prevout context. This is the
-        /// durable chain-state store used for genesis warmup and resume.
-        #[arg(long, default_value = DEFAULT_PREVOUT_DB_DIR)]
-        prevout_db_dir: PathBuf,
+        /// Byte cap for source data fetched since the last SQLite flush. This
+        /// bounds peak RAM even when --flush-blocks is large. The cap is checked
+        /// after each source chunk, so peak raw bytes can exceed it by one chunk.
+        #[arg(long, default_value_t = DEFAULT_MAX_BUFFERED_RAW_MB)]
+        max_buffered_raw_mb: usize,
 
         /// Maintain historical output-key reuse/debug counters in SQLite.
         /// Disabled by default because it is not needed for served light payload
@@ -276,8 +287,7 @@ async fn main() -> anyhow::Result<()> {
             finality_depth,
             catchup_batch_size,
             flush_blocks,
-            flush_prevout_mutations,
-            prevout_db_dir,
+            max_buffered_raw_mb,
             index_p2tr_key_stats,
             once,
         } => {
@@ -291,8 +301,7 @@ async fn main() -> anyhow::Result<()> {
                 finality_depth,
                 catchup_batch_size,
                 flush_blocks,
-                flush_prevout_mutations,
-                prevout_db_dir,
+                mb_to_bytes(max_buffered_raw_mb),
                 index_p2tr_key_stats,
                 once,
             )
@@ -345,8 +354,7 @@ async fn run_command(
     finality_depth: u64,
     catchup_batch_size: usize,
     flush_blocks: usize,
-    flush_prevout_mutations: usize,
-    prevout_db_dir: PathBuf,
+    max_buffered_raw_bytes: usize,
     index_p2tr_key_stats: bool,
     once: bool,
 ) -> anyhow::Result<()> {
@@ -356,11 +364,15 @@ async fn run_command(
     );
     anyhow::ensure!(flush_blocks > 0, "flush_blocks must be greater than zero");
     anyhow::ensure!(
-        flush_prevout_mutations > 0,
-        "flush_prevout_mutations must be greater than zero"
+        max_buffered_raw_bytes > 0,
+        "max_buffered_raw_mb must be greater than zero"
     );
 
     let bundle = source.build_bundle()?;
+    anyhow::ensure!(
+        bundle.undo_source.supports_block_spent_txouts(),
+        "light-indexer requires a REST undo source with /rest/spenttxouts enabled"
+    );
     let archive = SqliteArchive::connect(&database_url, true).await?;
     configure_indexer_sqlite(&archive).await?;
     archive.migrate().await?;
@@ -379,60 +391,20 @@ async fn run_command(
         .checked_sub(1)
         .filter(|h| *h >= emit_start_height);
     let mut state = restore_indexer_state(&archive, committed_profile_tip).await?;
-    let mut prevout_store = PrevoutStore::open(&prevout_db_dir)?;
-    let (mut prevout_tip, mut prevout_tip_hash) = prevout_store.tip();
-
-    if let Some(committed_profile_tip) = committed_profile_tip {
-        match prevout_tip {
-            Some(tip) if tip > committed_profile_tip => {
-                anyhow::bail!(
-                    "RocksDB prevout tip {tip} is ahead of committed SQLite profile tip {committed_profile_tip}; \
-                     refusing to continue because the mutable prevout store cannot be safely rewound"
-                );
-            }
-            Some(tip) if tip < committed_profile_tip => {
-                catch_up_prevout_store_to_tip(
-                    bundle.source.clone(),
-                    &mut prevout_store,
-                    tip + 1,
-                    committed_profile_tip,
-                    catchup_batch_size,
-                )
-                .await?;
-                (prevout_tip, prevout_tip_hash) = prevout_store.tip();
-            }
-            None => {
-                anyhow::bail!(
-                    "SQLite has committed profile tip {committed_profile_tip}, but RocksDB prevout store is empty; \
-                     refusing to rebuild prevout context from genesis automatically"
-                );
-            }
-            _ => {}
-        }
-    }
-
-    let initial_next_height = prevout_tip.map_or(GENESIS_HEIGHT, |height| height + 1);
+    let initial_next_height = profile_next_height;
     println!(
-        "restored indexer state profile_tip={} prevout_tip={} prevout_tip_hash={} next_height={} emit_start_height={} last_uid={} live_p2tr_utxos={} prevout_contexts_live_estimate={} fetch_blocks={} flush_blocks={} flush_prevout_mutations={} index_p2tr_key_stats={} prevout_db_dir={}",
+        "restored indexer state profile_tip={} next_height={} emit_start_height={} last_uid={} live_p2tr_utxos={} fetch_blocks={} flush_blocks={} decode_concurrency={} max_buffered_raw_mb={} index_p2tr_key_stats={}",
         committed_profile_tip
             .map(|h| h.to_string())
-            .unwrap_or_else(|| "none".to_string()),
-        prevout_tip
-            .map(|h| h.to_string())
-            .unwrap_or_else(|| "none".to_string()),
-        prevout_tip_hash
-            .map(|hash| hex::encode(hash.as_bytes()))
             .unwrap_or_else(|| "none".to_string()),
         initial_next_height,
         emit_start_height,
         state.last_uid(),
         state.live_uids_sorted().len(),
-        prevout_store.len_estimate(),
         catchup_batch_size,
         flush_blocks,
-        flush_prevout_mutations,
+        max_buffered_raw_bytes / 1024 / 1024,
         index_p2tr_key_stats,
-        prevout_db_dir.display(),
     );
 
     let mut chain_next_height = initial_next_height;
@@ -458,15 +430,15 @@ async fn run_command(
             chain_next_height = catch_up_ranges(
                 &archive,
                 bundle.source.as_ref(),
+                bundle.undo_source.as_ref(),
                 &mut state,
-                &mut prevout_store,
                 CatchUpConfig {
                     profile,
                     profile_id: db_profile.profile_id,
                     emit_start_height,
                     fetch_batch_size: catchup_batch_size,
                     flush_blocks,
-                    flush_prevout_mutations,
+                    max_buffered_raw_bytes,
                     index_p2tr_key_stats,
                 },
                 next_height,
@@ -496,11 +468,11 @@ const SQL_INSERT_CHUNK: usize = 128;
 const SQL_UTXO_MUTATION_CHUNK: usize = 512;
 
 // NOTE: source chunks are fetched/decoded in bounded batches, then compact
-// applied light data is buffered until the flush boundary. Compact BIP352
-// prevout context is staged in a RocksDB WriteBatch and committed at the same
-// boundary as the SQLite served archive.
+// applied light data is buffered until the SQLite flush boundary. Silent
+// Payment tweaks are computed directly from Bitcoin Core undo data returned
+// by /rest/spenttxouts, so no mutable prevout store is needed.
 /// Bundles the per-run settings for [`catch_up_ranges`], replacing a long
-/// positional argument list. Handles (archive/source/state/store) and the
+/// positional argument list. Handles (archive/source/state) and the
 /// dynamic range bounds stay as direct parameters.
 struct CatchUpConfig {
     profile: Profile,
@@ -508,15 +480,15 @@ struct CatchUpConfig {
     emit_start_height: u64,
     fetch_batch_size: usize,
     flush_blocks: usize,
-    flush_prevout_mutations: usize,
+    max_buffered_raw_bytes: usize,
     index_p2tr_key_stats: bool,
 }
 
 async fn catch_up_ranges(
     archive: &SqliteArchive,
     source: &dyn BlockSource,
+    undo_source: &dyn BlockSource,
     state: &mut P2trIndexerState,
-    prevout_store: &mut PrevoutStore,
     config: CatchUpConfig,
     start_height: u64,
     finalized_tip: u64,
@@ -527,7 +499,7 @@ async fn catch_up_ranges(
         emit_start_height,
         fetch_batch_size,
         flush_blocks,
-        flush_prevout_mutations,
+        max_buffered_raw_bytes,
         index_p2tr_key_stats,
     } = config;
     let remaining = finalized_tip - start_height + 1;
@@ -548,16 +520,11 @@ async fn catch_up_ranges(
     let mut total_fetch_elapsed = Duration::ZERO;
     let mut total_decode_elapsed = Duration::ZERO;
     let mut total_apply_elapsed = Duration::ZERO;
-    let mut scan_point_prevout_lookups = 0usize;
-    let mut prevout_contexts_created = 0usize;
-    let mut prevout_delete_attempts = 0usize;
     let mut pending: Vec<Pending> = Vec::with_capacity(flush_count);
-    let mut pending_prevouts = PendingPrevoutWrites::default();
-    let mut total_prevout_store_elapsed = Duration::ZERO;
 
-    // Seeded from the resume point so the first chunk's parent linkage is
-    // checked against the committed/prevout tip, not against itself.
-    let mut previous_tip_hash: Option<BlockHashBytes> = prevout_store.tip().1;
+    // Seeded from the committed profile tip so the first chunk's parent linkage
+    // is checked against the last served block, not against itself.
+    let mut previous_tip_hash: Option<BlockHashBytes> = committed_tip_hash(archive, profile_id).await?;
     let mut chunk_start = start_height;
     while chunk_start <= flush_end_height {
         let chunk_remaining = flush_end_height - chunk_start + 1;
@@ -566,7 +533,13 @@ async fn catch_up_ranges(
         // Stage 1: fetch + decode this bounded source chunk. The helper consumes
         // the raw frames instead of cloning their byte buffers, keeping peak
         // memory bounded to one source chunk plus its decoded block inputs.
-        let chunk = fetch_and_decode_chunk(source, chunk_start, chunk_count).await?;
+        let chunk = fetch_and_decode_chunk(
+            source,
+            undo_source,
+            chunk_start,
+            chunk_count,
+        )
+        .await?;
         total_fetch_elapsed += chunk.fetch_elapsed;
         total_decode_elapsed += chunk.decode_elapsed;
         total_bytes += chunk.raw_bytes;
@@ -581,29 +554,22 @@ async fn catch_up_ranges(
         previous_tip_hash = Some(chunk_last.block_hash);
 
         println!(
-            "fetched finalized chunk {}..={} count={} bytes={} flush_target={}..={} buffered_blocks={} pending_prevout_writes={}",
+            "fetched finalized chunk {}..={} count={} bytes={} flush_target={}..={} buffered_blocks={}",
             chunk_first_height,
             last_height.expect("last height set"),
             decoded.len(),
             chunk.raw_bytes,
             first_height,
             flush_end_height,
-            pending.len(),
-            pending_prevouts.len()
+            pending.len()
         );
 
         // Stage 2a: serial, ordered apply. State advances in memory until the
         // flush transaction commits. A crash before commit will reprocess from
         // the last committed profile tip.
         let apply_started = Instant::now();
-        for mut scan in decoded {
+        for scan in decoded {
             let emit_light_payload = scan.height >= emit_start_height;
-            let chain_delta =
-                prevout_store.enrich_block_scan_points(&mut pending_prevouts, &mut scan)?;
-            prevout_contexts_created += chain_delta.contexts_created;
-            prevout_delete_attempts += chain_delta.delete_attempts;
-            scan_point_prevout_lookups += chain_delta.scan_point_prevout_lookups;
-
             if emit_light_payload {
                 let applied = state.apply_block_with_stats(scan, profile)?;
                 let payload = to_packed_bytes(&encode_light_block(&applied.light_block)?)?;
@@ -613,25 +579,16 @@ async fn catch_up_ranges(
         total_apply_elapsed += apply_started.elapsed();
 
         let chunk_last_height = last_height.expect("last height set");
-        let chunk_last_hash = last_hash.expect("last hash set");
-
-        // Before the served profile starts, RocksDB is the only committed
-        // progress boundary. Commit prevout-state chunks immediately instead
-        // of buffering up to --flush-blocks. This prevents genesis warmup from
-        // accumulating millions of pending RocksDB puts/deletes in RAM.
-        if pending.is_empty() && chunk_last_height < emit_start_height {
-            let prevout_store_started = Instant::now();
-            prevout_store.apply_pending(
-                mem::take(&mut pending_prevouts),
-                chunk_last_height,
-                chunk_last_hash,
-            )?;
-            total_prevout_store_elapsed += prevout_store_started.elapsed();
-        }
-
         chunk_start = chunk_last_height + 1;
 
-        if pending_prevouts.len() >= flush_prevout_mutations {
+        if total_bytes >= max_buffered_raw_bytes && chunk_start <= flush_end_height {
+            println!(
+                "raw-byte flush cap reached at height {} buffered_raw_bytes={} cap_bytes={} pending_blocks={}",
+                chunk_last_height,
+                total_bytes,
+                max_buffered_raw_bytes,
+                pending.len()
+            );
             break;
         }
     }
@@ -723,14 +680,13 @@ async fn catch_up_ranges(
     for chunk in p2tr_created.chunks(SQL_UTXO_MUTATION_CHUNK) {
         let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
             r#"INSERT INTO p2tr_outputs
-               (uid, created_height, created_block_hash, tx_index, vout, value_sat, is_nums, is_reused,
+               (uid, created_height, tx_index, vout, value_sat, is_nums, is_reused,
                 reuse_count_at_creation, txid, script_pubkey, p2tr_xonly_key) "#,
         );
         qb.push_values(chunk, |mut b, created| {
             let entry = &created.entry;
             b.push_bind(i64::try_from(entry.uid).expect("uid fits in i64"))
                 .push_bind(i64::try_from(entry.created_height).expect("height fits in i64"))
-                .push_bind(entry.created_block_hash.as_bytes().to_vec())
                 .push_bind(i64::from(entry.tx_index))
                 .push_bind(i64::from(entry.outpoint.vout))
                 .push_bind(i64::try_from(entry.value_sat).expect("value_sat fits in i64"))
@@ -878,33 +834,13 @@ async fn catch_up_ranges(
     };
     sql_timing.checkpoint_profile_ms = checkpoint_profile_started.elapsed().as_millis();
 
-    let pending_prevout_write_count = pending_prevouts.len();
-    let should_apply_prevouts =
-        pending_prevout_write_count > 0 || prevout_store.tip().0 != Some(last_height);
-    let pending_prevouts_to_apply = if should_apply_prevouts {
-        Some(mem::take(&mut pending_prevouts))
-    } else {
-        None
-    };
-
-    // Durability ordering: commit SQLite first, then advance the RocksDB
-    // prevout tip. The served archive is the authority on progress, so SQLite
-    // tables use plain INSERT (no OR REPLACE) and never expect to re-write a
-    // committed height. A crash in this window leaves RocksDB *behind* SQLite,
-    // which restart repairs by rolling the prevout store forward
-    // (catch_up_prevout_store_to_tip); RocksDB can never be left ahead, so it
-    // never needs an unsafe rewind. Do not reorder these two steps without also
-    // revisiting that recovery path and the INSERT-vs-INSERT-OR-REPLACE choice.
+    // SQLite is now the only durable archive state. Undo data is fetched from
+    // Bitcoin Core per block, so there is no secondary prevout database to keep
+    // in sync with the served profile tip.
     let commit_started = Instant::now();
     tx.commit().await?;
     let commit_elapsed = commit_started.elapsed();
 
-    let prevout_store_started = Instant::now();
-    if let Some(pending_prevouts_to_apply) = pending_prevouts_to_apply {
-        prevout_store.apply_pending(pending_prevouts_to_apply, last_height, checkpoint_hash)?;
-    }
-    total_prevout_store_elapsed += prevout_store_started.elapsed();
-    sql_timing.prevout_store_ms = total_prevout_store_elapsed.as_millis();
 
     let sql_elapsed = sql_started.elapsed();
     let total_elapsed = range_started.elapsed();
@@ -931,12 +867,13 @@ async fn catch_up_ranges(
     let processed_blocks = last_height - first_height + 1;
 
     println!(
-        "indexed finalized range {}..={} blocks={} served_blocks={} flush_blocks={} raw_bytes={} payload_bytes={} checkpoint_bytes={} txs={} outputs={} p2tr_outputs={} indexed_created={} indexed_spent={} tx_tweaks={} prevout_contexts_created={} prevout_delete_attempts={} last_uid={} live_uids={} prevout_contexts_live_estimate={} scan_point_prevout_lookups={} pending_prevout_writes={} fetch_ms={} decode_ms={} apply_ms={} sql_ms={} sql_core_cache_ms={} prevout_store_ms={} sql_p2tr_output_ms={} sql_p2tr_utxo_insert_ms={} sql_p2tr_key_stats_ms={} sql_p2tr_spend_ms={} sql_p2tr_utxo_delete_ms={} sql_tx_tweak_ms={} sql_checkpoint_profile_ms={} commit_ms={} total_ms={}",
+        "indexed finalized range {}..={} blocks={} served_blocks={} flush_blocks={} decode_concurrency={} max_buffered_raw_bytes={} raw_bytes={} payload_bytes={} checkpoint_bytes={} txs={} outputs={} p2tr_outputs={} indexed_created={} indexed_spent={} tx_tweaks={} last_uid={} live_uids={} fetch_ms={} decode_ms={} apply_ms={} sql_ms={} sql_core_cache_ms={} sql_p2tr_output_ms={} sql_p2tr_utxo_insert_ms={} sql_p2tr_key_stats_ms={} sql_p2tr_spend_ms={} sql_p2tr_utxo_delete_ms={} sql_tx_tweak_ms={} sql_checkpoint_profile_ms={} commit_ms={} total_ms={}",
         first_height,
         last_height,
         processed_blocks,
         pending.len(),
         flush_blocks,
+        max_buffered_raw_bytes,
         total_bytes,
         payload_bytes,
         checkpoint_bytes.len(),
@@ -946,19 +883,13 @@ async fn catch_up_ranges(
         totals.indexed_output_count,
         totals.indexed_spent_count,
         totals.tweak_count,
-        prevout_contexts_created,
-        prevout_delete_attempts,
         state.last_uid(),
         state.live_uid_count(),
-        prevout_store.len_estimate(),
-        scan_point_prevout_lookups,
-        pending_prevout_write_count,
         total_fetch_elapsed.as_millis(),
         total_decode_elapsed.as_millis(),
         total_apply_elapsed.as_millis(),
         sql_elapsed.as_millis(),
         sql_timing.core_cache_ms,
-        sql_timing.prevout_store_ms,
         sql_timing.p2tr_output_ms,
         sql_timing.p2tr_utxo_insert_ms,
         sql_timing.p2tr_key_stats_ms,
@@ -973,48 +904,32 @@ async fn catch_up_ranges(
     Ok(last_height + 1)
 }
 
-async fn catch_up_prevout_store_to_tip(
-    source: Arc<dyn BlockSource>,
-    prevout_store: &mut PrevoutStore,
-    start_height: u64,
-    target_height: u64,
-    fetch_batch_size: usize,
-) -> anyhow::Result<()> {
+
+async fn committed_tip_hash(
+    archive: &SqliteArchive,
+    profile_id: i64,
+) -> anyhow::Result<Option<BlockHashBytes>> {
+    let row = sqlx::query(
+        r#"SELECT served_tip_hash
+           FROM profiles
+           WHERE profile_id = ? AND served_tip_hash IS NOT NULL"#,
+    )
+    .bind(profile_id)
+    .fetch_optional(archive.pool())
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let bytes: Vec<u8> = row.try_get("served_tip_hash")?;
     anyhow::ensure!(
-        start_height <= target_height,
-        "invalid prevout replay range {start_height}..={target_height}"
+        bytes.len() == 32,
+        "profile {profile_id} has invalid served_tip_hash length {}",
+        bytes.len()
     );
-
-    let mut pending_prevouts = PendingPrevoutWrites::default();
-    let mut chunk_start = start_height;
-    let mut previous_hash = prevout_store.tip().1;
-
-    while chunk_start <= target_height {
-        let chunk_remaining = target_height - chunk_start + 1;
-        let chunk_count = usize::try_from(chunk_remaining.min(fetch_batch_size as u64))?;
-        let decoded = fetch_and_decode_chunk(source.as_ref(), chunk_start, chunk_count)
-            .await?
-            .blocks;
-        validate_decoded_chunk(&decoded, chunk_start, previous_hash)?;
-
-        let chunk_last = decoded.last().expect("non-empty decoded chunk");
-        let chunk_last_height = chunk_last.height;
-        let chunk_last_hash = chunk_last.block_hash;
-
-        for mut scan in decoded {
-            prevout_store.enrich_block_scan_points(&mut pending_prevouts, &mut scan)?;
-        }
-
-        prevout_store.apply_pending(
-            mem::take(&mut pending_prevouts),
-            chunk_last_height,
-            chunk_last_hash,
-        )?;
-        previous_hash = Some(chunk_last_hash);
-        chunk_start = chunk_last_height + 1;
-    }
-
-    Ok(())
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&bytes);
+    Ok(Some(BlockHashBytes::from(hash)))
 }
 
 /// One fetched-and-decoded source chunk plus the fetch/decode telemetry the
@@ -1029,35 +944,70 @@ struct DecodedChunk {
 
 async fn fetch_and_decode_chunk(
     source: &dyn BlockSource,
+    undo_source: &dyn BlockSource,
     chunk_start: u64,
     chunk_count: usize,
 ) -> anyhow::Result<DecodedChunk> {
     let fetch_started = Instant::now();
-    let frames = source
+    let mut frames = source
         .get_block_range_by_height(chunk_start, chunk_count)
         .await?;
-    let fetch_elapsed = fetch_started.elapsed();
     anyhow::ensure!(
         !frames.is_empty(),
         "source returned an empty block range at height {chunk_start}"
     );
+
+    // REST frames already carry undo data. IPC frames carry block bytes only,
+    // so attach missing undo data here before decode. The decoder only sees
+    // completed frames and no longer performs a second undo pass.
+    let missing_undo = frames
+        .iter()
+        .enumerate()
+        .filter_map(|(index, frame)| frame.spent_txouts.is_none().then_some((index, frame.hash)))
+        .collect::<Vec<_>>();
+    if !missing_undo.is_empty() {
+        let hashes = missing_undo
+            .iter()
+            .map(|(_, hash)| *hash)
+            .collect::<Vec<_>>();
+        let fetched = undo_source.get_blocks_spent_txouts(&hashes).await?;
+        anyhow::ensure!(
+            fetched.len() == missing_undo.len(),
+            "undo source returned {} spenttxouts entries for {} missing blocks",
+            fetched.len(),
+            missing_undo.len()
+        );
+        for ((index, _), undo) in missing_undo.into_iter().zip(fetched) {
+            frames[index].spent_txouts = undo;
+        }
+    }
+
+    let fetch_elapsed = fetch_started.elapsed();
     let raw_bytes: usize = frames.iter().map(|frame| frame.bytes.len()).sum();
 
     let decode_started = Instant::now();
-    let mut blocks: Vec<BlockScanInput> = stream::iter(frames)
+    let mut blocks: Vec<BlockScanInput> = stream::iter(frames.into_iter())
         .map(|frame| {
             let height = frame.height;
             let hash = frame.hash;
             let bytes = frame.bytes;
+            let spent_txouts = frame.spent_txouts;
             async move {
+                let spent_txouts = spent_txouts.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "undo source did not return spenttxouts for block {} at height {}",
+                        display_hash(hash),
+                        height
+                    )
+                })?;
                 tokio::task::spawn_blocking(move || {
-                    decode_block_frame(height, hash, bytes.as_ref())
+                    decode_block_frame(height, hash, bytes.as_ref(), Some(&spent_txouts))
                 })
                 .await
                 .map_err(|e| anyhow::anyhow!("decode worker failed: {e}"))?
             }
         })
-        .buffer_unordered(8)
+        .buffer_unordered(chunk_count)
         .collect::<Vec<anyhow::Result<BlockScanInput>>>()
         .await
         .into_iter()
@@ -1122,6 +1072,7 @@ fn decode_block_frame(
     height: u64,
     source_hash: [u8; 32],
     bytes: &[u8],
+    spent_txouts: Option<&BlockSpentTxOuts>,
 ) -> anyhow::Result<BlockScanInput> {
     let block: Block = deserialize(bytes)?;
     let computed_hash = block.block_hash().to_byte_array();
@@ -1173,15 +1124,16 @@ fn decode_block_frame(
             });
         }
 
+        let silent_payment_tweak = compute_sp_tweak_from_undo(tx_index, &inputs, &outputs, spent_txouts)?;
+
         txs.push(TxScanInput {
             txid,
             tx_index,
             inputs,
             outputs,
-            // Filled later by the ordered indexer pass after compact prevout
-            // context is available. Decoding raw blocks is kept stateless and
-            // must not fabricate scan data.
-            silent_payment_tweak: None,
+            // Filled directly from Bitcoin Core undo data. Missing undo data is
+            // an indexer error, not a signal to use a local prevout database.
+            silent_payment_tweak,
         });
     }
 
@@ -1191,6 +1143,74 @@ fn decode_block_frame(
         previous_block_hash: BlockHashBytes::from(block.header.prev_blockhash.to_byte_array()),
         txs,
     })
+}
+
+fn compute_sp_tweak_from_undo(
+    tx_index: u32,
+    inputs: &[TxInputScan],
+    outputs: &[TxOutputScan],
+    spent_txouts: Option<&BlockSpentTxOuts>,
+) -> anyhow::Result<Option<TxTweak>> {
+    // Do not touch undo data unless this transaction creates at least one
+    // Taproot output. Only those transactions can need a served SP tweak.
+    if !outputs.iter().any(|output| output.is_p2tr) {
+        return Ok(None);
+    }
+    if tx_index == 0 {
+        return Ok(None);
+    }
+    let spent_txouts = spent_txouts.ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing spenttxouts undo data for tx_index={tx_index}; light-indexer requires /rest/spenttxouts"
+        )
+    })?;
+
+    let undo_tx_index = usize::try_from(tx_index)?;
+    let undo_inputs = spent_txouts.txs.get(undo_tx_index).ok_or_else(|| {
+        anyhow::anyhow!(
+            "spenttxouts missing tx entry for tx_index={tx_index}"
+        )
+    })?;
+    anyhow::ensure!(
+        undo_inputs.len() == inputs.len(),
+        "spenttxouts input count mismatch for tx_index={tx_index}: undo={} tx={}",
+        undo_inputs.len(),
+        inputs.len()
+    );
+
+    let mut input_context = Vec::with_capacity(inputs.len());
+    for (input, prevout) in inputs.iter().zip(undo_inputs) {
+        input_context.push(TxInputContext {
+            previous_output: input.previous_output,
+            script_sig: input.script_sig.clone(),
+            witness: input.witness.clone(),
+            prevout: Some(prevout_info_from_spent_txout(prevout)?),
+        });
+    }
+
+    match compute_tx_scan_point(&input_context)? {
+        ScanPointStatus::Computed(tweak) => Ok(Some(tweak)),
+        ScanPointStatus::Ineligible | ScanPointStatus::MissingPrevout { .. } => Ok(None),
+    }
+}
+
+fn prevout_info_from_spent_txout(prevout: &SpentTxOut) -> anyhow::Result<PrevoutInfo> {
+    let script = match classify_script(&prevout.script_pubkey) {
+        ScriptKind::P2pkh { hash160 } => PrevoutScript::P2pkh { hash160 },
+        ScriptKind::P2sh { hash160 } => PrevoutScript::P2sh { hash160 },
+        ScriptKind::P2wpkh { hash160 } => PrevoutScript::P2wpkh { hash160 },
+        ScriptKind::P2tr { xonly_key } => PrevoutScript::P2tr {
+            xonly_key: bitcoin::secp256k1::XOnlyPublicKey::from_slice(&xonly_key)?,
+        },
+        ScriptKind::WitnessUnknown { version, .. } if version >= 2 => {
+            PrevoutScript::WitnessUnknown { version }
+        }
+        ScriptKind::P2wsh { .. }
+        | ScriptKind::WitnessUnknown { .. }
+        | ScriptKind::OpReturn
+        | ScriptKind::Other => PrevoutScript::Other,
+    };
+    Ok(PrevoutInfo { script })
 }
 
 async fn source_tip_command(source: SourceCli) -> anyhow::Result<()> {
@@ -1654,8 +1674,9 @@ async fn restore_indexer_state(
     // replaces the former p2tr_utxo_lookup mirror table.
     let mut rows = sqlx::query(
         r#"SELECT o.txid, o.vout, o.uid, o.value_sat, o.script_pubkey, o.p2tr_xonly_key,
-                  o.created_height, o.created_block_hash, o.tx_index AS created_tx_index
+                  o.created_height, b.block_hash AS created_block_hash, o.tx_index AS created_tx_index
            FROM p2tr_outputs o
+           JOIN blocks b ON b.height = o.created_height
            LEFT JOIN p2tr_spends s ON s.uid = o.uid
            WHERE s.uid IS NULL
            ORDER BY o.uid"#,

@@ -2,7 +2,7 @@
 //!
 //! Concrete implementations live in `btc-data-sources`.
 
-use crate::block::RawBlockFrame;
+use crate::block::{BlockSpentTxOuts, RawBlockFrame};
 use async_trait::async_trait;
 use bytes::Bytes;
 
@@ -10,6 +10,27 @@ use bytes::Bytes;
 pub trait BlockSource: Send + Sync {
     async fn get_block_hash(&self, height: u64) -> anyhow::Result<[u8; 32]>;
     async fn get_block_raw(&self, hash: [u8; 32]) -> anyhow::Result<Bytes>;
+
+
+    /// Fetch Bitcoin Core-style per-block spent txouts / undo data when available.
+    async fn get_block_spent_txouts(
+        &self,
+        _hash: [u8; 32],
+    ) -> anyhow::Result<Option<BlockSpentTxOuts>> {
+        Ok(None)
+    }
+
+    /// Fetch undo data for an ordered list of block hashes.
+    async fn get_blocks_spent_txouts(
+        &self,
+        hashes: &[[u8; 32]],
+    ) -> anyhow::Result<Vec<Option<BlockSpentTxOuts>>> {
+        let mut out = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            out.push(self.get_block_spent_txouts(*hash).await?);
+        }
+        Ok(out)
+    }
 
     /// Current best chain height known by this source.
     ///
@@ -25,10 +46,12 @@ pub trait BlockSource: Send + Sync {
     async fn get_block_by_height(&self, height: u64) -> anyhow::Result<RawBlockFrame> {
         let hash = self.get_block_hash(height).await?;
         let bytes = self.get_block_raw(hash).await?;
+        let spent_txouts = self.get_block_spent_txouts(hash).await?;
         Ok(RawBlockFrame {
             height,
             hash,
             bytes,
+            spent_txouts,
         })
     }
 
@@ -58,6 +81,12 @@ pub trait BlockSource: Send + Sync {
     /// The default range fallback is intentionally not considered a batch, because
     /// grouping non-batch sources can reduce concurrency and delay ordered output.
     fn supports_block_range_batches(&self) -> bool {
+        false
+    }
+
+
+    /// True when this source provides spent prevouts / undo data with block frames.
+    fn supports_block_spent_txouts(&self) -> bool {
         false
     }
 

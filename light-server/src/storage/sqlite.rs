@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
+use std::collections::HashSet;
 use std::str::FromStr;
 
 #[derive(Debug, Clone)]
@@ -60,6 +61,134 @@ impl SqliteArchive {
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    pub async fn validate_schema_compatibility(&self) -> anyhow::Result<()> {
+        async fn table_columns(pool: &SqlitePool, table: &str) -> anyhow::Result<HashSet<String>> {
+            let rows = match table {
+                "blocks" => sqlx::query("PRAGMA table_info(blocks)")
+                    .fetch_all(pool)
+                    .await?,
+                "p2tr_outputs" => sqlx::query("PRAGMA table_info(p2tr_outputs)")
+                    .fetch_all(pool)
+                    .await?,
+                "p2tr_spends" => sqlx::query("PRAGMA table_info(p2tr_spends)")
+                    .fetch_all(pool)
+                    .await?,
+                "tx_tweaks" => sqlx::query("PRAGMA table_info(tx_tweaks)")
+                    .fetch_all(pool)
+                    .await?,
+                "payload_cache" => sqlx::query("PRAGMA table_info(payload_cache)")
+                    .fetch_all(pool)
+                    .await?,
+                "checkpoint_cache" => sqlx::query("PRAGMA table_info(checkpoint_cache)")
+                    .fetch_all(pool)
+                    .await?,
+                "profiles" => sqlx::query("PRAGMA table_info(profiles)")
+                    .fetch_all(pool)
+                    .await?,
+                _ => anyhow::bail!("internal error: unsupported schema table `{table}`"),
+            };
+            anyhow::ensure!(!rows.is_empty(), "missing required table `{table}`");
+            let mut columns = HashSet::with_capacity(rows.len());
+            for row in rows {
+                let name: String = row.try_get("name")?;
+                columns.insert(name);
+            }
+            Ok(columns)
+        }
+
+        fn require_columns(
+            table: &str,
+            columns: &HashSet<String>,
+            required: &[&str],
+        ) -> anyhow::Result<()> {
+            let missing = required
+                .iter()
+                .copied()
+                .filter(|name| !columns.contains(*name))
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                missing.is_empty(),
+                "database table `{table}` is missing required column(s): {}",
+                missing.join(", ")
+            );
+            Ok(())
+        }
+
+        let blocks = table_columns(&self.pool, "blocks").await?;
+        require_columns(
+            "blocks",
+            &blocks,
+            &[
+                "height",
+                "block_hash",
+                "previous_block_hash",
+                "anchor_last_uid",
+            ],
+        )?;
+
+        let p2tr_outputs = table_columns(&self.pool, "p2tr_outputs").await?;
+        require_columns(
+            "p2tr_outputs",
+            &p2tr_outputs,
+            &[
+                "uid",
+                "txid",
+                "created_height",
+                "tx_index",
+                "vout",
+                "value_sat",
+                "script_pubkey",
+                "p2tr_xonly_key",
+            ],
+        )?;
+
+        let p2tr_spends = table_columns(&self.pool, "p2tr_spends").await?;
+        require_columns(
+            "p2tr_spends",
+            &p2tr_spends,
+            &["uid", "spent_height", "spent_block_hash", "spend_tx_index"],
+        )?;
+
+        let tx_tweaks = table_columns(&self.pool, "tx_tweaks").await?;
+        require_columns("tx_tweaks", &tx_tweaks, &["height", "tx_index", "tweak"])?;
+
+        let payload_cache = table_columns(&self.pool, "payload_cache").await?;
+        require_columns(
+            "payload_cache",
+            &payload_cache,
+            &["profile_id", "height", "block_hash", "payload", "payload_len"],
+        )?;
+
+        let checkpoint_cache = table_columns(&self.pool, "checkpoint_cache").await?;
+        require_columns(
+            "checkpoint_cache",
+            &checkpoint_cache,
+            &[
+                "profile_id",
+                "height",
+                "block_hash",
+                "checkpoint",
+                "checkpoint_len",
+            ],
+        )?;
+
+        let profiles = table_columns(&self.pool, "profiles").await?;
+        require_columns(
+            "profiles",
+            &profiles,
+            &[
+                "profile_id",
+                "name",
+                "scope",
+                "cutthrough_blocks",
+                "served_tip_height",
+                "served_tip_hash",
+            ],
+        )?;
+
+        Ok(())
     }
 
     pub async fn meta_text(&self, key: &str) -> anyhow::Result<Option<String>> {
