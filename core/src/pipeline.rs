@@ -56,6 +56,7 @@ pub fn raw_block_stream(
                     height,
                     hash,
                     bytes,
+                    spent_txouts: None,
                 })
             }
         })

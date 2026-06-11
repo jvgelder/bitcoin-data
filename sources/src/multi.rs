@@ -5,7 +5,7 @@
 //! public endpoints.
 
 use async_trait::async_trait;
-use btc_data_core::block::RawBlockFrame;
+use btc_data_core::block::{BlockSpentTxOuts, RawBlockFrame};
 use btc_data_core::source::BlockSource;
 use bytes::Bytes;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -57,6 +57,45 @@ impl BlockSource for MultiSource {
                 Ok(b) => return Ok(b),
                 Err(e) => {
                     eprintln!("[{}] block fetch: {e}", src.name());
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap())
+    }
+
+
+    async fn get_block_spent_txouts(
+        &self,
+        hash: [u8; 32],
+    ) -> anyhow::Result<Option<BlockSpentTxOuts>> {
+        let n = self.sources.len();
+        let mut last_err = None;
+        for _ in 0..n {
+            let src = self.pick();
+            match src.get_block_spent_txouts(hash).await {
+                Ok(undo) => return Ok(undo),
+                Err(e) => {
+                    eprintln!("[{}] spenttxouts fetch: {e}", src.name());
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap())
+    }
+
+    async fn get_blocks_spent_txouts(
+        &self,
+        hashes: &[[u8; 32]],
+    ) -> anyhow::Result<Vec<Option<BlockSpentTxOuts>>> {
+        let n = self.sources.len();
+        let mut last_err = None;
+        for _ in 0..n {
+            let src = self.pick();
+            match src.get_blocks_spent_txouts(hashes).await {
+                Ok(undo) => return Ok(undo),
+                Err(e) => {
+                    eprintln!("[{}] spenttxouts batch fetch: {e}", src.name());
                     last_err = Some(e);
                 }
             }
@@ -125,6 +164,12 @@ impl BlockSource for MultiSource {
         self.sources
             .iter()
             .all(|source| source.supports_block_range_batches())
+    }
+
+    fn supports_block_spent_txouts(&self) -> bool {
+        self.sources
+            .iter()
+            .all(|source| source.supports_block_spent_txouts())
     }
 
     fn prefers_height_fetch(&self) -> bool {

@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
             if args.migrate {
                 archive.migrate().await?;
             }
+            archive.validate_schema_compatibility().await?;
             Arc::new(archive)
         }
         BackendKind::Files => Arc::new(FileArchive::new(args.archive)),

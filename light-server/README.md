@@ -94,7 +94,29 @@ btc_data_sources::RestSource
 btc_data_sources::PollingTipWatcher
 ```
 
-IPC is the preferred source. REST remains useful as a fallback/debug source.
+IPC is the default block source. REST can also be used as the block source. Undo data for Silent Payment tweak computation is always fetched from Bitcoin Core REST `/rest/spenttxouts`.
+
+Actual `light-indexer` source arguments:
+
+```text
+--source <ipc|rest>        block source, default: ipc
+--ipc-socket <PATH>        required when --source ipc
+--ipc-threads <N>          IPC worker threads, default: 8
+--rest-url <URL>           required for --source rest, and also required for --source ipc undo data
+--poll-interval-secs <N>   REST polling interval, default: 10
+```
+
+Use the REST base URL only, not an endpoint path:
+
+```text
+--rest-url http://127.0.0.1:8332
+```
+
+Bitcoin Core must have REST enabled:
+
+```conf
+rest=1
+```
 
 The intended run loop is:
 
@@ -107,7 +129,10 @@ The intended run loop is:
 6. wake, recompute finalized tip, repeat
 ```
 
-For IPC, `TipWatcher` should use Bitcoin Core IPC chain notifications (`waitForNotificationsIfTipChanged` / `waitForNotifications`), not polling. REST uses `PollingTipWatcher`.
+`light-indexer` no longer uses a RocksDB prevout store. Tweak data is derived from REST undo data.
+
+When `--source ipc` is used, blocks and tip watching come from IPC, while undo data comes from `--rest-url`.
+When `--source rest` is used, blocks, tip polling, and undo data all use the same REST source.
 
 ## Running the indexer
 
@@ -116,7 +141,8 @@ Check the IPC source:
 ```bash
 cargo run -p btc-data-light-server --bin light-indexer -- source-tip \
   --source ipc \
-  --ipc-socket /var/lib/bitcoind/.bitcoin/node.sock
+  --ipc-socket /var/lib/bitcoind/.bitcoin/node.sock \
+  --rest-url http://127.0.0.1:8332
 ```
 
 Fetch one block:
@@ -125,40 +151,38 @@ Fetch one block:
 cargo run -p btc-data-light-server --bin light-indexer -- fetch-block \
   --source ipc \
   --ipc-socket /var/lib/bitcoind/.bitcoin/node.sock \
+  --rest-url http://127.0.0.1:8332 \
   --height 709632 \
   --output block-709632.bin
 ```
 
-Run mainnet indexing with genesis prevout warmup and P2TR/SP emission from Taproot activation:
+Run mainnet indexing with P2TR/SP emission from Taproot activation. Tweak data is derived from `/rest/spenttxouts`; no RocksDB prevout store is used:
 
 ```bash
 cargo run -p btc-data-light-server --bin light-indexer -- run \
   --source ipc \
   --ipc-socket /var/lib/bitcoind/.bitcoin/node.sock \
+  --rest-url http://127.0.0.1:8332 \
   --database-url sqlite:lightdata-mainnet.db \
   --network mainnet \
   --scope p2tr-sp \
-  --finality-depth 6 \
-  --utxo-checkpoint-dir /var/lib/bitcoind/light-utxo-checkpoints \
-  --utxo-checkpoints-retain 3
+  --finality-depth 6
 ```
 
-For a smoke test that performs one pass and exits:
+For a REST-only smoke test that performs one pass and exits:
 
 ```bash
 cargo run -p btc-data-light-server --bin light-indexer -- run \
-  --source ipc \
-  --ipc-socket /var/lib/bitcoind/.bitcoin/node.sock \
+  --source rest \
+  --rest-url http://127.0.0.1:8332 \
   --database-url sqlite:lightdata-mainnet.db \
   --network mainnet \
   --scope p2tr-sp \
   --finality-depth 6 \
-  --utxo-checkpoint-dir /var/lib/bitcoind/light-utxo-checkpoints \
-  --utxo-checkpoints-retain 3 \
   --once
 ```
 
-REST fallback:
+Check the REST source:
 
 ```bash
 cargo run -p btc-data-light-server --bin light-indexer -- source-tip \
@@ -372,11 +396,11 @@ fake placeholder tweak emission: removed
 BIP352 scan-point computation: implemented for P2TR, P2WPKH, P2SH-P2WPKH, and P2PKH inputs
 ```
 
-If prevout context is missing or a transaction is not eligible under BIP352, live indexing omits tweak data rather than serving incorrect tweak data.
+If `/rest/spenttxouts` undo data is missing for a non-coinbase transaction that has Taproot outputs, live indexing fails rather than falling back to a local prevout database or serving guessed tweak data.
 
 ## BIP352 tweak computation requirements
 
-A correct Silent Payments tweak requires transaction input eligibility and prevout context.
+A correct Silent Payments tweak requires transaction input eligibility and spent prevout context. The live indexer obtains that context from Bitcoin Core `/rest/spenttxouts`.
 
 Eligible input types:
 
@@ -389,7 +413,7 @@ P2PKH
 
 Transactions should only emit tweak data if they have at least one Taproot output, at least one eligible input, and do not spend unsupported SegWit version > 1 outputs.
 
-The indexer needs enough prevout data to derive/sum eligible input public keys:
+The indexer needs enough undo/prevout data to derive/sum eligible input public keys:
 
 ```text
 P2TR:        spent prevout output key, except NUMS script-path inputs
@@ -476,7 +500,7 @@ sqlite3 lightdata-mainnet.db "SELECT key,value FROM meta ORDER BY key;"
 Expected live indexing log shape:
 
 ```text
-source=ipc:/path/node.sock watcher=ipc:/path/node.sock best_height=... finalized_tip=... next_height=709632 database=sqlite:lightdata-mainnet.db
+source=http://127.0.0.1:8332 watcher=polling:http://127.0.0.1:8332 best_height=... finalized_tip=... next_height=709632 database=sqlite:lightdata-mainnet.db
 fetched finalized range 709632..=709759 count=128 bytes=...
 indexed finalized range 709632..=709759 last_uid=... live_uids=...
 ```

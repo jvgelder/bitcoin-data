@@ -9,7 +9,6 @@ pub mod index;
 pub mod json_wire;
 pub mod output_id;
 pub mod p2tr_indexer;
-pub mod prevout_store;
 pub mod profile;
 pub mod range;
 pub mod script_classify;
