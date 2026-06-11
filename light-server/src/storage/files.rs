@@ -22,7 +22,6 @@ pub struct Manifest {
     pub version: u16,
     pub network: String,
     pub genesis_hash: Option<String>,
-    pub checkpoint_interval: u64,
     /// Depth after which server responses can be treated as practically immutable
     /// for caching. Payloads closer to tip remain replaceable on reorg.
     pub finality_depth: u64,
@@ -65,9 +64,6 @@ impl FileArchive {
     pub fn blocks_dir(&self) -> PathBuf {
         self.root.join("blocks")
     }
-    pub fn checkpoints_dir(&self) -> PathBuf {
-        self.root.join("checkpoints")
-    }
     pub fn stats_dir(&self) -> PathBuf {
         self.root.join("block_stats")
     }
@@ -80,10 +76,6 @@ impl FileArchive {
             .join(format!("{height:010}.{}.capnp", profile.file_tag()))
     }
 
-    pub fn checkpoint_path(&self, height: u64, profile: Profile) -> PathBuf {
-        self.checkpoints_dir()
-            .join(format!("{height:010}.{}.unspent.capnp", profile.file_tag()))
-    }
 
     pub fn block_stats_path(&self, height: u64) -> PathBuf {
         self.stats_dir().join(format!("{height:010}.stats.json"))
@@ -117,48 +109,6 @@ impl FileArchive {
         Ok(path)
     }
 
-    pub fn read_checkpoint(&self, height: u64, profile: Profile) -> anyhow::Result<Vec<u8>> {
-        let path = self.checkpoint_path(height, profile);
-        Ok(fs::read(path)?)
-    }
-
-    pub fn write_checkpoint_bytes(
-        &self,
-        height: u64,
-        profile: Profile,
-        bytes: &[u8],
-    ) -> anyhow::Result<PathBuf> {
-        fs::create_dir_all(self.checkpoints_dir())?;
-        let path = self.checkpoint_path(height, profile);
-        fs::write(&path, bytes)?;
-        Ok(path)
-    }
-
-    pub fn latest_checkpoint_height(
-        &self,
-        height_lte: u64,
-        profile: Profile,
-    ) -> anyhow::Result<Option<u64>> {
-        let dir = self.checkpoints_dir();
-        if !dir.exists() {
-            return Ok(None);
-        }
-        let suffix = format!(".{}.unspent.capnp", profile.file_tag());
-        let mut best = None;
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if let Some(prefix) = name.strip_suffix(&suffix) {
-                if let Ok(height) = prefix.parse::<u64>() {
-                    if height <= height_lte && best.is_none_or(|b| height > b) {
-                        best = Some(height);
-                    }
-                }
-            }
-        }
-        Ok(best)
-    }
 
     pub fn tip(&self, profile: Profile) -> anyhow::Result<Option<ChainTip>> {
         let manifest = self.read_manifest().ok();
@@ -308,21 +258,6 @@ impl crate::storage::ArchiveBackend for FileArchive {
         anyhow::bail!("file-backed archives do not support cut-through snapshots")
     }
 
-    async fn read_checkpoint(
-        &self,
-        height: u64,
-        profile: &crate::storage::ServedProfile,
-    ) -> anyhow::Result<Vec<u8>> {
-        self.read_checkpoint(height, profile.profile)
-    }
-
-    async fn latest_checkpoint_height(
-        &self,
-        height_lte: u64,
-        profile: &crate::storage::ServedProfile,
-    ) -> anyhow::Result<Option<u64>> {
-        self.latest_checkpoint_height(height_lte, profile.profile)
-    }
 
     async fn block_stats(&self, height: u64) -> anyhow::Result<serde_json::Value> {
         self.read_block_stats(height)

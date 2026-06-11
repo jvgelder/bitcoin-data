@@ -81,9 +81,6 @@ impl SqliteArchive {
                 "payload_cache" => sqlx::query("PRAGMA table_info(payload_cache)")
                     .fetch_all(pool)
                     .await?,
-                "checkpoint_cache" => sqlx::query("PRAGMA table_info(checkpoint_cache)")
-                    .fetch_all(pool)
-                    .await?,
                 "profiles" => sqlx::query("PRAGMA table_info(profiles)")
                     .fetch_all(pool)
                     .await?,
@@ -161,18 +158,6 @@ impl SqliteArchive {
             &["profile_id", "height", "block_hash", "payload", "payload_len"],
         )?;
 
-        let checkpoint_cache = table_columns(&self.pool, "checkpoint_cache").await?;
-        require_columns(
-            "checkpoint_cache",
-            &checkpoint_cache,
-            &[
-                "profile_id",
-                "height",
-                "block_hash",
-                "checkpoint",
-                "checkpoint_len",
-            ],
-        )?;
 
         let profiles = table_columns(&self.pool, "profiles").await?;
         require_columns(
@@ -325,11 +310,6 @@ impl ArchiveBackend for SqliteArchive {
             .await?
             .unwrap_or_else(|| "unknown".to_string());
         let genesis_hash = self.meta_text("genesis_hash").await?;
-        let checkpoint_interval = self
-            .meta_text("checkpoint_interval")
-            .await?
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(10_000);
         let finality_depth = self
             .meta_text("finality_depth")
             .await?
@@ -394,7 +374,6 @@ impl ArchiveBackend for SqliteArchive {
             version: WIRE_VERSION,
             network,
             genesis_hash,
-            checkpoint_interval,
             finality_depth,
             suggested_reorg_cache_depth,
             max_range_count: DEFAULT_MAX_RANGE_COUNT,
@@ -877,50 +856,6 @@ impl ArchiveBackend for SqliteArchive {
         })
     }
 
-    async fn read_checkpoint(
-        &self,
-        height: u64,
-        profile: &ServedProfile,
-    ) -> anyhow::Result<Vec<u8>> {
-        let profile_id = profile.profile_id;
-        let row = sqlx::query(
-            r#"SELECT checkpoint
-               FROM checkpoint_cache
-               WHERE profile_id = ? AND height = ?"#,
-        )
-        .bind(profile_id)
-        .bind(i64::try_from(height)?)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("checkpoint not found for height {height}"))?;
-        Ok(row.try_get("checkpoint")?)
-    }
-
-    async fn latest_checkpoint_height(
-        &self,
-        height_lte: u64,
-        profile: &ServedProfile,
-    ) -> anyhow::Result<Option<u64>> {
-        let profile_id = profile.profile_id;
-        let row = sqlx::query(
-            r#"SELECT height
-               FROM checkpoint_cache
-               WHERE profile_id = ? AND height <= ?
-               ORDER BY height DESC
-               LIMIT 1"#,
-        )
-        .bind(profile_id)
-        .bind(i64::try_from(height_lte)?)
-        .fetch_optional(&self.pool)
-        .await?;
-        match row {
-            Some(row) => {
-                let height: i64 = row.try_get("height")?;
-                Ok(Some(height.try_into()?))
-            }
-            None => Ok(None),
-        }
-    }
 
     async fn block_stats(&self, height: u64) -> anyhow::Result<serde_json::Value> {
         let row = sqlx::query(r#"SELECT * FROM block_stats WHERE height = ?"#)

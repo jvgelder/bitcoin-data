@@ -3,9 +3,7 @@ use bitcoin::hashes::Hash as BitcoinHash;
 use bitcoin::Block;
 use btc_data_core::block::{BlockSpentTxOuts, SpentTxOut};
 use btc_data_core::source::{BlockSource, TipWatcher};
-use btc_data_light_server::index::{
-    encode_light_block, encode_uid_checkpoint, to_packed_bytes, UidCheckpointInput,
-};
+use btc_data_light_server::index::{encode_light_block, to_packed_bytes};
 use btc_data_light_server::p2tr_indexer::{
     BlockScanInput, BlockScopeStats, OutPointKey, P2trIndexerState, ScopedUtxoEntry, TxInputScan,
     TxOutputScan, TxScanInput,
@@ -38,12 +36,10 @@ fn mb_to_bytes(mb: usize) -> usize {
 struct SqlTiming {
     core_cache_ms: u128,
     p2tr_output_ms: u128,
-    p2tr_utxo_insert_ms: u128,
     p2tr_key_stats_ms: u128,
     p2tr_spend_ms: u128,
-    p2tr_utxo_delete_ms: u128,
     tx_tweak_ms: u128,
-    checkpoint_profile_ms: u128,
+    profile_tip_ms: u128,
 }
 
 #[derive(Debug, Parser)]
@@ -393,14 +389,14 @@ async fn run_command(
     let mut state = restore_indexer_state(&archive, committed_profile_tip).await?;
     let initial_next_height = profile_next_height;
     println!(
-        "restored indexer state profile_tip={} next_height={} emit_start_height={} last_uid={} live_p2tr_utxos={} fetch_blocks={} flush_blocks={} decode_concurrency={} max_buffered_raw_mb={} index_p2tr_key_stats={}",
+        "restored indexer state profile_tip={} next_height={} emit_start_height={} last_uid={} live_p2tr_utxos={} fetch_blocks={} flush_blocks={} max_buffered_raw_mb={} index_p2tr_key_stats={}",
         committed_profile_tip
             .map(|h| h.to_string())
             .unwrap_or_else(|| "none".to_string()),
         initial_next_height,
         emit_start_height,
         state.last_uid(),
-        state.live_uids_sorted().len(),
+        state.live_uid_count(),
         catchup_batch_size,
         flush_blocks,
         max_buffered_raw_bytes / 1024 / 1024,
@@ -516,7 +512,7 @@ async fn catch_up_ranges(
     let first_height = start_height;
     let mut last_height = None;
     let mut last_hash: Option<BlockHashBytes> = None;
-    let mut total_bytes = 0usize;
+    let mut processed_raw_bytes_since_flush = 0usize;
     let mut total_fetch_elapsed = Duration::ZERO;
     let mut total_decode_elapsed = Duration::ZERO;
     let mut total_apply_elapsed = Duration::ZERO;
@@ -542,7 +538,7 @@ async fn catch_up_ranges(
         .await?;
         total_fetch_elapsed += chunk.fetch_elapsed;
         total_decode_elapsed += chunk.decode_elapsed;
-        total_bytes += chunk.raw_bytes;
+        processed_raw_bytes_since_flush += chunk.raw_bytes;
         let decoded = chunk.blocks;
 
         validate_decoded_chunk(&decoded, chunk_start, previous_tip_hash)?;
@@ -554,11 +550,12 @@ async fn catch_up_ranges(
         previous_tip_hash = Some(chunk_last.block_hash);
 
         println!(
-            "fetched finalized chunk {}..={} count={} bytes={} flush_target={}..={} buffered_blocks={}",
+            "fetched finalized chunk {}..={} count={} bytes={} live_raw_bytes=0 processed_raw_bytes_since_flush={} flush_target={}..={} pending_blocks={}",
             chunk_first_height,
             last_height.expect("last height set"),
             decoded.len(),
             chunk.raw_bytes,
+            processed_raw_bytes_since_flush,
             first_height,
             flush_end_height,
             pending.len()
@@ -581,11 +578,11 @@ async fn catch_up_ranges(
         let chunk_last_height = last_height.expect("last height set");
         chunk_start = chunk_last_height + 1;
 
-        if total_bytes >= max_buffered_raw_bytes && chunk_start <= flush_end_height {
+        if processed_raw_bytes_since_flush >= max_buffered_raw_bytes && chunk_start <= flush_end_height {
             println!(
-                "raw-byte flush cap reached at height {} buffered_raw_bytes={} cap_bytes={} pending_blocks={}",
+                "processed-raw-byte flush budget reached at height {} processed_raw_bytes_since_flush={} budget_bytes={} live_raw_bytes=0 pending_blocks={}",
                 chunk_last_height,
-                total_bytes,
+                processed_raw_bytes_since_flush,
                 max_buffered_raw_bytes,
                 pending.len()
             );
@@ -668,9 +665,8 @@ async fn catch_up_ranges(
     }
     sql_timing.core_cache_ms = core_cache_started.elapsed().as_millis();
 
-    // Stage 4: chain UTXO state is already applied in memory. Do not mirror it
-    // into SQLite's hot path; it is persisted as a binary checkpoint just before
-    // the SQL transaction commits and advances the served profile tip.
+    // Stage 4: persist lifecycle rows. Replay from the profile start remains
+    // deterministic, so no live UID snapshot is materialized here.
 
     let p2tr_created = pending
         .iter()
@@ -703,12 +699,6 @@ async fn catch_up_ranges(
         qb.build().execute(&mut *tx).await?;
     }
     sql_timing.p2tr_output_ms = p2tr_output_started.elapsed().as_millis();
-
-    // p2tr_utxo_lookup removed: it was only a durability mirror of the in-RAM
-    // live UID set. That set is rebuilt at startup from p2tr_outputs LEFT JOIN
-    // p2tr_spends (authoritative, written in this same transaction), so the
-    // per-range insert/delete churn on a 16M-row WITHOUT ROWID table is gone.
-    sql_timing.p2tr_utxo_insert_ms = 0;
 
     if index_p2tr_key_stats {
         let p2tr_key_stats_started = Instant::now();
@@ -760,9 +750,6 @@ async fn catch_up_ranges(
     }
     sql_timing.p2tr_spend_ms = p2tr_spend_started.elapsed().as_millis();
 
-    // See note above: no p2tr_utxo_lookup table to delete spent rows from.
-    sql_timing.p2tr_utxo_delete_ms = 0;
-
     let tx_tweak_started = Instant::now();
     let tx_tweaks = pending
         .iter()
@@ -790,49 +777,22 @@ async fn catch_up_ranges(
     }
     sql_timing.tx_tweak_ms = tx_tweak_started.elapsed().as_millis();
 
-    // checkpoint + profile tip: once per emitted range. During genesis warmup
-    // before the archive scope begins, only the UTXO checkpoint is advanced.
-    let checkpoint_profile_started = Instant::now();
-    let checkpoint_hash = last_hash;
-    let checkpoint_bytes = if pending.is_empty() {
-        Vec::new()
-    } else {
-        let checkpoint = UidCheckpointInput {
-            height: last_height,
-            block_hash: checkpoint_hash,
-            last_uid: state.last_uid(),
-            profile,
-            unspent_uids_sorted: state.live_uids_sorted(),
-        };
-        let checkpoint_bytes = to_packed_bytes(&encode_uid_checkpoint(&checkpoint)?)?;
-
-        sqlx::query(
-            r#"INSERT INTO checkpoint_cache
-               (profile_id, height, block_hash, checkpoint, checkpoint_len, created_at)
-               VALUES (?, ?, ?, ?, ?, unixepoch())"#,
-        )
-        .bind(profile_id)
-        .bind(i64::try_from(last_height)?)
-        .bind(checkpoint_hash.as_bytes().to_vec())
-        .bind(checkpoint_bytes.clone())
-        .bind(i64::try_from(checkpoint_bytes.len())?)
-        .execute(&mut *tx)
-        .await?;
-
+    // Advance the served profile tip once per emitted range. Deterministic
+    // replay from genesis/profile start plus committed SQL rows is the recovery model.
+    let profile_tip_started = Instant::now();
+    if !pending.is_empty() {
         sqlx::query(
             r#"UPDATE profiles
                SET served_tip_height = ?, served_tip_hash = ?
                WHERE profile_id = ?"#,
         )
         .bind(i64::try_from(last_height)?)
-        .bind(checkpoint_hash.as_bytes().to_vec())
+        .bind(last_hash.as_bytes().to_vec())
         .bind(profile_id)
         .execute(&mut *tx)
         .await?;
-
-        checkpoint_bytes
-    };
-    sql_timing.checkpoint_profile_ms = checkpoint_profile_started.elapsed().as_millis();
+    }
+    sql_timing.profile_tip_ms = profile_tip_started.elapsed().as_millis();
 
     // SQLite is now the only durable archive state. Undo data is fetched from
     // Bitcoin Core per block, so there is no secondary prevout database to keep
@@ -867,16 +827,15 @@ async fn catch_up_ranges(
     let processed_blocks = last_height - first_height + 1;
 
     println!(
-        "indexed finalized range {}..={} blocks={} served_blocks={} flush_blocks={} decode_concurrency={} max_buffered_raw_bytes={} raw_bytes={} payload_bytes={} checkpoint_bytes={} txs={} outputs={} p2tr_outputs={} indexed_created={} indexed_spent={} tx_tweaks={} last_uid={} live_uids={} fetch_ms={} decode_ms={} apply_ms={} sql_ms={} sql_core_cache_ms={} sql_p2tr_output_ms={} sql_p2tr_utxo_insert_ms={} sql_p2tr_key_stats_ms={} sql_p2tr_spend_ms={} sql_p2tr_utxo_delete_ms={} sql_tx_tweak_ms={} sql_checkpoint_profile_ms={} commit_ms={} total_ms={}",
+        "indexed finalized range {}..={} blocks={} served_blocks={} flush_blocks={} processed_raw_byte_budget={} processed_raw_bytes={} live_raw_bytes=0 payload_bytes={} txs={} outputs={} p2tr_outputs={} indexed_created={} indexed_spent={} tx_tweaks={} last_uid={} live_uids={} fetch_ms={} decode_ms={} apply_ms={} sql_ms={} sql_core_cache_ms={} sql_p2tr_output_ms={} sql_p2tr_key_stats_ms={} sql_p2tr_spend_ms={} sql_tx_tweak_ms={} sql_profile_tip_ms={} commit_ms={} total_ms={}",
         first_height,
         last_height,
         processed_blocks,
         pending.len(),
         flush_blocks,
         max_buffered_raw_bytes,
-        total_bytes,
+        processed_raw_bytes_since_flush,
         payload_bytes,
-        checkpoint_bytes.len(),
         totals.tx_count,
         totals.output_count_total,
         totals.p2tr_output_count,
@@ -891,12 +850,10 @@ async fn catch_up_ranges(
         sql_elapsed.as_millis(),
         sql_timing.core_cache_ms,
         sql_timing.p2tr_output_ms,
-        sql_timing.p2tr_utxo_insert_ms,
         sql_timing.p2tr_key_stats_ms,
         sql_timing.p2tr_spend_ms,
-        sql_timing.p2tr_utxo_delete_ms,
         sql_timing.tx_tweak_ms,
-        sql_timing.checkpoint_profile_ms,
+        sql_timing.profile_tip_ms,
         commit_elapsed.as_millis(),
         total_elapsed.as_millis(),
     );
@@ -1298,11 +1255,9 @@ type FixtureBlocks = (
         Vec<u8>,
         BlockScopeStats,
     )>,
-    Vec<u8>,
     u64,
     BlockHashBytes,
     u64,
-    Vec<u64>,
 );
 
 fn fixture_blocks(
@@ -1415,25 +1370,9 @@ fn fixture_blocks(
         ));
     }
 
-    let checkpoint_height = start_height + count - 1;
-    let checkpoint = UidCheckpointInput {
-        height: checkpoint_height,
-        block_hash: tip_hash,
-        last_uid: state.last_uid(),
-        profile,
-        unspent_uids_sorted: state.live_uids_sorted(),
-    };
+    let tip_height = start_height + count - 1;
 
-    let checkpoint_bytes = to_packed_bytes(&encode_uid_checkpoint(&checkpoint)?)?;
-
-    Ok((
-        blocks,
-        checkpoint_bytes,
-        checkpoint_height,
-        tip_hash,
-        state.last_uid(),
-        state.live_uids_sorted(),
-    ))
+    Ok((blocks, tip_height, tip_hash, state.last_uid()))
 }
 
 fn write_fixture_archive(
@@ -1449,21 +1388,18 @@ fn write_fixture_archive(
         cutthrough_blocks: 0,
     };
 
-    let (blocks, checkpoint_bytes, checkpoint_height, tip_hash, _last_uid, _live) =
-        fixture_blocks(scope, start_height, count)?;
+    let (blocks, tip_height, tip_hash, _last_uid) = fixture_blocks(scope, start_height, count)?;
 
     for (height, _hash, _prev_hash, _anchor_last_uid, bytes, stats) in blocks {
         archive.write_block_bytes(height, profile, &bytes)?;
         archive.write_block_stats(height, &stats)?;
     }
 
-    archive.write_checkpoint_bytes(checkpoint_height, profile, &checkpoint_bytes)?;
 
     archive.write_manifest(&Manifest {
         version: btc_data_light_server::WIRE_VERSION,
         network: network.to_string(),
         genesis_hash: None,
-        checkpoint_interval: count,
         finality_depth: 6,
         suggested_reorg_cache_depth: 144,
         max_range_count: btc_data_light_server::DEFAULT_MAX_RANGE_COUNT,
@@ -1471,7 +1407,7 @@ fn write_fixture_archive(
             scope,
             cutthrough_blocks: 0,
             tip: Some(ChainTip {
-                height: checkpoint_height,
+                height: tip_height,
                 block_hash: hex::encode(tip_hash.as_bytes()),
             }),
         }],
@@ -1507,8 +1443,7 @@ async fn write_fixture_db(
 
     let db_profile = archive.resolve_profile(None, Some(profile)).await?;
 
-    let (blocks, checkpoint_bytes, checkpoint_height, tip_hash, _last_uid, _live) =
-        fixture_blocks(scope, start_height, count)?;
+    let (blocks, tip_height, tip_hash, _last_uid) = fixture_blocks(scope, start_height, count)?;
 
     let mut tx = archive.pool().begin().await?;
 
@@ -1565,25 +1500,13 @@ async fn write_fixture_db(
         .await?;
     }
 
-    sqlx::query(
-        r#"INSERT INTO checkpoint_cache
-           (profile_id, height, block_hash, checkpoint, checkpoint_len, created_at)
-           VALUES (?, ?, ?, ?, ?, unixepoch())"#,
-    )
-    .bind(db_profile.profile_id)
-    .bind(i64::try_from(checkpoint_height)?)
-    .bind(tip_hash.as_bytes().to_vec())
-    .bind(checkpoint_bytes.clone())
-    .bind(i64::try_from(checkpoint_bytes.len())?)
-    .execute(&mut *tx)
-    .await?;
 
     sqlx::query(
         r#"UPDATE profiles
            SET served_tip_height = ?, served_tip_hash = ?
            WHERE profile_id = ?"#,
     )
-    .bind(i64::try_from(checkpoint_height)?)
+    .bind(i64::try_from(tip_height)?)
     .bind(tip_hash.as_bytes().to_vec())
     .bind(db_profile.profile_id)
     .execute(&mut *tx)
@@ -1826,21 +1749,6 @@ async fn validate_resume_boundary(
         );
     }
 
-    let checkpoint_exists = sqlx::query_scalar::<_, i64>(
-        r#"SELECT COUNT(*)
-           FROM checkpoint_cache
-           WHERE profile_id = ? AND height = ?"#,
-    )
-    .bind(profile_id)
-    .bind(i64::try_from(served_tip)?)
-    .fetch_one(archive.pool())
-    .await?;
-    anyhow::ensure!(
-        checkpoint_exists == 1,
-        "missing checkpoint at committed profile tip height {} for profile {}",
-        served_tip,
-        profile_id
-    );
 
     Ok(())
 }

@@ -10,8 +10,7 @@ INSERT OR IGNORE INTO meta(key, value) VALUES
   ('scope', 'p2tr-sp'),
   ('network', 'mainnet'),
   ('finality_depth', '6'),
-  ('suggested_reorg_cache_depth', '24'),
-  ('checkpoint_interval', '10000');
+  ('suggested_reorg_cache_depth', '24');
 
 CREATE TABLE IF NOT EXISTS blocks (
   height INTEGER PRIMARY KEY CHECK(height >= 0),
@@ -146,17 +145,6 @@ CREATE TABLE IF NOT EXISTS payload_cache (
   FOREIGN KEY(height) REFERENCES blocks(height)
 ) WITHOUT ROWID;
 
-CREATE TABLE IF NOT EXISTS checkpoint_cache (
-  profile_id INTEGER NOT NULL,
-  height INTEGER NOT NULL,
-  block_hash BLOB NOT NULL CHECK(length(block_hash) = 32),
-  checkpoint BLOB NOT NULL CHECK(length(checkpoint) = checkpoint_len),
-  checkpoint_len INTEGER NOT NULL CHECK(checkpoint_len >= 0),
-  created_at INTEGER NOT NULL,
-  PRIMARY KEY(profile_id, height),
-  FOREIGN KEY(profile_id) REFERENCES profiles(profile_id),
-  FOREIGN KEY(height) REFERENCES blocks(height)
-) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS cutthrough_snapshot_cache (
   profile_id INTEGER NOT NULL,

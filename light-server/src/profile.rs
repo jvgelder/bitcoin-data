@@ -137,7 +137,7 @@ impl fmt::Display for ArchiveScope {
 pub struct Profile {
     pub scope: ArchiveScope,
     /// 0 means raw/no cut-through. Non-zero profiles are materialized from the
-    /// same canonical scope and must use matching checkpoints.
+    /// same canonical scope and have their own served tips.
     pub cutthrough_blocks: u32,
 }
 

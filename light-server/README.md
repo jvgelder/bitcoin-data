@@ -5,7 +5,7 @@ Prototype crate for a Silent Payments light-data archive.
 The crate has two main binaries:
 
 - `light-indexer`: reads Bitcoin blocks from `btc-data-sources`, builds the light archive, and writes SQLite/file-backed payloads.
-- `light-server`: serves cached light blocks, ranges, checkpoints, manifests, and debug statistics over HTTP.
+- `light-server`: serves cached light blocks, ranges, manifests, cut-through streams, and debug statistics over HTTP.
 
 The production path is SQLite-first. File-backed archives remain useful for fixtures and decoder tests.
 
@@ -19,7 +19,7 @@ uid += 1 for every P2TR output in the selected scope.
 non-P2TR outputs do not receive UIDs.
 reused P2TR output keys are included and receive UIDs.
 spent streams contain spends of scoped UIDs only.
-checkpoints contain live unspent scoped UIDs only.
+checkpoints are not generated or served; deterministic replay from the profile start is the recovery model.
 ```
 
 Archive scope is deterministic and fixed for a database/archive. Changing from `p2tr-sp` to `p2tr` or `all-outputs` requires a full rescan because the UID namespace changes.
@@ -72,8 +72,8 @@ There are no profile toggles for reuse filtering or NUMS filtering. This avoids 
 - `src/bin/light_indexer.rs`: CLI for fixture generation, source checks, raw block fetching, and live SQLite indexing.
 - `src/bin/light_server.rs`: HTTP server entrypoint.
 - `src/p2tr_indexer.rs`: source-agnostic scoped UID state, `outpoint -> uid`, live UID mutation state, reuse counting, spend tracking, and conversion to `LightBlockInput`.
-- `src/index.rs`: `LightBlock` and `UidCheckpoint` encoders, Elias-delta spent UID encoding, and fixed tx tweak index encoding.
-- `src/server.rs`: Axum routes for `/health`, `/manifest`, `/tip`, block range, single block, checkpoints, latest checkpoint, and debug block stats.
+- `src/index.rs`: `LightBlock` encoders, Elias-delta spent UID encoding, and fixed tx tweak index encoding.
+- `src/server.rs`: Axum routes for `/health`, `/manifest`, `/tip`, block range, single block, cut-through streams, and debug block stats.
 - `src/storage/backend.rs`: storage interface used by HTTP routes.
 - `src/storage/sqlite.rs`: SQLx/SQLite implementation of `ArchiveBackend`.
 - `src/storage/files.rs`: file-backed implementation for fixtures/local tests.
@@ -253,7 +253,6 @@ The production serving path reads exact cached wire bytes:
 
 ```text
 payload_cache(profile_id, height)      -> serialized LightBlock bytes
-checkpoint_cache(profile_id, height)   -> serialized UidCheckpoint bytes
 ```
 
 ## Client-facing API examples
@@ -290,15 +289,6 @@ curl -H 'Accept: application/octet-stream' \
 curl -H 'Accept: application/octet-stream' \
   -o range-ct.bdsr \
   'http://127.0.0.1:3000/blocks/light/cutthrough?start=709632&count=1000&scope=p2tr-sp'
-
-# Latest full checkpoint before a height.
-curl -o checkpoint.capnp \
-  'http://127.0.0.1:3000/checkpoints/latest?height_lte=710000&scope=p2tr-sp'
-
-# Latest cut-through checkpoint before a height. This is explicit because it is
-# a different profile/state snapshot from the full checkpoint.
-curl -o checkpoint-ct.capnp \
-  'http://127.0.0.1:3000/checkpoints/latest/cutthrough?height_lte=710000&scope=p2tr-sp'
 
 # Per-block stats.
 curl 'http://127.0.0.1:3000/debug/blocks/709632/stats'
@@ -343,7 +333,7 @@ This keeps wallet clients from using a reduced stream for the recent reorg windo
 
 ## Wallet cold-boot flow
 
-A v1 Silent Payments wallet client should not use UID checkpoints for output discovery. A checkpoint contains only the live unspent UID set at a height; it does not contain transaction tweaks, output identifiers, output refs, labels, or creation history. The wallet must scan block payloads to discover its own outputs.
+A v1 Silent Payments wallet client scans block payloads from its profile start. Checkpoints are intentionally removed for now; cut-through-from-genesis/profile-start is deterministic and avoids a large checkpoint materialization path in the indexer.
 
 Recommended cold boot:
 
@@ -445,8 +435,8 @@ resolve_profile()
 tip()
 read_block()
 read_blocks()
-read_checkpoint()
-latest_checkpoint_height()
+read_cutthrough_delta_blocks()
+read_cutthrough_snapshot()
 block_stats()
 ```
 
@@ -466,11 +456,9 @@ block_exclusion_stats
 profiles
 p2tr_outputs
 p2tr_spends
-p2tr_utxo_lookup
 p2tr_key_stats
 tx_tweaks
 payload_cache
-checkpoint_cache
 ```
 
 Important invariants:
@@ -484,7 +472,7 @@ p2tr_reused_count is counted but not subtracted from p2tr-sp
 p2tr_nums_count is not an output-exclusion count; NUMS is input-side for BIP352 tweaks
 ```
 
-During indexing, live UIDs are kept in a hash set for fast insert/remove. Checkpoint materialization collects and sorts live UIDs for deterministic encoding.
+During indexing, live UIDs are kept in memory for fast insert/remove. The indexer does not materialize UID checkpoints; committed SQL rows and deterministic replay define recovery state.
 
 ## Debug and validation commands
 

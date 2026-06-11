@@ -2,7 +2,7 @@
 //!
 //! The server depends only on [`ArchiveBackend`]. Concrete implementations live
 //! behind this module:
-//! - [`SqliteArchive`] serves cached payload/checkpoint bytes from SQLite via SQLx.
+//! - [`SqliteArchive`] serves cached payload bytes from SQLite via SQLx.
 //! - [`FileArchive`] serves fixture/static archives from files per block.
 
 pub mod backend;
