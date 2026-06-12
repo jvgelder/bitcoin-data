@@ -9,7 +9,6 @@
 use crate::p2tr_indexer::OutPointKey;
 use crate::script_classify::{classify_script, ScriptKind};
 use crate::types::TxTweak;
-use anyhow::{anyhow, Context};
 use bitcoin::hashes::{hash160, Hash};
 use bitcoin::secp256k1::{Parity, PublicKey, Scalar, Secp256k1, XOnlyPublicKey};
 use sha2::{Digest, Sha256};
@@ -19,6 +18,26 @@ const TAPROOT_NUMS_H_XONLY: [u8; 32] = [
     0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a, 0x5e,
     0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80, 0x3a, 0xc0,
 ];
+
+#[derive(Debug, thiserror::Error)]
+pub enum SpTweakError {
+    #[error("eligible input public-key sum is infinity")]
+    PublicKeySumInfinity,
+    #[error("non-empty non-coinbase input set expected")]
+    EmptyNonCoinbaseInputSet,
+    #[error("BIP352 input hash is not a valid secp256k1 scalar")]
+    InvalidInputHashScalar,
+    #[error("BIP352 scan point multiplication failed")]
+    ScanPointMultiplication,
+    #[error("invalid compressed input public key")]
+    InvalidCompressedInputPublicKey {
+        #[source]
+        source: bitcoin::secp256k1::Error,
+    },
+}
+
+pub type SpTweakResult<T> = Result<T, SpTweakError>;
+
 
 #[derive(Debug, Clone, Copy)]
 pub struct PrevoutInfo {
@@ -55,7 +74,7 @@ pub enum ScanPointStatus {
     Computed(TxTweak),
 }
 
-pub fn compute_tx_scan_point(inputs: &[TxInputContext]) -> anyhow::Result<ScanPointStatus> {
+pub fn compute_tx_scan_point(inputs: &[TxInputContext]) -> SpTweakResult<ScanPointStatus> {
     if inputs.is_empty()
         || inputs
             .iter()
@@ -99,21 +118,21 @@ pub fn compute_tx_scan_point(inputs: &[TxInputContext]) -> anyhow::Result<ScanPo
 
     let pubkey_refs = eligible_pubkeys.iter().collect::<Vec<_>>();
     let sum = PublicKey::combine_keys(&pubkey_refs)
-        .context("eligible input public-key sum is infinity")?;
+        .map_err(|_| SpTweakError::PublicKeySumInfinity)?;
 
     let outpoint_l = smallest_non_coinbase_outpoint(inputs)
-        .ok_or_else(|| anyhow!("non-empty non-coinbase input set expected"))?;
+        .ok_or(SpTweakError::EmptyNonCoinbaseInputSet)?;
     let mut input_hash_preimage = Vec::with_capacity(36 + 33);
     input_hash_preimage.extend_from_slice(&outpoint_l);
     input_hash_preimage.extend_from_slice(&sum.serialize());
 
     let input_hash = tagged_sha256(BIP352_INPUTS_TAG, &input_hash_preimage);
     let scalar = Scalar::from_be_bytes(input_hash)
-        .map_err(|_| anyhow!("BIP352 input hash is not a valid secp256k1 scalar"))?;
+        .map_err(|_| SpTweakError::InvalidInputHashScalar)?;
 
     let scan_point = sum
         .mul_tweak(&secp, &scalar)
-        .context("BIP352 scan point multiplication failed")?;
+        .map_err(|_| SpTweakError::ScanPointMultiplication)?;
 
     Ok(ScanPointStatus::Computed(TxTweak::from(
         scan_point.serialize(),
@@ -134,7 +153,7 @@ fn spends_witness_version_greater_than_one(inputs: &[TxInputContext]) -> bool {
 fn extract_bip352_input_pubkey(
     input: &TxInputContext,
     prevout: &PrevoutInfo,
-) -> anyhow::Result<Option<PublicKey>> {
+) -> SpTweakResult<Option<PublicKey>> {
     match prevout.script {
         PrevoutScript::P2tr { xonly_key } => extract_p2tr_input_pubkey(input, xonly_key),
         PrevoutScript::P2wpkh { hash160 } => extract_p2wpkh_input_pubkey(input, hash160),
@@ -147,7 +166,7 @@ fn extract_bip352_input_pubkey(
 fn extract_p2tr_input_pubkey(
     input: &TxInputContext,
     xonly_key: XOnlyPublicKey,
-) -> anyhow::Result<Option<PublicKey>> {
+) -> SpTweakResult<Option<PublicKey>> {
     if let Some(internal_key) = taproot_script_path_internal_key(&input.witness) {
         if internal_key == TAPROOT_NUMS_H_XONLY {
             return Ok(None);
@@ -160,7 +179,7 @@ fn extract_p2tr_input_pubkey(
 fn extract_p2wpkh_input_pubkey(
     input: &TxInputContext,
     expected_hash: [u8; 20],
-) -> anyhow::Result<Option<PublicKey>> {
+) -> SpTweakResult<Option<PublicKey>> {
     let Some(pubkey_bytes) = input.witness.last() else {
         return Ok(None);
     };
@@ -170,7 +189,7 @@ fn extract_p2wpkh_input_pubkey(
 fn extract_p2sh_p2wpkh_input_pubkey(
     input: &TxInputContext,
     expected_script_hash: [u8; 20],
-) -> anyhow::Result<Option<PublicKey>> {
+) -> SpTweakResult<Option<PublicKey>> {
     let pushes = parse_script_pushes(&input.script_sig);
     let Some(redeem_script) = pushes
         .iter()
@@ -192,7 +211,7 @@ fn extract_p2sh_p2wpkh_input_pubkey(
 fn extract_p2pkh_input_pubkey(
     input: &TxInputContext,
     expected_hash: [u8; 20],
-) -> anyhow::Result<Option<PublicKey>> {
+) -> SpTweakResult<Option<PublicKey>> {
     for push in parse_script_pushes(&input.script_sig).into_iter().rev() {
         if let Some(pubkey) = parse_compressed_pubkey_matching_hash(&push, expected_hash)? {
             return Ok(Some(pubkey));
@@ -204,7 +223,7 @@ fn extract_p2pkh_input_pubkey(
 fn parse_compressed_pubkey_matching_hash(
     bytes: &[u8],
     expected_hash: [u8; 20],
-) -> anyhow::Result<Option<PublicKey>> {
+) -> SpTweakResult<Option<PublicKey>> {
     if bytes.len() != 33 || !matches!(bytes.first(), Some(0x02 | 0x03)) {
         return Ok(None);
     }
@@ -212,7 +231,8 @@ fn parse_compressed_pubkey_matching_hash(
         return Ok(None);
     }
     Ok(Some(
-        PublicKey::from_slice(bytes).context("invalid compressed input public key")?,
+        PublicKey::from_slice(bytes)
+            .map_err(|source| SpTweakError::InvalidCompressedInputPublicKey { source })?,
     ))
 }
 

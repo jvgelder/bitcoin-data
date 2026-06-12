@@ -15,7 +15,7 @@ use crate::profile::Profile;
 use crate::types::{BlockHashBytes, OutputIdHash, TxTweak, TxidBytes};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 pub const OUTPUT_ID_COLLISION_PROBABILITY_LOG2: u32 = 20;
 
@@ -62,7 +62,7 @@ pub struct CreatedScopedUtxo {
 
 #[derive(Debug, Clone)]
 pub struct SpentScopedUtxo {
-    pub entry: ScopedUtxoEntry,
+    pub uid: u64,
     pub spent_height: u64,
     pub spent_block_hash: BlockHashBytes,
     pub spend_tx_index: u32,
@@ -139,8 +139,15 @@ pub struct AppliedBlock {
 #[derive(Debug, Default)]
 pub struct P2trIndexerState {
     next_uid: u64,
-    outpoint_to_entry: HashMap<OutPointKey, ScopedUtxoEntry>,
-    live_uids: BTreeSet<u64>,
+    /// Minimal spend index. A Bitcoin input only gives us `(txid, vout)`, and
+    /// the light payload only needs the corresponding UID for spent-ID output.
+    /// Full output metadata is carried by `CreatedScopedUtxo` until it is
+    /// flushed to SQLite; it is not retained in the long-lived state.
+    outpoint_to_uid: HashMap<OutPointKey, u64>,
+    /// Counts live indexed outputs, including historical DB outputs restored by
+    /// count only. Historical outputs are not materialized in `outpoint_to_uid`
+    /// unless a chunk may spend them.
+    live_uid_count: usize,
     seen_p2tr_keys: Option<HashSet<[u8; 32]>>,
 }
 
@@ -148,8 +155,8 @@ impl P2trIndexerState {
     pub fn new() -> Self {
         Self {
             next_uid: 0,
-            outpoint_to_entry: HashMap::new(),
-            live_uids: BTreeSet::new(),
+            outpoint_to_uid: HashMap::new(),
+            live_uid_count: 0,
             seen_p2tr_keys: Some(HashSet::new()),
         }
     }
@@ -161,13 +168,13 @@ impl P2trIndexerState {
     ) -> Self {
         let mut state = Self {
             next_uid: last_uid,
-            outpoint_to_entry: HashMap::new(),
-            live_uids: BTreeSet::new(),
+            outpoint_to_uid: HashMap::new(),
+            live_uid_count: 0,
             seen_p2tr_keys: Some(seen_keys.into_iter().collect()),
         };
         for entry in live_entries {
-            state.live_uids.insert(entry.uid);
-            state.outpoint_to_entry.insert(entry.outpoint, entry);
+            state.live_uid_count += 1;
+            state.outpoint_to_uid.insert(entry.outpoint, entry.uid);
         }
         state
     }
@@ -178,23 +185,65 @@ impl P2trIndexerState {
     ) -> Self {
         let mut state = Self {
             next_uid: last_uid,
-            outpoint_to_entry: HashMap::new(),
-            live_uids: BTreeSet::new(),
+            outpoint_to_uid: HashMap::new(),
+            live_uid_count: 0,
             seen_p2tr_keys: None,
         };
         for entry in live_entries {
-            state.live_uids.insert(entry.uid);
-            state.outpoint_to_entry.insert(entry.outpoint, entry);
+            state.live_uid_count += 1;
+            state.outpoint_to_uid.insert(entry.outpoint, entry.uid);
         }
         state
     }
 
-    pub fn live_uid_count(&self) -> usize {
-        self.live_uids.len()
+    pub fn restore_counts_only(last_uid: u64, live_uid_count: usize) -> Self {
+        Self {
+            next_uid: last_uid,
+            outpoint_to_uid: HashMap::new(),
+            live_uid_count,
+            seen_p2tr_keys: None,
+        }
     }
 
-    pub fn live_entries(&self) -> impl Iterator<Item = &ScopedUtxoEntry> {
-        self.outpoint_to_entry.values()
+    /// Cache historical spend candidates loaded from SQLite for the current
+    /// decoded chunk. This intentionally stores only `OutPointKey -> uid`; value,
+    /// script, creation height/hash and output key are not needed for spend UID
+    /// accounting. Returned outpoints can be evicted after the chunk is applied.
+    pub fn cache_spend_uid_candidates(
+        &mut self,
+        candidates: impl IntoIterator<Item = (OutPointKey, u64)>,
+    ) -> Vec<OutPointKey> {
+        let mut cached = Vec::new();
+        for (outpoint, uid) in candidates {
+            if let std::collections::hash_map::Entry::Vacant(slot) =
+                self.outpoint_to_uid.entry(outpoint)
+            {
+                slot.insert(uid);
+                cached.push(outpoint);
+            }
+        }
+        cached
+    }
+
+    /// Remove unspent historical candidates after a chunk. If a candidate was
+    /// actually spent, `apply_block_with_stats` has already removed it and
+    /// decremented `live_uid_count`; this method only drops lookup-only cache
+    /// entries and must not adjust the live count.
+    pub fn evict_spend_uid_candidates(
+        &mut self,
+        cached_outpoints: impl IntoIterator<Item = OutPointKey>,
+    ) -> usize {
+        let mut evicted = 0usize;
+        for outpoint in cached_outpoints {
+            if self.outpoint_to_uid.remove(&outpoint).is_some() {
+                evicted += 1;
+            }
+        }
+        evicted
+    }
+
+    pub fn live_uid_count(&self) -> usize {
+        self.live_uid_count
     }
 
     pub fn last_uid(&self) -> u64 {
@@ -202,7 +251,9 @@ impl P2trIndexerState {
     }
 
     pub fn live_uids_sorted(&self) -> Vec<u64> {
-        self.live_uids.iter().copied().collect()
+        let mut uids = self.outpoint_to_uid.values().copied().collect::<Vec<_>>();
+        uids.sort_unstable();
+        uids
     }
 
     /// Compatibility alias for earlier P2TR-only code.
@@ -251,11 +302,11 @@ impl P2trIndexerState {
             let mut tx_has_indexed_output = false;
 
             for input in &tx.inputs {
-                if let Some(entry) = self.outpoint_to_entry.remove(&input.previous_output) {
-                    self.live_uids.remove(&entry.uid);
-                    spent_uids.push(entry.uid);
+                if let Some(uid) = self.outpoint_to_uid.remove(&input.previous_output) {
+                    self.live_uid_count = self.live_uid_count.saturating_sub(1);
+                    spent_uids.push(uid);
                     spent_utxos.push(SpentScopedUtxo {
-                        entry,
+                        uid,
                         spent_height: block.height,
                         spent_block_hash: block.block_hash,
                         spend_tx_index: tx.tx_index,
@@ -331,8 +382,8 @@ impl P2trIndexerState {
                     script_pubkey: output.script_pubkey.clone(),
                     p2tr_xonly_key,
                 };
-                self.outpoint_to_entry.insert(outpoint, entry.clone());
-                self.live_uids.insert(uid);
+                self.outpoint_to_uid.insert(outpoint, uid);
+                self.live_uid_count += 1;
                 created_utxos.push(CreatedScopedUtxo {
                     entry,
                     is_nums: output.is_nums,
