@@ -1,23 +1,18 @@
 //! P2TR/SP archive builder primitives.
 //!
 //! This module is source-agnostic. A Bitcoin Core REST/RPC adapter can decode
-//! blocks and feed `BlockScanInput` values here. UID assignment is scoped by
-//! `Profile.scope`:
-//!
-//! - `p2tr-sp`: every P2TR output receives a UID. Reused keys are included.
-//!   NUMS is handled on input-side BIP352 spend eligibility, not output creation.
-//! - `p2tr`: every P2TR output receives a UID, including reused keys.
-//! - `all-outputs`: every output receives a UID; callers must provide canonical identity bytes.
+//! blocks and feed `BlockScanInput` values here. The archive currently has one
+//! fixed scope: every P2TR output receives a UID. Reused keys are included.
+//! NUMS is handled on input-side BIP352 spend eligibility, not output creation.
 
-use crate::index::{LightBlockInput, OutputRefInput};
-use crate::output_id::{choose_output_id_bytes, truncate_into_packed};
-use crate::profile::Profile;
-use crate::types::{BlockHashBytes, OutputIdHash, TxTweak, TxidBytes};
+use crate::index::{
+    LightBlockInput, OutputEntryInput, SpendEntryInput, StoredLightBlockInput,
+    StoredOutputEntryInput, StoredSpendEntryInput, StoredTweakEntryInput, TweakEntryInput,
+    STORAGE_OUTPUT_FLAG_REUSED, STORAGE_SPENT_HEIGHT_UNSPENT,
+};
+use crate::types::{BlockHashBytes, TxTweak, TxidBytes};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-
-pub const OUTPUT_ID_COLLISION_PROBABILITY_LOG2: u32 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OutPointKey {
@@ -29,6 +24,13 @@ impl OutPointKey {
     pub fn is_coinbase(&self) -> bool {
         self.vout == u32::MAX && self.txid.as_bytes() == &[0u8; 32]
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpendLookup {
+    pub uid: u64,
+    pub creation_height: u64,
+    pub flags: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -62,7 +64,10 @@ pub struct CreatedScopedUtxo {
 
 #[derive(Debug, Clone)]
 pub struct SpentScopedUtxo {
+    pub outpoint: OutPointKey,
     pub uid: u64,
+    pub creation_height: u64,
+    pub flags: u8,
     pub spent_height: u64,
     pub spent_block_hash: BlockHashBytes,
     pub spend_tx_index: u32,
@@ -98,7 +103,7 @@ pub struct TxScanInput {
     pub tx_index: u32,
     pub inputs: Vec<TxInputScan>,
     pub outputs: Vec<TxOutputScan>,
-    /// BIP352/Blindbit per-transaction tweak: the 33-byte compressed public key input_hash*A.
+    /// BIP352/Blindbit per-transaction tweak. The served block stores its 32-byte x-coordinate.
     /// Do not fill this with fake data. Live indexing may set this only when it has
     /// complete prevout context and has applied all BIP352 input eligibility rules.
     pub silent_payment_tweak: Option<TxTweak>,
@@ -130,7 +135,11 @@ pub struct BlockScopeStats {
 
 #[derive(Debug, Clone)]
 pub struct AppliedBlock {
+    /// Compact client/server response shape.
     pub light_block: LightBlockInput,
+    /// Rich file-archive storage shape. The server decodes this and serializes
+    /// `light_block` responses from it.
+    pub storage_block: StoredLightBlockInput,
     pub stats: BlockScopeStats,
     pub created_utxos: Vec<CreatedScopedUtxo>,
     pub spent_utxos: Vec<SpentScopedUtxo>,
@@ -142,8 +151,8 @@ pub struct P2trIndexerState {
     /// Minimal spend index. A Bitcoin input only gives us `(txid, vout)`, and
     /// the light payload only needs the corresponding UID for spent-ID output.
     /// Full output metadata is carried by `CreatedScopedUtxo` until it is
-    /// flushed to SQLite; it is not retained in the long-lived state.
-    outpoint_to_uid: HashMap<OutPointKey, u64>,
+    /// flushed to the archive/index store; it is not retained in the long-lived state.
+    outpoint_to_spend: HashMap<OutPointKey, SpendLookup>,
     /// Counts live indexed outputs, including historical DB outputs restored by
     /// count only. Historical outputs are not materialized in `outpoint_to_uid`
     /// unless a chunk may spend them.
@@ -155,7 +164,7 @@ impl P2trIndexerState {
     pub fn new() -> Self {
         Self {
             next_uid: 0,
-            outpoint_to_uid: HashMap::new(),
+            outpoint_to_spend: HashMap::new(),
             live_uid_count: 0,
             seen_p2tr_keys: Some(HashSet::new()),
         }
@@ -168,13 +177,20 @@ impl P2trIndexerState {
     ) -> Self {
         let mut state = Self {
             next_uid: last_uid,
-            outpoint_to_uid: HashMap::new(),
+            outpoint_to_spend: HashMap::new(),
             live_uid_count: 0,
             seen_p2tr_keys: Some(seen_keys.into_iter().collect()),
         };
         for entry in live_entries {
             state.live_uid_count += 1;
-            state.outpoint_to_uid.insert(entry.outpoint, entry.uid);
+            state.outpoint_to_spend.insert(
+                entry.outpoint,
+                SpendLookup {
+                    uid: entry.uid,
+                    creation_height: entry.created_height,
+                    flags: 0,
+                },
+            );
         }
         state
     }
@@ -185,13 +201,20 @@ impl P2trIndexerState {
     ) -> Self {
         let mut state = Self {
             next_uid: last_uid,
-            outpoint_to_uid: HashMap::new(),
+            outpoint_to_spend: HashMap::new(),
             live_uid_count: 0,
             seen_p2tr_keys: None,
         };
         for entry in live_entries {
             state.live_uid_count += 1;
-            state.outpoint_to_uid.insert(entry.outpoint, entry.uid);
+            state.outpoint_to_spend.insert(
+                entry.outpoint,
+                SpendLookup {
+                    uid: entry.uid,
+                    creation_height: entry.created_height,
+                    flags: 0,
+                },
+            );
         }
         state
     }
@@ -199,26 +222,43 @@ impl P2trIndexerState {
     pub fn restore_counts_only(last_uid: u64, live_uid_count: usize) -> Self {
         Self {
             next_uid: last_uid,
-            outpoint_to_uid: HashMap::new(),
+            outpoint_to_spend: HashMap::new(),
             live_uid_count,
             seen_p2tr_keys: None,
         }
     }
 
-    /// Cache historical spend candidates loaded from SQLite for the current
+    pub fn restore_at_uid(last_uid: u64) -> Self {
+        Self {
+            next_uid: last_uid,
+            outpoint_to_spend: HashMap::new(),
+            live_uid_count: 0,
+            seen_p2tr_keys: None,
+        }
+    }
+
+    pub fn contains_outpoint(&self, outpoint: &OutPointKey) -> bool {
+        self.outpoint_to_spend.contains_key(outpoint)
+    }
+
+    pub fn cached_outpoint_count(&self) -> usize {
+        self.outpoint_to_spend.len()
+    }
+
+    /// Cache historical spend candidates loaded from RocksDB for the current
     /// decoded chunk. This intentionally stores only `OutPointKey -> uid`; value,
     /// script, creation height/hash and output key are not needed for spend UID
     /// accounting. Returned outpoints can be evicted after the chunk is applied.
     pub fn cache_spend_uid_candidates(
         &mut self,
-        candidates: impl IntoIterator<Item = (OutPointKey, u64)>,
+        candidates: impl IntoIterator<Item = (OutPointKey, SpendLookup)>,
     ) -> Vec<OutPointKey> {
         let mut cached = Vec::new();
-        for (outpoint, uid) in candidates {
+        for (outpoint, spend) in candidates {
             if let std::collections::hash_map::Entry::Vacant(slot) =
-                self.outpoint_to_uid.entry(outpoint)
+                self.outpoint_to_spend.entry(outpoint)
             {
-                slot.insert(uid);
+                slot.insert(spend);
                 cached.push(outpoint);
             }
         }
@@ -235,7 +275,7 @@ impl P2trIndexerState {
     ) -> usize {
         let mut evicted = 0usize;
         for outpoint in cached_outpoints {
-            if self.outpoint_to_uid.remove(&outpoint).is_some() {
+            if self.outpoint_to_spend.remove(&outpoint).is_some() {
                 evicted += 1;
             }
         }
@@ -251,7 +291,11 @@ impl P2trIndexerState {
     }
 
     pub fn live_uids_sorted(&self) -> Vec<u64> {
-        let mut uids = self.outpoint_to_uid.values().copied().collect::<Vec<_>>();
+        let mut uids = self
+            .outpoint_to_spend
+            .values()
+            .map(|spend| spend.uid)
+            .collect::<Vec<_>>();
         uids.sort_unstable();
         uids
     }
@@ -272,24 +316,24 @@ impl P2trIndexerState {
     /// Inputs are processed before outputs within each tx, matching Bitcoin
     /// spend semantics while still using an end-of-block UID anchor for
     /// same-block spends.
-    pub fn apply_block(
-        &mut self,
-        block: BlockScanInput,
-        profile: Profile,
-    ) -> anyhow::Result<LightBlockInput> {
-        Ok(self.apply_block_with_stats(block, profile)?.light_block)
+    pub fn apply_block(&mut self, block: BlockScanInput) -> anyhow::Result<LightBlockInput> {
+        Ok(self.apply_block_with_stats(block)?.light_block)
     }
 
     pub fn apply_block_with_stats(
         &mut self,
         block: BlockScanInput,
-        profile: Profile,
     ) -> anyhow::Result<AppliedBlock> {
-        let mut outputs = Vec::<OutputRefInput>::new();
-        let mut full_output_hashes = Vec::<OutputIdHash>::new();
-        let mut spent_uids = Vec::<u64>::new();
-        let mut tx_tweak_indexes = Vec::<u32>::new();
-        let mut tx_tweaks = Vec::<TxTweak>::new();
+        let block_first_uid = self.next_uid.saturating_add(1);
+        let mut output_entries = Vec::<OutputEntryInput>::new();
+        let mut storage_output_entries = Vec::<StoredOutputEntryInput>::new();
+        let mut spends = Vec::<SpendEntryInput>::new();
+        let mut storage_spends = Vec::<StoredSpendEntryInput>::new();
+        let mut skipped_txs_for_tweaks = Vec::<u16>::new();
+        let mut tx_tweaks = Vec::<TweakEntryInput>::new();
+        let mut storage_tx_tweaks = Vec::<StoredTweakEntryInput>::new();
+        let mut skipped_outputs = Vec::<u16>::new();
+        let mut flattened_output_index: u32 = 0;
         let mut stats = BlockScopeStats {
             tx_count: block.txs.len() as u32,
             ..Default::default()
@@ -299,14 +343,23 @@ impl P2trIndexerState {
 
         for tx in &block.txs {
             let mut tx_has_p2tr_output = false;
-            let mut tx_has_indexed_output = false;
+            let mut tx_indexed_output_count: u16 = 0;
 
             for input in &tx.inputs {
-                if let Some(uid) = self.outpoint_to_uid.remove(&input.previous_output) {
+                if let Some(spend_ref) = self.outpoint_to_spend.remove(&input.previous_output) {
                     self.live_uid_count = self.live_uid_count.saturating_sub(1);
-                    spent_uids.push(uid);
+                    spends.push(SpendEntryInput {
+                        spent_uid: spend_ref.uid,
+                    });
+                    storage_spends.push(StoredSpendEntryInput {
+                        spent_uid: spend_ref.uid,
+                        creation_height: u32::try_from(spend_ref.creation_height)?,
+                    });
                     spent_utxos.push(SpentScopedUtxo {
-                        uid,
+                        outpoint: input.previous_output,
+                        uid: spend_ref.uid,
+                        creation_height: spend_ref.creation_height,
+                        flags: spend_ref.flags,
                         spent_height: block.height,
                         spent_block_hash: block.block_hash,
                         spend_tx_index: tx.tx_index,
@@ -316,22 +369,20 @@ impl P2trIndexerState {
             }
 
             for output in &tx.outputs {
+                let current_flattened_output_index = flattened_output_index;
+                flattened_output_index = flattened_output_index
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("flattened output index overflow"))?;
+
                 stats.output_count_total += 1;
                 let mut is_reused_output = false;
-                // Compute the P2TR output identity once and reuse it for the
-                // reuse-set probe, the output-id hash, and the stored x-only key.
                 let p2tr_identity = if output.is_p2tr {
                     let identity = p2tr_output_identity(output, block.height, tx.tx_index)?;
                     tx_has_p2tr_output = true;
                     stats.p2tr_output_count += 1;
                     if output.is_nums {
-                        // Kept for compatibility with the current DB column, but
-                        // live block ingestion should not set this from outputs.
                         stats.p2tr_nums_count += 1;
                     }
-                    // In output scope, every P2TR output is an SP scan candidate;
-                    // input-side eligibility determines whether a tx scan point
-                    // can be produced.
                     stats.p2tr_sp_candidate_count += 1;
                     if let Some(seen_p2tr_keys) = self.seen_p2tr_keys.as_mut() {
                         is_reused_output = !seen_p2tr_keys.insert(identity);
@@ -343,15 +394,22 @@ impl P2trIndexerState {
                 } else {
                     None
                 };
-                let include = profile.scope.include_output(output.is_p2tr, output.is_nums);
-                if !include {
-                    if output.is_p2tr {
-                        stats.p2tr_excluded_by_scope_count += 1;
-                    }
+
+                if !output.is_p2tr {
+                    skipped_outputs.push(u16::try_from(current_flattened_output_index)?);
                     continue;
                 }
 
-                let output_identity = output_identity_bytes(output, p2tr_identity);
+                // A P2TR output is only scannable if its transaction has a
+                // usable Silent Payments tweak. If the tweak is missing or
+                // ineligible, omit this output from both the response and the
+                // storage-output list, and preserve its original output slot in
+                // `skipped_outputs` so later output positions do not collapse.
+                if tx.silent_payment_tweak.is_none() {
+                    skipped_outputs.push(u16::try_from(current_flattened_output_index)?);
+                    continue;
+                }
+
                 let p2tr_xonly_key = p2tr_identity.ok_or_else(|| {
                     anyhow::anyhow!(
                         "indexed P2TR output at height {} tx_index {} vout {} is missing x-only key",
@@ -361,16 +419,21 @@ impl P2trIndexerState {
                     )
                 })?;
 
-                tx_has_indexed_output = true;
                 stats.indexed_output_count += 1;
-                self.next_uid = self
-                    .next_uid
+                tx_indexed_output_count = tx_indexed_output_count
                     .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("tx indexed output count exceeds u16"))?;
+                let uid = block_first_uid
+                    .checked_add(u64::from(current_flattened_output_index))
                     .ok_or_else(|| anyhow::anyhow!("scoped UID overflow"))?;
-                let uid = self.next_uid;
                 let outpoint = OutPointKey {
                     txid: tx.txid,
                     vout: output.vout,
+                };
+                let flags = if is_reused_output {
+                    STORAGE_OUTPUT_FLAG_REUSED
+                } else {
+                    0
                 };
                 let entry = ScopedUtxoEntry {
                     outpoint,
@@ -382,7 +445,14 @@ impl P2trIndexerState {
                     script_pubkey: output.script_pubkey.clone(),
                     p2tr_xonly_key,
                 };
-                self.outpoint_to_uid.insert(outpoint, uid);
+                self.outpoint_to_spend.insert(
+                    outpoint,
+                    SpendLookup {
+                        uid,
+                        creation_height: block.height,
+                        flags,
+                    },
+                );
                 self.live_uid_count += 1;
                 created_utxos.push(CreatedScopedUtxo {
                     entry,
@@ -390,52 +460,66 @@ impl P2trIndexerState {
                     is_reused: is_reused_output,
                     reuse_count_at_creation: 1,
                 });
-                outputs.push(OutputRefInput {
-                    tx_index: tx.tx_index,
-                    vout: output.vout,
-                    uid,
+                output_entries.push(OutputEntryInput {
+                    key: p2tr_xonly_key,
                 });
-                full_output_hashes.push(output_identifier_hash(&output_identity));
+                storage_output_entries.push(StoredOutputEntryInput {
+                    key: p2tr_xonly_key,
+                    spent_height: STORAGE_SPENT_HEIGHT_UNSPENT,
+                    flags,
+                });
             }
 
             if tx_has_p2tr_output {
                 stats.tx_with_p2tr_output_count += 1;
             }
-            if tx_has_indexed_output {
+            if tx_indexed_output_count > 0 {
                 stats.tx_with_indexed_output_count += 1;
-                if tx_has_p2tr_output {
-                    // Do not fabricate scan data. If the caller cannot compute
-                    // a correct BIP352 value from eligible inputs/prevouts, omit
-                    // it. The real schema migration should replace this legacy
-                    // 33-byte tx tweaks.
-                    if let Some(tweak) = tx.silent_payment_tweak {
-                        tx_tweak_indexes.push(tx.tx_index);
-                        tx_tweaks.push(tweak);
-                        stats.tweak_count += 1;
-                    }
+                if let Some(tweak) = tx.silent_payment_tweak {
+                    tx_tweaks.push(TweakEntryInput {
+                        output_count: tx_indexed_output_count,
+                        tweak,
+                    });
+                    storage_tx_tweaks.push(StoredTweakEntryInput {
+                        output_count: tx_indexed_output_count,
+                        tweak,
+                    });
+                    stats.tweak_count += 1;
                 }
+            } else if tx_has_p2tr_output && tx.silent_payment_tweak.is_none() {
+                skipped_txs_for_tweaks.push(u16::try_from(tx.tx_index)?);
             }
         }
 
-        spent_uids.sort_unstable();
-        let output_id_bytes =
-            choose_output_id_bytes(outputs.len() as u64, OUTPUT_ID_COLLISION_PROBABILITY_LOG2)
-                .clamp(1, crate::index::MAX_P2TR_OUTPUT_ID_BYTES);
-        let output_ids = truncate_into_packed(&full_output_hashes, output_id_bytes)?;
+        if flattened_output_index > 0 {
+            self.next_uid = block_first_uid
+                .checked_add(u64::from(flattened_output_index))
+                .and_then(|next_after_block| next_after_block.checked_sub(1))
+                .ok_or_else(|| anyhow::anyhow!("scoped UID overflow"))?;
+        }
 
         Ok(AppliedBlock {
             light_block: LightBlockInput {
                 height: block.height,
                 block_hash: block.block_hash,
                 previous_block_hash: block.previous_block_hash,
-                block_anchor_last_uid: self.last_uid(),
-                profile,
-                output_id_bytes,
-                tx_tweak_indexes,
-                tx_tweaks,
-                outputs,
-                output_ids,
-                spent_uids_sorted: spent_uids,
+                first_uid: block_first_uid,
+                skipped_txs_for_tweaks: skipped_txs_for_tweaks.clone(),
+                tweaks: tx_tweaks.clone(),
+                skipped_outputs: skipped_outputs.clone(),
+                outputs: output_entries,
+                spends,
+            },
+            storage_block: StoredLightBlockInput {
+                height: block.height,
+                block_hash: block.block_hash,
+                previous_block_hash: block.previous_block_hash,
+                first_uid: block_first_uid,
+                skipped_txs_for_tweaks,
+                tweaks: storage_tx_tweaks,
+                skipped_outputs,
+                outputs: storage_output_entries,
+                spends: storage_spends,
             },
             stats,
             created_utxos,
@@ -457,23 +541,6 @@ fn p2tr_output_identity(
     })
 }
 
-fn output_identity_bytes(output: &TxOutputScan, p2tr_identity: Option<[u8; 32]>) -> Vec<u8> {
-    // For P2TR the caller has already resolved the identity (caught the missing
-    // key above), so reuse it; everything else is identified by its scriptPubKey.
-    match p2tr_identity {
-        Some(key) => key.to_vec(),
-        None => output.script_pubkey.clone(),
-    }
-}
-
-pub fn output_identifier_hash(identity_bytes: &[u8]) -> OutputIdHash {
-    let mut h = Sha256::new();
-    h.update(b"bitcoindata:light:p2tr-output-key");
-    h.update(identity_bytes);
-    let bytes: [u8; 32] = h.finalize().into();
-    OutputIdHash::from(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,7 +555,6 @@ mod tests {
 
     #[test]
     fn p2tr_sp_includes_reuse_and_does_not_filter_output_nums() {
-        let profile = Profile::default();
         let mut state = P2trIndexerState::new();
         let block = BlockScanInput {
             height: 1,
@@ -498,7 +564,7 @@ mod tests {
                 txid: txid(10),
                 tx_index: 0,
                 inputs: vec![],
-                silent_payment_tweak: Some([9; 33].into()),
+                silent_payment_tweak: Some([9u8; 33].into()),
                 outputs: vec![
                     TxOutputScan {
                         vout: 0,
@@ -527,11 +593,16 @@ mod tests {
                 ],
             }],
         };
-        let applied = state.apply_block_with_stats(block, profile).unwrap();
+        let applied = state.apply_block_with_stats(block).unwrap();
         assert_eq!(applied.light_block.outputs.len(), 3);
-        assert_eq!(applied.light_block.outputs[0].uid, 1);
-        assert_eq!(applied.light_block.outputs[1].uid, 2);
-        assert_eq!(applied.light_block.outputs[2].uid, 3);
+        assert_eq!(applied.light_block.first_uid, 1);
+        assert_eq!(applied.light_block.outputs[0].key, xonly_key(1));
+        assert!(applied.created_utxos[1].is_reused);
+        assert_eq!(
+            applied.storage_block.outputs[1].flags & STORAGE_OUTPUT_FLAG_REUSED,
+            STORAGE_OUTPUT_FLAG_REUSED
+        );
+        assert_eq!(applied.light_block.outputs[2].key, xonly_key(2));
         assert_eq!(applied.stats.p2tr_nums_count, 1);
         assert_eq!(applied.stats.p2tr_reused_count, 1);
         assert_eq!(applied.stats.indexed_output_count, 3);
@@ -539,7 +610,6 @@ mod tests {
 
     #[test]
     fn tracks_spends_in_scope() {
-        let profile = Profile::default();
         let mut state = P2trIndexerState::new();
         let block1 = BlockScanInput {
             height: 1,
@@ -549,7 +619,7 @@ mod tests {
                 txid: txid(10),
                 tx_index: 0,
                 inputs: vec![],
-                silent_payment_tweak: Some([9; 33].into()),
+                silent_payment_tweak: Some([9u8; 33].into()),
                 outputs: vec![
                     TxOutputScan {
                         vout: 0,
@@ -570,10 +640,9 @@ mod tests {
                 ],
             }],
         };
-        let light1 = state.apply_block(block1, profile).unwrap();
+        let light1 = state.apply_block(block1).unwrap();
         assert_eq!(light1.outputs.len(), 1);
-        assert_eq!(light1.outputs[0].uid, 1);
-        assert_eq!(light1.block_anchor_last_uid, 1);
+        assert_eq!(light1.first_uid, 1);
 
         let block2 = BlockScanInput {
             height: 2,
@@ -590,7 +659,7 @@ mod tests {
                     script_sig: Vec::new(),
                     witness: Vec::new(),
                 }],
-                silent_payment_tweak: Some([8; 33].into()),
+                silent_payment_tweak: Some([8u8; 33].into()),
                 outputs: vec![TxOutputScan {
                     vout: 0,
                     value_sat: 0,
@@ -601,9 +670,16 @@ mod tests {
                 }],
             }],
         };
-        let light2 = state.apply_block(block2, profile).unwrap();
-        assert_eq!(light2.spent_uids_sorted, vec![1]);
-        assert_eq!(light2.outputs[0].uid, 2);
-        assert_eq!(state.live_uids_sorted(), vec![2]);
+        let light2 = state.apply_block(block2).unwrap();
+        assert_eq!(
+            light2
+                .spends
+                .iter()
+                .map(|s| s.spent_uid)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(light2.first_uid, 3);
+        assert_eq!(state.live_uids_sorted(), vec![3]);
     }
 }

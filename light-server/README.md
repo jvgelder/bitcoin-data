@@ -1,142 +1,185 @@
 # btc-data light-server
 
-Prototype crate for a Silent Payments light-data archive.
+`btc-data-light-server` builds and serves Silent Payments light-data blocks.
 
-The crate has two main binaries:
+The current implementation is intentionally small:
 
-- `light-indexer`: reads Bitcoin blocks from `btc-data-sources`, builds the light archive, and writes SQLite/file-backed payloads.
-- `light-server`: serves cached light blocks, ranges, manifests, cut-through streams, and debug statistics over HTTP.
+- `light-indexer` reads finalized Bitcoin blocks, derives Silent Payments scan points, assigns dense output UIDs, writes per-block Cap'n Proto payloads, and keeps only indexer working state in RocksDB.
+- `light-server` serves the already encoded block payload files over HTTP.
 
-The production path is SQLite-first. File-backed archives remain useful for fixtures and decoder tests.
+There is no SQLite serving path, no profiles, no checkpoints, and no client-specific cut-through state in the current format.
 
-## Current archive scope
+## Storage model
 
-The current working scope is **`p2tr-sp`**.
-
-```text
-UID starts at 1.
-uid += 1 for every P2TR output in the selected scope.
-non-P2TR outputs do not receive UIDs.
-reused P2TR output keys are included and receive UIDs.
-spent streams contain spends of scoped UIDs only.
-checkpoints are not generated or served; deterministic replay from the profile start is the recovery model.
-```
-
-Archive scope is deterministic and fixed for a database/archive. Changing from `p2tr-sp` to `p2tr` or `all-outputs` requires a full rescan because the UID namespace changes.
-
-## Start height and immutable metadata
-
-Archive start height is deterministic for a new archive and is persisted in metadata together with the scope/network. For P2TR-scoped archives, the default start height is the network Taproot activation height.
+The archive is split into two stores with different responsibilities.
 
 ```text
-mainnet p2tr-sp / p2tr: 709632
-testnet p2tr-sp / p2tr: 2011968
-signet/regtest/fixture p2tr-sp / p2tr: 0 unless overridden
-all-outputs: 0 unless overridden
+lightdata/                       # served archive
+  manifest.json
+  blocks/
+    0000000000.capnp
+    0000000001.capnp
+    ...
+
+light-indexer-rocksdb/           # indexer-only working state
+  RocksDB files
 ```
 
-If `network`, `scope`, or `start_height` in an existing DB differs from the configured values, the indexer must stop and require a new DB/full rescan.
+### Served archive
 
-During active development it is often simplest to delete the SQLite archive and restart:
+Each file in `lightdata/blocks/` is a serialized Cap'n Proto `LightBlock` for exactly one block height. The server reads these files and returns the cached bytes directly.
 
-```bash
-rm -f lightdata-mainnet.db lightdata-mainnet.db-shm lightdata-mainnet.db-wal
-```
+The archive files are the public sync data. RocksDB is not served to clients.
 
-## Scope meanings
+### RocksDB working state
+
+RocksDB is used only by the indexer so it can resume and resolve future spends:
 
 ```text
-p2tr-sp:
-  Silent Payments candidate output scope.
-  Includes P2TR outputs, including reused keys.
-  Does not exclude outputs based on NUMS.
-  Excludes all non-P2TR outputs.
+metadata:
+  network
+  start_height
+  tip_height
+  tip_hash
+  last_uid
 
-p2tr:
-  All P2TR outputs, including reused keys.
+outpoint lookup:
+  previous txid + vout -> created UID + creation height
 
-all-outputs:
-  Broad scope: every Bitcoin output receives a UID when the archive is initialized with this scope.
+seen key counts:
+  P2TR x-only output key -> count
 ```
 
-Profiles inside a scope only vary by cut-through window:
+The outpoint lookup lets the indexer convert a later input prevout into a `spentUid` without keeping a full in-memory UTXO set.
+
+The current internal RocksDB encoding is not part of the client wire protocol. It uses prefixed keys and big-endian numeric fields for stable RocksDB ordering:
 
 ```text
-profile = scope + cutthrough_blocks
+outpoint key:
+  "o:" || txid[32] || vout[u32-be]
+
+outpoint value:
+  uid[u64-be] || creation_height[u64-be]
 ```
 
-There are no profile toggles for reuse filtering or NUMS filtering. This avoids servers drifting apart while using the same profile name.
+Older staged 8-byte and 17-byte outpoint values may be accepted for local migration compatibility, but new writes should use the 16-byte no-flags value.
 
-## Current crate layout
+## Commit ordering
 
-- `src/bin/light_indexer.rs`: CLI for fixture generation, source checks, raw block fetching, and live SQLite indexing.
-- `src/bin/light_server.rs`: HTTP server entrypoint.
-- `src/p2tr_indexer.rs`: source-agnostic scoped UID state, `outpoint -> uid`, live UID mutation state, reuse counting, spend tracking, and conversion to `LightBlockInput`.
-- `src/index.rs`: `LightBlock` encoders, Elias-delta spent UID encoding, and fixed tx tweak index encoding.
-- `src/server.rs`: Axum routes for `/health`, `/manifest`, `/tip`, block range, single block, cut-through streams, and debug block stats.
-- `src/storage/backend.rs`: storage interface used by HTTP routes.
-- `src/storage/sqlite.rs`: SQLx/SQLite implementation of `ArchiveBackend`.
-- `src/storage/files.rs`: file-backed implementation for fixtures/local tests.
-- `src/storage/migrations/0001_init.sql`: canonical SQLite schema.
-- `schema/light.capnp`: canonical binary wire schema.
+The indexer should only advance the RocksDB tip after the corresponding archive block files are durable.
 
-Source access is provided by the workspace `btc-data-sources` crate. The light-server crate should not duplicate block-source implementations.
-
-## Sources and indexer operation
-
-The indexer uses `btc_data_sources` directly:
+Preferred order for each commit window:
 
 ```text
-btc_data_core::source::BlockSource
-btc_data_core::source::TipWatcher
-btc_data_sources::IpcSource
-btc_data_sources::RestSource
-btc_data_sources::PollingTipWatcher
+1. Fetch block and undo/spent-prevout data.
+2. Derive scan points, dense outputs, skipped outputs, and spends.
+3. Encode the block as a Cap'n Proto LightBlock.
+4. Write blocks/<height>.capnp.tmp.
+5. fsync and rename to blocks/<height>.capnp.
+6. Commit the RocksDB batch:
+   - insert new outpoint -> uid entries
+   - delete spent outpoints
+   - update seen key counts
+   - update last_uid
+   - update tip height/hash
+7. Rewrite manifest/tip metadata if needed.
 ```
 
-IPC is the default block source. REST can also be used as the block source. Undo data for Silent Payment tweak computation is always fetched from Bitcoin Core REST `/rest/spenttxouts`.
-
-Actual `light-indexer` source arguments:
+Critical invariant:
 
 ```text
---source <ipc|rest>        block source, default: ipc
---ipc-socket <PATH>        required when --source ipc
---ipc-threads <N>          IPC worker threads, default: 8
---rest-url <URL>           required for --source rest, and also required for --source ipc undo data
---poll-interval-secs <N>   REST polling interval, default: 10
+Never advance the RocksDB tip past a height whose .capnp block file is missing.
 ```
 
-Use the REST base URL only, not an endpoint path:
+If a crash happens after writing a block file but before advancing the RocksDB tip, the indexer can reprocess and overwrite the same archive block file.
+
+## Wire format
+
+The served block payload is a Cap'n Proto `LightBlock`:
+
+```capnp
+struct LightBlock {
+  version @0 :UInt16;
+  height @1 :UInt64;
+
+  blockHash @2 :Data;          # 32 bytes
+  previousBlockHash @3 :Data;  # 32 bytes
+
+  firstUid @4 :UInt64;
+
+  skippedTxsForTweaks @5 :List(UInt16);
+  tweaks @6 :List(TweakEntry);
+
+  skippedOutputs @7 :List(UInt16);
+  outputs @8 :List(OutputEntry);
+
+  spends @9 :List(SpendEntry);
+}
+
+struct TweakEntry {
+  outputCount @0 :UInt16;
+  tweak @1 :Data;              # 32-byte x-coordinate of the scan point
+}
+
+struct OutputEntry {
+  key @0 :Data;                # 32-byte P2TR x-only output key
+}
+
+struct SpendEntry {
+  spentUid @0 :UInt64;
+}
+```
+
+The indexer may represent a scan point internally as a 33-byte compressed public key. The served `TweakEntry.tweak` stores the 32-byte x-coordinate.
+
+## UID semantics
+
+UIDs are assigned only to the dense scannable output section of a block.
 
 ```text
---rest-url http://127.0.0.1:8332
+uid = firstUid + dense_output_index
 ```
 
-Bitcoin Core must have REST enabled:
+A dense output is a Taproot output whose transaction has a usable Silent Payments scan point. If a transaction has Taproot outputs but no usable scan point, those outputs are recorded in `skippedOutputs` and do not receive UIDs.
 
-```conf
-rest=1
-```
-
-The intended run loop is:
+Required invariant:
 
 ```text
-1. read archive metadata and indexed tip
-2. ask source for current tip
-3. finalized_tip = source_tip - finality_depth
-4. index missing blocks next_height..=finalized_tip in ranges
-5. only once caught up, wait for source tip notification
-6. wake, recompute finalized tip, repeat
+sum(tweaks.outputCount) == outputs.len()
 ```
 
-`light-indexer` no longer uses a RocksDB prevout store. Tweak data is derived from REST undo data.
+`TweakEntry.outputCount` tells the client how many consecutive dense outputs use that scan point.
 
-When `--source ipc` is used, blocks and tip watching come from IPC, while undo data comes from `--rest-url`.
-When `--source rest` is used, blocks, tip polling, and undo data all use the same REST source.
+`SpendEntry.spentUid` identifies an output created in an earlier block. The spend height is the containing `LightBlock.height`, so no separate spent-height field is needed.
+
+## Skipped data
+
+`skippedTxsForTweaks` contains transaction indexes that have Taproot outputs but no corresponding tweak entry.
+
+Common skip reasons:
+
+```text
+No eligible Silent Payments input keys
+Unsupported witness version greater than 1
+Missing prevout context
+Eligible input public-key sum is infinity
+```
+
+Normal no-eligible-input cases are expected and should be logged at debug level. Missing prevouts and infinity sums are warnings because they may indicate source or data issues worth investigating.
+
+`skippedOutputs` contains flattened block-output indexes for Taproot outputs omitted from the dense `outputs` list.
 
 ## Running the indexer
 
-Check the IPC source:
+Check a REST source:
+
+```bash
+cargo run -p btc-data-light-server --bin light-indexer -- source-tip \
+  --source rest \
+  --rest-url http://127.0.0.1:8332
+```
+
+Check an IPC source. `--rest-url` is still required because undo data is fetched through REST:
 
 ```bash
 cargo run -p btc-data-light-server --bin light-indexer -- source-tip \
@@ -145,394 +188,179 @@ cargo run -p btc-data-light-server --bin light-indexer -- source-tip \
   --rest-url http://127.0.0.1:8332
 ```
 
-Fetch one block:
-
-```bash
-cargo run -p btc-data-light-server --bin light-indexer -- fetch-block \
-  --source ipc \
-  --ipc-socket /var/lib/bitcoind/.bitcoin/node.sock \
-  --rest-url http://127.0.0.1:8332 \
-  --height 709632 \
-  --output block-709632.bin
-```
-
-Run mainnet indexing with P2TR/SP emission from Taproot activation. Tweak data is derived from `/rest/spenttxouts`; no RocksDB prevout store is used:
-
-```bash
-cargo run -p btc-data-light-server --bin light-indexer -- run \
-  --source ipc \
-  --ipc-socket /var/lib/bitcoind/.bitcoin/node.sock \
-  --rest-url http://127.0.0.1:8332 \
-  --database-url sqlite:lightdata-mainnet.db \
-  --network mainnet \
-  --scope p2tr-sp \
-  --finality-depth 6
-```
-
-For a REST-only smoke test that performs one pass and exits:
+Run mainnet indexing from the default network start height:
 
 ```bash
 cargo run -p btc-data-light-server --bin light-indexer -- run \
   --source rest \
   --rest-url http://127.0.0.1:8332 \
-  --database-url sqlite:lightdata-mainnet.db \
+  --archive-dir lightdata-mainnet \
+  --index-db-dir light-indexer-mainnet.rocksdb \
   --network mainnet \
-  --scope p2tr-sp \
   --finality-depth 6 \
+  --catchup-batch-size 100 \
+  --flush-blocks 100 \
+  --memory-budget-mb 4000
+```
+
+Run with IPC block fetches and REST undo data:
+
+```bash
+cargo run -p btc-data-light-server --bin light-indexer -- run \
+  --source ipc \
+  --ipc-socket /var/lib/bitcoind/.bitcoin/node.sock \
+  --rest-url http://127.0.0.1:8332 \
+  --archive-dir lightdata-mainnet \
+  --index-db-dir light-indexer-mainnet.rocksdb \
+  --network mainnet \
+  --finality-depth 6 \
+  --catchup-batch-size 100 \
+  --flush-blocks 100 \
+  --memory-budget-mb 4000
+```
+
+For a smoke test that catches up once and exits:
+
+```bash
+cargo run -p btc-data-light-server --bin light-indexer -- run \
+  --source rest \
+  --rest-url http://127.0.0.1:8332 \
+  --archive-dir lightdata-test \
+  --index-db-dir light-indexer-test.rocksdb \
+  --network mainnet \
+  --finality-depth 6 \
+  --catchup-batch-size 10 \
+  --flush-blocks 10 \
   --once
 ```
 
-Check the REST source:
+## Running the server
 
-```bash
-cargo run -p btc-data-light-server --bin light-indexer -- source-tip \
-  --source rest \
-  --rest-url http://127.0.0.1:8332
-```
-
-## Fixture generation
-
-Generate a file-backed fixture archive:
-
-```bash
-cargo run -p btc-data-light-server --bin light-indexer -- fixture \
-  --archive lightdata \
-  --network fixture \
-  --scope p2tr-sp \
-  --start-height 800000 \
-  --count 3
-```
-
-Generate a SQLite fixture archive and serve it:
-
-```bash
-cargo run -p btc-data-light-server --bin light-indexer -- fixture-db \
-  --database-url sqlite:lightdata.db \
-  --network fixture \
-  --scope p2tr-sp \
-  --start-height 800000 \
-  --count 3
-
-cargo run -p btc-data-light-server --bin light-server -- \
-  --backend sqlite \
-  --database-url sqlite:lightdata.db \
-  --bind 127.0.0.1:3000
-```
-
-Serve a file-backed fixture archive:
+Serve the file archive:
 
 ```bash
 cargo run -p btc-data-light-server --bin light-server -- \
-  --backend files \
-  --archive lightdata \
-  --bind 127.0.0.1:3000
+  --archive lightdata-mainnet \
+  --bind 127.0.0.1:3000 \
+  --max-range-count 1000
 ```
 
-## Serving SQLite data
+The server has no SQLite backend selection. It serves the file archive rooted at `--archive`.
 
-Run the HTTP server:
+## HTTP API
 
-```bash
-cargo run -p btc-data-light-server --bin light-server -- \
-  --backend sqlite \
-  --database-url sqlite:lightdata-mainnet.db \
-  --bind 127.0.0.1:3000
-```
-
-For an empty DB, the server can initialize schema before serving:
-
-```bash
-cargo run -p btc-data-light-server --bin light-server -- \
-  --backend sqlite \
-  --database-url sqlite:lightdata.db \
-  --migrate \
-  --bind 127.0.0.1:3000
-```
-
-The production serving path reads exact cached wire bytes:
-
-```text
-payload_cache(profile_id, height)      -> serialized LightBlock bytes
-```
-
-## Client-facing API examples
+Health check:
 
 ```bash
 curl http://127.0.0.1:3000/health
-
-# Full finalized tip for a selected scope.
-curl 'http://127.0.0.1:3000/tip?scope=p2tr-sp'
-
-# Cut-through finalized tip for a selected scope.
-curl 'http://127.0.0.1:3000/tip/cutthrough?scope=p2tr-sp'
-
-# Single full light block.
-curl -H 'Accept: application/octet-stream' \
-  -o block.capnp \
-  'http://127.0.0.1:3000/blocks/709632/light?scope=p2tr-sp'
-
-# Single cut-through light block.
-curl -H 'Accept: application/octet-stream' \
-  -o block-ct.capnp \
-  'http://127.0.0.1:3000/blocks/709632/light/cutthrough?scope=p2tr-sp'
-
-# JSON debug view of one full light block.
-curl -H 'Accept: application/json' \
-  'http://127.0.0.1:3000/blocks/709632/light?scope=p2tr-sp'
-
-# Full range sync.
-curl -H 'Accept: application/octet-stream' \
-  -o range.bdsr \
-  'http://127.0.0.1:3000/blocks/light?start=709632&count=1000&scope=p2tr-sp'
-
-# Cut-through historical backfill.
-curl -H 'Accept: application/octet-stream' \
-  -o range-ct.bdsr \
-  'http://127.0.0.1:3000/blocks/light/cutthrough?start=709632&count=1000&scope=p2tr-sp'
-
-# Per-block stats.
-curl 'http://127.0.0.1:3000/debug/blocks/709632/stats'
 ```
 
-The public API intentionally exposes `scope=` and dedicated full vs cut-through endpoints, but not `profile=`, `domain=`, or numeric `ct=` parameters. The selected `scope` defines the UID namespace. The server validates that the requested scope exists in the archive and returns a clear error when it does not.
-
-`cutthrough=true` is not accepted on the full endpoints. Use the `/cutthrough` endpoints instead so clients cannot accidentally treat a reduced stream as a full stream.
-
-## Sync target and cut-through
-
-The public sync target should be finalized blocks only:
-
-```text
-finality_depth = 6
-full served_tip = indexed_tip - 6
-cut-through served_tip = floor((indexed_tip - 6 - ct) / 144) * 144
-```
-
-The SQLite-backed archive may materialize fixed cut-through profiles on 144-block boundaries, for example:
-
-```text
-raw-sp      ct=0
-ct12-sp     ct=12
-ct144-sp    ct=144
-ct1008-sp   ct=1008
-ct4320-sp   ct=4320
-ct12960-sp  ct=12960
-ct52560-sp  ct=52560
-ct105120-sp ct=105120
-```
-
-For `/blocks/light/cutthrough`, the server chooses the largest materialized cut-through window that can serve the requested start height.
-
-Cut-through requests must end at or below:
-
-```text
-full_tip - suggested_reorg_cache_depth
-```
-
-This keeps wallet clients from using a reduced stream for the recent reorg window. The default suggested reorg cache depth is 24 blocks.
-
-## Wallet cold-boot flow
-
-A v1 Silent Payments wallet client scans block payloads from its profile start. Checkpoints are intentionally removed for now; cut-through-from-genesis/profile-start is deterministic and avoids a large checkpoint materialization path in the indexer.
-
-Recommended cold boot:
-
-```text
-1. GET /manifest
-2. GET /tip?scope=p2tr-sp
-3. recent_full_depth = manifest.suggested_reorg_cache_depth, default 24
-4. stable_tip = tip.height - recent_full_depth
-5. scan /blocks/light/cutthrough from wallet birthday/start height through stable_tip
-6. scan /blocks/light from stable_tip + 1 through tip.height
-7. live sync new blocks with /blocks/light only
-```
-
-The cut-through stream is a historical backfill optimization. It may omit outputs created and spent inside the cut-through window, so it is not a complete activity-history stream. The full stream is required near the tip for shallow reorg handling and short-lived recent wallet outputs.
-
-## Wire payload semantics
-
-`LightBlock` contains:
-
-```text
-version
-height
-blockHash
-previousBlockHash
-profile
-blockAnchorLastUid
-outputIdBytes
-tweakCount
-txTweakIndexes
-txTweaks
-outputs
-outputIds
-spentIdCodec
-spentCount
-spentIds
-```
-
-Tweak naming follows Blindbit/light-client terminology. `txTweaks` are **33-byte compressed public tweak keys**, not 32-byte scalar tweaks:
-
-```text
-server computes: input_hash * A
-client computes: b_scan * tweak
-```
-
-Current implementation status:
-
-```text
-TxTweak type and wire length: 33 bytes
-fake placeholder tweak emission: removed
-BIP352 scan-point computation: implemented for P2TR, P2WPKH, P2SH-P2WPKH, and P2PKH inputs
-```
-
-If `/rest/spenttxouts` undo data is missing for a non-coinbase transaction that has Taproot outputs, live indexing fails rather than falling back to a local prevout database or serving guessed tweak data.
-
-## BIP352 tweak computation requirements
-
-A correct Silent Payments tweak requires transaction input eligibility and spent prevout context. The live indexer obtains that context from Bitcoin Core `/rest/spenttxouts`.
-
-Eligible input types:
-
-```text
-P2TR
-P2WPKH
-P2SH-P2WPKH
-P2PKH
-```
-
-Transactions should only emit tweak data if they have at least one Taproot output, at least one eligible input, and do not spend unsupported SegWit version > 1 outputs.
-
-The indexer needs enough undo/prevout data to derive/sum eligible input public keys:
-
-```text
-P2TR:        spent prevout output key, except NUMS script-path inputs
-P2WPKH:      compressed pubkey from witness
-P2SH-P2WPKH: compressed pubkey from witness + redeem script validation
-P2PKH:       compressed pubkey from scriptSig
-```
-
-The BIP352 NUMS exception is input-side only: Taproot script-path spends with the NUMS internal key are excluded from tweak derivation. They should not affect output UID assignment.
-
-## Storage backend interface
-
-The HTTP server is storage-agnostic:
-
-```text
-Axum routes
-  -> Arc<dyn ArchiveBackend>
-     -> SqliteArchive using SQLx
-     -> FileArchive using files per block
-```
-
-Backend selection happens in `src/bin/light_server.rs`, not inside route handlers.
-
-The trait boundary is:
-
-```text
-manifest()
-resolve_profile()
-tip()
-read_block()
-read_blocks()
-read_cutthrough_delta_blocks()
-read_cutthrough_snapshot()
-block_stats()
-```
-
-Any future backend must implement that interface and return the same cached wire bytes for the same scope/profile/height.
-
-## SQLite schema
-
-The schema is stored in `src/storage/migrations/0001_init.sql` and applied through SQLx.
-
-Core tables:
-
-```text
-meta
-blocks
-block_stats
-block_exclusion_stats
-profiles
-p2tr_outputs
-p2tr_spends
-p2tr_key_stats
-tx_tweaks
-payload_cache
-```
-
-Important invariants:
-
-```text
-uid INTEGER PRIMARY KEY CHECK(uid > 0)
-first UID = 1
-network, scope, and start_height are stored in meta and immutable for the DB
-p2tr-sp indexed_output_count = p2tr_output_count
-p2tr_reused_count is counted but not subtracted from p2tr-sp
-p2tr_nums_count is not an output-exclusion count; NUMS is input-side for BIP352 tweaks
-```
-
-During indexing, live UIDs are kept in memory for fast insert/remove. The indexer does not materialize UID checkpoints; committed SQL rows and deterministic replay define recovery state.
-
-## Debug and validation commands
-
-While indexing:
+Manifest:
 
 ```bash
-sqlite3 lightdata-mainnet.db "SELECT COUNT(*), MIN(height), MAX(height) FROM blocks;"
-sqlite3 lightdata-mainnet.db "SELECT SUM(p2tr_created_count), SUM(p2tr_spent_count), MAX(anchor_last_uid) FROM blocks;"
-sqlite3 lightdata-mainnet.db "SELECT profile_id,name,scope,cutthrough_blocks,served_tip_height FROM profiles;"
-sqlite3 lightdata-mainnet.db "SELECT key,value FROM meta ORDER BY key;"
+curl http://127.0.0.1:3000/manifest
 ```
 
-Expected live indexing log shape:
+Tip:
+
+```bash
+curl http://127.0.0.1:3000/tip
+```
+
+Single light block:
+
+```bash
+curl -H 'Accept: application/octet-stream' \
+  -o block.capnp \
+  http://127.0.0.1:3000/blocks/871932/light
+```
+
+Range of light blocks:
+
+```bash
+curl -H 'Accept: application/octet-stream' \
+  -o blocks.capnp \
+  'http://127.0.0.1:3000/blocks/light?start=871932&count=100'
+```
+
+The current API does not expose `scope`, `profile`, `cutthrough`, or checkpoint endpoints.
+
+## Fixture generation
+
+Generate a deterministic file-backed fixture archive:
+
+```bash
+cargo run -p btc-data-light-server --bin light-indexer -- fixture \
+  --archive lightdata-fixture \
+  --network fixture \
+  --start-height 800000 \
+  --count 3
+```
+
+Serve it:
+
+```bash
+cargo run -p btc-data-light-server --bin light-server -- \
+  --archive lightdata-fixture \
+  --bind 127.0.0.1:3000
+```
+
+## Removed concepts
+
+The current format intentionally removed the previous heavier archive model:
 
 ```text
-source=http://127.0.0.1:8332 watcher=polling:http://127.0.0.1:8332 best_height=... finalized_tip=... next_height=709632 database=sqlite:lightdata-mainnet.db
-fetched finalized range 709632..=709759 count=128 bytes=...
-indexed finalized range 709632..=709759 last_uid=... live_uids=...
+checkpoints
+profiles
+SQLite
+per-output flags
+spent-height fields
+reuse flags in served payloads
+live unspent UID snapshots
+client-specific cut-through state
+payload_cache/checkpoint_cache tables
 ```
 
-## Shared-code/refactor notes
+Reuse detection may still exist as an internal counter/debug aid, but it is not part of the served wire format and does not change UID assignment in the current model.
 
-There is overlap between light-server indexing code and existing stats code. The reusable pieces should move into a common crate instead of being duplicated:
+## Development invariants
+
+These invariants should hold for every encoded block:
 
 ```text
-script classification
-P2TR x-only output key extraction
-Taproot spend-path classification
-NUMS internal-key detection
-block preparation / source batching patterns
+blockHash.len() == 32
+previousBlockHash.len() == 32
+all OutputEntry.key values are 32 bytes
+all TweakEntry.tweak values are 32 bytes
+sum(tweaks.outputCount) == outputs.len()
+skippedTxsForTweaks is sorted and unique
+skippedOutputs is sorted and unique
 ```
 
-Recommended future layout:
+Indexing invariants:
 
 ```text
-btc-data-chain
-  script.rs        ScriptType, classify_script, p2tr_xonly_output_key, P2A
-  taproot.rs       SpendPath, SpendClass, classify_p2tr_spend, NUMS_H_XONLY
-  block_prepare.rs compact decoded block representation
-  outpoint.rs      shared outpoint/txid helpers
-
-btc-data-sources
-  BlockSource implementations and TipWatcher implementations
-
-btc-data-stats
-  depends on btc-data-chain + btc-data-sources
-
-btc-data-light-server
-  depends on btc-data-chain + btc-data-sources
+RocksDB tip only advances after archive files exist
+last_uid is monotonic
+new outpoint lookups are written before later blocks can spend them
+spent outpoints are removed from RocksDB during the commit that emits their spentUid
+missing prevouts should be warnings, not silently treated as no eligible inputs
+public-key sum infinity should be rare and investigated
 ```
 
-## Strong domain types
-
-The Rust API should not pass unrelated fixed-size values as raw arrays at module boundaries. The crate defines explicit byte-newtypes in `src/types.rs`:
+## Crate layout
 
 ```text
-BlockHashBytes  [u8; 32]
-TxidBytes       [u8; 32]
-TxTweak         [u8; 33]
-OutputIdHash    [u8; 32]
+src/bin/light_indexer.rs   indexer CLI, source loop, archive/RocksDB commit path
+src/bin/light_server.rs    HTTP server entrypoint
+src/p2tr_indexer.rs        dense UID assignment, spend resolution, block assembly
+src/sp_tweak.rs            BIP352 scan-point calculation
+src/index.rs               LightBlock validation and Cap'n Proto encoding
+src/index_store.rs         RocksDB working state
+src/storage/files.rs       file archive implementation
+src/server.rs              Axum routes
+src/types.rs               fixed-size byte newtypes
+schema/light.capnp         canonical wire schema
 ```
 
-`TxTweak` is intentionally 33 bytes because it is a compressed public tweak key.
+Source access lives in the workspace `btc-data-sources` crate. This crate should not duplicate block source implementations.

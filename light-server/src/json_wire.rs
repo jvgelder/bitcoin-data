@@ -1,12 +1,9 @@
-//! JSON representations for the Cap'n Proto light-sync wire messages.
+//! JSON representation for the typed Cap'n Proto light block.
 //!
-//! The binary Cap'n Proto payload remains canonical. These helpers decode the
-//! cached Cap'n Proto bytes into stable, human-readable JSON for debugging,
-//! interoperability, and simple clients.
+//! The binary Cap'n Proto payload remains canonical. These helpers decode it
+//! into stable human-readable JSON for debugging only.
 
-use crate::index::{decode_spent_uids, decode_tx_tweak_indexes};
 use crate::light_capnp::light_block;
-use crate::storage::ServedProfile;
 use capnp::message::ReaderOptions;
 use serde::Serialize;
 use std::io::Cursor;
@@ -17,121 +14,100 @@ pub struct JsonLightBlock {
     pub height: u64,
     pub block_hash: String,
     pub previous_block_hash: String,
-    pub block_anchor_last_uid: u64,
-    pub profile: JsonProfile,
-    pub output_id_bytes: u8,
-    pub tweaks: Vec<JsonTxTweak>,
-    pub outputs: Vec<JsonOutputRef>,
-    pub spent_id_codec: &'static str,
-    pub spent_uids: Vec<u64>,
-}
-
-
-#[derive(Debug, Serialize)]
-pub struct JsonProfile {
-    pub name: Option<String>,
-    pub scope: String,
-    pub cutthrough: bool,
-    pub cutthrough_blocks: u32,
+    pub first_uid: u64,
+    pub skipped_txs_for_tweaks: Vec<u16>,
+    pub tweaks: Vec<JsonTweakEntry>,
+    pub skipped_outputs: Vec<u16>,
+    pub outputs: Vec<JsonOutputEntry>,
+    pub spends: Vec<JsonSpendEntry>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct JsonTxTweak {
-    pub tx_index: u32,
+pub struct JsonTweakEntry {
+    pub output_count: u16,
     pub tweak: String,
 }
 
 #[derive(Debug, Serialize)]
-pub struct JsonOutputRef {
-    pub tx_index: u32,
-    pub vout: u32,
+pub struct JsonOutputEntry {
     pub uid: u64,
-    pub output_id: String,
+    pub key: String,
 }
 
-pub fn light_block_to_json(
-    bytes: &[u8],
-    profile: Option<&ServedProfile>,
-) -> anyhow::Result<JsonLightBlock> {
+#[derive(Debug, Serialize)]
+pub struct JsonSpendEntry {
+    pub spent_uid: u64,
+}
+
+pub fn light_block_to_json(bytes: &[u8]) -> anyhow::Result<JsonLightBlock> {
     let mut cursor = Cursor::new(bytes);
     let message = capnp::serialize_packed::read_message(&mut cursor, ReaderOptions::new())?;
     let block = message.get_root::<light_block::Reader>()?;
 
-    let output_id_bytes = block.get_output_id_bytes();
-    let output_id_len = output_id_bytes as usize;
-    let output_ids = block.get_output_ids()?;
-    let outputs_reader = block.get_outputs()?;
-    anyhow::ensure!(
-        output_ids.len() == outputs_reader.len() as usize * output_id_len,
-        "packed output ID length mismatch in cached block"
-    );
+    let skipped_txs_for_tweaks = read_u16_list(block.get_skipped_txs_for_tweaks()?);
+    let skipped_outputs = read_u16_list(block.get_skipped_outputs()?);
 
-    let mut outputs = Vec::with_capacity(outputs_reader.len() as usize);
-    for i in 0..outputs_reader.len() {
-        let output = outputs_reader.get(i);
-        let offset = i as usize * output_id_len;
-        outputs.push(JsonOutputRef {
-            tx_index: output.get_tx_index(),
-            vout: output.get_vout(),
-            uid: output.get_uid(),
-            output_id: hex::encode(&output_ids[offset..offset + output_id_len]),
+    let tweak_reader = block.get_tweaks()?;
+    let mut tweaks = Vec::with_capacity(tweak_reader.len() as usize);
+    for i in 0..tweak_reader.len() {
+        let entry = tweak_reader.get(i);
+        let tweak = entry.get_tweak()?;
+        anyhow::ensure!(tweak.len() == 32, "tweak entry {i} is not 32 bytes");
+        tweaks.push(JsonTweakEntry {
+            output_count: entry.get_output_count(),
+            tweak: hex::encode(tweak),
         });
     }
 
-    let tweak_indexes = decode_tx_tweak_indexes(
-        block.get_tx_tweak_indexes()?,
-        block.get_tweak_count() as usize,
-    )?;
-    let tweak_bytes = block.get_tx_tweaks()?;
-    anyhow::ensure!(
-        tweak_bytes.len() == tweak_indexes.len() * crate::types::TxTweak::LEN,
-        "tx tweak byte length mismatch"
-    );
-    let tweaks = tweak_indexes
-        .into_iter()
-        .enumerate()
-        .map(|(i, tx_index)| JsonTxTweak {
-            tx_index,
-            tweak: hex::encode(
-                &tweak_bytes[i * crate::types::TxTweak::LEN..(i + 1) * crate::types::TxTweak::LEN],
-            ),
-        })
-        .collect();
+    let output_reader = block.get_outputs()?;
+    let mut outputs = Vec::with_capacity(output_reader.len() as usize);
+    let mut skipped_iter = skipped_outputs.iter().copied().peekable();
+    let mut flattened_output_index = 0u64;
+    for i in 0..output_reader.len() {
+        while skipped_iter
+            .peek()
+            .is_some_and(|skipped| u64::from(*skipped) == flattened_output_index)
+        {
+            skipped_iter.next();
+            flattened_output_index += 1;
+        }
 
-    let spent_uids = decode_spent_uids(
-        block.get_block_anchor_last_uid(),
-        block.get_spent_ids()?,
-        block.get_spent_count() as usize,
-    )?;
+        let entry = output_reader.get(i);
+        let key = entry.get_key()?;
+        anyhow::ensure!(key.len() == 32, "output entry {i} key is not 32 bytes");
+        outputs.push(JsonOutputEntry {
+            uid: block.get_first_uid() + flattened_output_index,
+            key: hex::encode(key),
+        });
+        flattened_output_index += 1;
+    }
+
+    let spend_reader = block.get_spends()?;
+    let mut spends = Vec::with_capacity(spend_reader.len() as usize);
+    for i in 0..spend_reader.len() {
+        spends.push(JsonSpendEntry {
+            spent_uid: spend_reader.get(i).get_spent_uid(),
+        });
+    }
 
     Ok(JsonLightBlock {
         version: block.get_version(),
         height: block.get_height(),
         block_hash: hex::encode(block.get_block_hash()?),
         previous_block_hash: hex::encode(block.get_previous_block_hash()?),
-        block_anchor_last_uid: block.get_block_anchor_last_uid(),
-        profile: json_profile(profile),
-        output_id_bytes,
+        first_uid: block.get_first_uid(),
+        skipped_txs_for_tweaks,
         tweaks,
+        skipped_outputs,
         outputs,
-        spent_id_codec: "eliasDeltaSorted",
-        spent_uids,
+        spends,
     })
 }
 
-fn json_profile(profile: Option<&ServedProfile>) -> JsonProfile {
-    match profile {
-        Some(profile) => JsonProfile {
-            name: Some(profile.name.clone()),
-            scope: profile.profile.scope.as_str().to_string(),
-            cutthrough: profile.profile.cutthrough_blocks != 0,
-            cutthrough_blocks: profile.profile.cutthrough_blocks,
-        },
-        None => JsonProfile {
-            name: None,
-            scope: "unknown".to_string(),
-            cutthrough: false,
-            cutthrough_blocks: 0,
-        },
+fn read_u16_list(list: capnp::primitive_list::Reader<'_, u16>) -> Vec<u16> {
+    let mut out = Vec::with_capacity(list.len() as usize);
+    for i in 0..list.len() {
+        out.push(list.get(i));
     }
+    out
 }

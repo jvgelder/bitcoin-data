@@ -38,7 +38,6 @@ pub enum SpTweakError {
 
 pub type SpTweakResult<T> = Result<T, SpTweakError>;
 
-
 #[derive(Debug, Clone, Copy)]
 pub struct PrevoutInfo {
     pub script: PrevoutScript,
@@ -63,10 +62,24 @@ pub struct TxInputContext {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanPointIneligibleReason {
+    /// No eligible input public key material was found after script/witness
+    /// classification. This is normal for non-BIP352-capable spends.
+    NoEligibleInputs,
+    /// BIP352 v0 excludes transactions that spend witness versions greater
+    /// than one.
+    WitnessVersionGreaterThanOne,
+    /// Eligible input keys existed, but their group sum was the point at
+    /// infinity. This is unusual and worth logging/investigating, but the tx
+    /// still cannot produce a valid scan point.
+    PublicKeySumInfinity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanPointStatus {
     /// The transaction cannot create BIP352 outputs because no eligible input
     /// material was found or a BIP352 v0 exclusion applies.
-    Ineligible,
+    Ineligible { reason: ScanPointIneligibleReason },
     /// At least one non-coinbase input is missing prevout context. Computing a
     /// partial scan point would be incorrect, so the indexer must omit it.
     MissingPrevout { missing_count: usize },
@@ -80,7 +93,9 @@ pub fn compute_tx_scan_point(inputs: &[TxInputContext]) -> SpTweakResult<ScanPoi
             .iter()
             .all(|input| input.previous_output.is_coinbase())
     {
-        return Ok(ScanPointStatus::Ineligible);
+        return Ok(ScanPointStatus::Ineligible {
+            reason: ScanPointIneligibleReason::NoEligibleInputs,
+        });
     }
 
     let missing_count = inputs
@@ -92,7 +107,9 @@ pub fn compute_tx_scan_point(inputs: &[TxInputContext]) -> SpTweakResult<ScanPoi
     }
 
     if spends_witness_version_greater_than_one(inputs) {
-        return Ok(ScanPointStatus::Ineligible);
+        return Ok(ScanPointStatus::Ineligible {
+            reason: ScanPointIneligibleReason::WitnessVersionGreaterThanOne,
+        });
     }
 
     let secp = Secp256k1::verification_only();
@@ -113,22 +130,30 @@ pub fn compute_tx_scan_point(inputs: &[TxInputContext]) -> SpTweakResult<ScanPoi
     }
 
     if eligible_pubkeys.is_empty() {
-        return Ok(ScanPointStatus::Ineligible);
+        return Ok(ScanPointStatus::Ineligible {
+            reason: ScanPointIneligibleReason::NoEligibleInputs,
+        });
     }
 
     let pubkey_refs = eligible_pubkeys.iter().collect::<Vec<_>>();
-    let sum = PublicKey::combine_keys(&pubkey_refs)
-        .map_err(|_| SpTweakError::PublicKeySumInfinity)?;
+    let sum = match PublicKey::combine_keys(&pubkey_refs) {
+        Ok(sum) => sum,
+        Err(_) => {
+            return Ok(ScanPointStatus::Ineligible {
+                reason: ScanPointIneligibleReason::PublicKeySumInfinity,
+            });
+        }
+    };
 
-    let outpoint_l = smallest_non_coinbase_outpoint(inputs)
-        .ok_or(SpTweakError::EmptyNonCoinbaseInputSet)?;
+    let outpoint_l =
+        smallest_non_coinbase_outpoint(inputs).ok_or(SpTweakError::EmptyNonCoinbaseInputSet)?;
     let mut input_hash_preimage = Vec::with_capacity(36 + 33);
     input_hash_preimage.extend_from_slice(&outpoint_l);
     input_hash_preimage.extend_from_slice(&sum.serialize());
 
     let input_hash = tagged_sha256(BIP352_INPUTS_TAG, &input_hash_preimage);
-    let scalar = Scalar::from_be_bytes(input_hash)
-        .map_err(|_| SpTweakError::InvalidInputHashScalar)?;
+    let scalar =
+        Scalar::from_be_bytes(input_hash).map_err(|_| SpTweakError::InvalidInputHashScalar)?;
 
     let scan_point = sum
         .mul_tweak(&secp, &scalar)
@@ -230,10 +255,9 @@ fn parse_compressed_pubkey_matching_hash(
     if hash160_bytes(bytes) != expected_hash {
         return Ok(None);
     }
-    Ok(Some(
-        PublicKey::from_slice(bytes)
-            .map_err(|source| SpTweakError::InvalidCompressedInputPublicKey { source })?,
-    ))
+    Ok(Some(PublicKey::from_slice(bytes).map_err(|source| {
+        SpTweakError::InvalidCompressedInputPublicKey { source }
+    })?))
 }
 
 fn taproot_script_path_internal_key(witness: &[Vec<u8>]) -> Option<[u8; 32]> {
@@ -351,7 +375,9 @@ mod tests {
     fn empty_prevouts_are_ineligible() {
         assert_eq!(
             compute_tx_scan_point(&[]).unwrap(),
-            ScanPointStatus::Ineligible
+            ScanPointStatus::Ineligible {
+                reason: ScanPointIneligibleReason::NoEligibleInputs,
+            }
         );
     }
 
@@ -416,7 +442,12 @@ mod tests {
         }])
         .unwrap();
 
-        assert_eq!(status, ScanPointStatus::Ineligible);
+        assert_eq!(
+            status,
+            ScanPointStatus::Ineligible {
+                reason: ScanPointIneligibleReason::WitnessVersionGreaterThanOne,
+            }
+        );
     }
 
     #[test]

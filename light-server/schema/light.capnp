@@ -1,79 +1,69 @@
 @0xb17c0da7a4510001;
 
+# Client/server response format. This stays compact and does not expose
+# server-side storage metadata such as reuse or spent height.
 struct LightBlock {
   version @0 :UInt16;
   height @1 :UInt64;
-  blockHash @2 :Data;
-  previousBlockHash @3 :Data;
-  blockAnchorLastUid @4 :UInt64;
-  profile @5 :LightBlockProfile;
-  outputIdBytes @6 :UInt8;
-  tweakCount @7 :UInt32;
-  # Elias-delta encoded sorted tx indexes: first index as first+1, later indexes as deltas.
-  txTweakIndexes @8 :Data;
-  # Concatenated 33-byte compressed public tweak keys.
-  # Each element is input_hash*A for the tx at the corresponding txTweakIndexes entry.
-  txTweaks @9 :Data;
-  outputs @10 :List(OutputRef);
-  outputIds @11 :Data;
-  spentIdCodec @12 :SpentIdCodec;
-  spentCount @13 :UInt32;
-  spentIds @14 :Data;
+
+  blockHash @2 :Data;          # 32 bytes
+  previousBlockHash @3 :Data;  # 32 bytes
+
+  firstUid @4 :UInt64;
+
+  skippedTxsForTweaks @5 :List(UInt16);
+  tweaks @6 :List(TweakEntry);
+
+  skippedOutputs @7 :List(UInt16);
+  outputs @8 :List(OutputEntry);
+
+  spends @9 :List(SpendEntry);
 }
 
-struct OutputRef {
-  txIndex @0 :UInt32;
-  vout @1 :UInt32;
-  uid @2 :UInt64;
+struct TweakEntry {
+  outputCount @0 :UInt16;
+  tweak @1 :Data;              # 32 bytes
 }
 
-# SnapshotBlock is a live-output snapshot block, not a normal block delta.
-# A cut-through snapshot at height H contains only outputs that were created in
-# this block and are still live at H. It has no spent stream; outputs omitted
-# from the snapshot were spent by H or are outside the selected scope.
-struct SnapshotBlock {
+struct OutputEntry {
+  key @0 :Data;                # 32 bytes
+}
+
+struct SpendEntry {
+  spentUid @0 :UInt64;
+}
+
+# File archive storage format. The server reads this richer format and derives
+# the compact LightBlock response from it.
+struct StoredLightBlock {
   version @0 :UInt16;
-  height @1 :UInt64;
-  blockHash @2 :Data;
-  previousBlockHash @3 :Data;
-  blockAnchorLastUid @4 :UInt64;
-  outputIdBytes @5 :UInt8;
-  txs @6 :List(SnapshotTx);
+  height @1 :UInt32;
+
+  blockHash @2 :Data;          # 32 bytes
+  previousBlockHash @3 :Data;  # 32 bytes
+
+  firstUid @4 :UInt64;
+
+  skippedTxsForTweaks @5 :List(UInt16);
+  tweaks @6 :List(StoredTweakEntry);
+
+  skippedOutputs @7 :List(UInt16);
+  outputs @8 :List(StoredOutputEntry);
+
+  spends @9 :List(StoredSpendEntry);
 }
 
-struct SnapshotTx {
-  txIndex @0 :UInt32;
-  # 33-byte compressed public scan point input_hash*A for this transaction.
-  tweak @1 :Data;
-  outputs @2 :List(SnapshotOutputRef);
-  # Packed truncated output identifiers for outputs, using the parent block's
-  # outputIdBytes. len = outputs.len * outputIdBytes.
-  outputIds @3 :Data;
+struct StoredTweakEntry {
+  outputCount @0 :UInt16;
+  tweak @1 :Data;              # 32 bytes
+}
+struct StoredOutputEntry {
+  key @0 :Data;                # 32 bytes
+  spentHeight @1 :UInt32;      # UInt32::MAX means unspent
+  flags @2 :UInt8;             # bit 0 = reused
 }
 
-struct SnapshotOutputRef {
-  vout @0 :UInt32;
-  uid @1 :UInt64;
+struct StoredSpendEntry {
+  spentUid @0 :UInt64;
+  creationHeight @1 :UInt32;
 }
-
-struct LightBlockProfile {
-  scope @0 :ArchiveScope;
-  # 0 means raw/no cut-through. Non-zero cut-through profiles are materialized
-  # on fixed boundaries and have their own served tips.
-  cutThroughBlocks @1 :UInt32;
-}
-
-enum ArchiveScope {
-  # Silent Payments candidate scope: every P2TR output after Taproot activation receives a UID.
-  # Reused P2TR keys are included. NUMS is an input-side BIP352 spend rule, not an output filter.
-  p2trSp @0;
-  # Every P2TR output receives a UID, including NUMS and reused keys.
-  p2tr @1;
-  # Every Bitcoin output receives a UID when the archive is initialized with this scope.
-  allOutputs @2;
-}
-
-enum SpentIdCodec {
-  eliasDeltaSorted @0;
-}
-

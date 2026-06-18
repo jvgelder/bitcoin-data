@@ -4,21 +4,22 @@ use bitcoin::Block;
 use btc_data_core::block::{BlockSpentTxOuts, SpentTxOut};
 use btc_data_core::source::{BlockSource, TipWatcher};
 use btc_data_light_server::index::{encode_light_block, to_packed_bytes};
+use btc_data_light_server::index_store::RocksIndexStore;
 use btc_data_light_server::p2tr_indexer::{
     BlockScanInput, BlockScopeStats, OutPointKey, P2trIndexerState, TxInputScan, TxOutputScan,
     TxScanInput,
 };
-use btc_data_light_server::profile::{ArchiveNetwork, ArchiveScope, Profile};
+use btc_data_light_server::profile::ArchiveNetwork;
 use btc_data_light_server::script_classify::{classify_script, extract_p2tr_xonly, ScriptKind};
-use btc_data_light_server::sp_tweak::{compute_tx_scan_point, PrevoutInfo, PrevoutScript, ScanPointStatus, TxInputContext};
-use btc_data_light_server::storage::{
-    ArchiveBackend, ChainTip, FileArchive, Manifest, ManifestProfile, SqliteArchive,
+use btc_data_light_server::sp_tweak::{
+    compute_tx_scan_point, PrevoutInfo, PrevoutScript, ScanPointIneligibleReason, ScanPointStatus,
+    TxInputContext,
 };
+use btc_data_light_server::storage::{ChainTip, FileArchive, Manifest};
 use btc_data_light_server::types::{BlockHashBytes, TxTweak, TxidBytes};
 use btc_data_sources::{IpcSource, PollingTipWatcher, RestSource};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use futures::{stream, StreamExt};
-use sqlx::Row;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,7 +28,6 @@ use tracing_subscriber::EnvFilter;
 const DEFAULT_CATCHUP_BATCH_SIZE: usize = 16;
 const DEFAULT_FLUSH_BLOCKS: usize = 128;
 const DEFAULT_MEMORY_BUDGET_MB: usize = 4096;
-const DEFAULT_INDEX_P2TR_KEY_STATS: bool = false;
 fn mb_to_bytes(mb: usize) -> usize {
     mb.saturating_mul(1024).saturating_mul(1024)
 }
@@ -35,7 +35,6 @@ fn mb_to_bytes(mb: usize) -> usize {
 const ESTIMATED_PENDING_RAW_MULTIPLIER: usize = 4;
 const ESTIMATED_PENDING_PAYLOAD_MULTIPLIER: usize = 2;
 const ESTIMATED_PENDING_BLOCK_OVERHEAD_BYTES: usize = 64 * 1024;
-const SQL_OUTPOINT_LOOKUP_CHUNK: usize = 400;
 
 fn estimate_pending_memory_bytes(
     processed_raw_bytes_since_flush: usize,
@@ -46,16 +45,6 @@ fn estimate_pending_memory_bytes(
         .saturating_mul(ESTIMATED_PENDING_RAW_MULTIPLIER)
         .saturating_add(pending_payload_bytes.saturating_mul(ESTIMATED_PENDING_PAYLOAD_MULTIPLIER))
         .saturating_add(pending_blocks.saturating_mul(ESTIMATED_PENDING_BLOCK_OVERHEAD_BYTES))
-}
-
-#[derive(Debug, Default)]
-struct SqlTiming {
-    core_cache_ms: u128,
-    p2tr_output_ms: u128,
-    p2tr_key_stats_ms: u128,
-    p2tr_spend_ms: u128,
-    tx_tweak_ms: u128,
-    profile_tip_ms: u128,
 }
 
 #[derive(Debug, Parser)]
@@ -158,29 +147,7 @@ enum Command {
         #[arg(long, default_value_t = ArchiveNetwork::Fixture)]
         network: ArchiveNetwork,
 
-        #[arg(long, default_value_t = ArchiveScope::P2trSp)]
-        scope: ArchiveScope,
-
-        /// Override the default start height for the selected network/scope.
-        #[arg(long)]
-        start_height: Option<u64>,
-
-        #[arg(long, default_value_t = 3)]
-        count: u64,
-    },
-
-    /// Generate a deterministic SQLite fixture archive for the Axum/SQLx server.
-    FixtureDb {
-        #[arg(long, default_value = "sqlite:lightdata.db")]
-        database_url: String,
-
-        #[arg(long, default_value_t = ArchiveNetwork::Fixture)]
-        network: ArchiveNetwork,
-
-        #[arg(long, default_value_t = ArchiveScope::P2trSp)]
-        scope: ArchiveScope,
-
-        /// Override the default start height for the selected network/scope.
+        /// Override the default start height for the selected network.
         #[arg(long)]
         start_height: Option<u64>,
 
@@ -193,14 +160,16 @@ enum Command {
         #[command(flatten)]
         source: SourceCli,
 
-        #[arg(long, default_value = "sqlite:lightdata.db")]
-        database_url: String,
+        /// File-backed payload archive root. Encoded block payloads are written here.
+        #[arg(long, default_value = "lightdata")]
+        archive_dir: PathBuf,
+
+        /// RocksDB directory for indexer-only prevout and metadata state.
+        #[arg(long, default_value = "light-indexer-rocksdb")]
+        index_db_dir: PathBuf,
 
         #[arg(long, default_value_t = ArchiveNetwork::Mainnet)]
         network: ArchiveNetwork,
-
-        #[arg(long, default_value_t = ArchiveScope::P2trSp)]
-        scope: ArchiveScope,
 
         #[arg(long, default_value_t = 6)]
         finality_depth: u64,
@@ -209,7 +178,7 @@ enum Command {
         #[arg(long, default_value_t = DEFAULT_CATCHUP_BATCH_SIZE)]
         catchup_batch_size: usize,
 
-        /// Maximum number of applied blocks kept in RAM before one atomic SQLite flush.
+        /// Maximum number of applied blocks kept in RAM before one archive/index flush.
         /// Larger values reduce write/commit overhead but increase crash rework
         /// and peak memory. The indexer may flush earlier when estimated pending
         /// memory reaches --memory-budget-mb.
@@ -224,12 +193,6 @@ enum Command {
         /// Deprecated alias: --max-buffered-raw-mb.
         #[arg(long, default_value_t = DEFAULT_MEMORY_BUDGET_MB, alias = "max-buffered-raw-mb")]
         memory_budget_mb: usize,
-
-        /// Maintain historical output-key reuse/debug counters in SQLite.
-        /// Disabled by default because it is not needed for served light payload
-        /// correctness and is very expensive during high-P2TR ranges.
-        #[arg(long, default_value_t = DEFAULT_INDEX_P2TR_KEY_STATS)]
-        index_p2tr_key_stats: bool,
 
         /// Do one catch-up pass and exit without waiting for another tip signal.
         #[arg(long, default_value_t = false)]
@@ -283,52 +246,38 @@ async fn main() -> anyhow::Result<()> {
         Command::Fixture {
             archive,
             network,
-            scope,
             start_height,
             count,
         } => {
-            let start_height = start_height.unwrap_or_else(|| scope.default_start_height(network));
-            write_fixture_archive(archive, network, scope, start_height, count)
-        }
-
-        Command::FixtureDb {
-            database_url,
-            network,
-            scope,
-            start_height,
-            count,
-        } => {
-            let start_height = start_height.unwrap_or_else(|| scope.default_start_height(network));
-            write_fixture_db(database_url, network, scope, start_height, count).await
+            let start_height = start_height.unwrap_or_else(|| network.default_start_height());
+            write_fixture_archive(archive, network, start_height, count)
         }
 
         Command::Run {
             source,
-            database_url,
+            archive_dir,
+            index_db_dir,
             network,
-            scope,
             finality_depth,
             catchup_batch_size,
             flush_blocks,
             memory_budget_mb,
-            index_p2tr_key_stats,
             once,
         } => {
-            let emit_start_height = scope.default_start_height(network);
+            let emit_start_height = network.default_start_height();
             run_command(
                 source,
-                database_url,
+                archive_dir,
+                index_db_dir,
                 network,
-                scope,
                 emit_start_height,
                 finality_depth,
                 catchup_batch_size,
                 flush_blocks,
-                mb_to_bytes(memory_budget_mb),
-                index_p2tr_key_stats,
+                memory_budget_mb,
                 once,
             )
-                .await
+            .await
         }
 
         Command::SourceTip { source } => source_tip_command(source).await,
@@ -347,46 +296,17 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn configure_indexer_sqlite(archive: &SqliteArchive) -> anyhow::Result<()> {
-    // Indexer writes are already committed at finalized range boundaries. WAL +
-    // NORMAL keeps crash consistency while avoiding a full fsync-style penalty
-    // for every statement inside the large transaction. Temp tables are heavily
-    // used for temporary indexer work.
-    sqlx::query("PRAGMA journal_mode = WAL")
-        .execute(archive.pool())
-        .await?;
-    sqlx::query("PRAGMA synchronous = NORMAL")
-        .execute(archive.pool())
-        .await?;
-    sqlx::query("PRAGMA temp_store = MEMORY")
-        .execute(archive.pool())
-        .await?;
-    // Let SQLite/OS cache hot index and table pages instead of maintaining a
-    // second large Rust-side historical live set. Negative cache_size is KiB.
-    sqlx::query("PRAGMA cache_size = -1000000")
-        .execute(archive.pool())
-        .await?;
-    sqlx::query("PRAGMA mmap_size = 4294967296")
-        .execute(archive.pool())
-        .await?;
-    sqlx::query("PRAGMA busy_timeout = 5000")
-        .execute(archive.pool())
-        .await?;
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_command(
     source: SourceCli,
-    database_url: String,
+    archive_dir: PathBuf,
+    index_db_dir: PathBuf,
     network: ArchiveNetwork,
-    scope: ArchiveScope,
     emit_start_height: u64,
     finality_depth: u64,
     catchup_batch_size: usize,
     flush_blocks: usize,
-    memory_budget_bytes: usize,
-    index_p2tr_key_stats: bool,
+    memory_budget_mb: usize,
     once: bool,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -394,44 +314,36 @@ async fn run_command(
         "catchup_batch_size must be greater than zero"
     );
     anyhow::ensure!(flush_blocks > 0, "flush_blocks must be greater than zero");
+    let memory_budget_bytes = mb_to_bytes(memory_budget_mb);
 
     let bundle = source.build_bundle()?;
     anyhow::ensure!(
         bundle.undo_source.supports_block_spent_txouts(),
         "light-indexer requires a REST undo source with /rest/spenttxouts enabled"
     );
-    let archive = SqliteArchive::connect(&database_url, true).await?;
-    configure_indexer_sqlite(&archive).await?;
-    archive.migrate().await?;
-    ensure_archive_meta(&archive, network, scope, emit_start_height).await?;
+    let file_archive = FileArchive::new(archive_dir);
+    let index_store = RocksIndexStore::open(&index_db_dir)?;
+    index_store.ensure_meta(&network.to_string(), emit_start_height)?;
 
-    let profile = Profile {
-        scope,
-        cutthrough_blocks: 0,
-    };
-    let db_profile = archive.resolve_profile(None, Some(profile)).await?;
-
-    validate_resume_boundary(&archive, db_profile.profile_id, emit_start_height).await?;
-    let profile_next_height =
-        next_index_height(&archive, db_profile.profile_id, emit_start_height).await?;
-    let committed_profile_tip = profile_next_height
-        .checked_sub(1)
-        .filter(|h| *h >= emit_start_height);
-    let mut state = restore_indexer_state(&archive, committed_profile_tip).await?;
-    let initial_next_height = profile_next_height;
+    let tip = index_store.tip()?;
+    let committed_tip = tip.map(|tip| tip.height);
+    let initial_next_height = committed_tip
+        .map(|height| height + 1)
+        .unwrap_or(emit_start_height);
+    let mut state = P2trIndexerState::restore_at_uid(tip.map(|tip| tip.last_uid).unwrap_or(0));
     println!(
-        "restored indexer state profile_tip={} next_height={} emit_start_height={} last_uid={} live_p2tr_utxos={} fetch_blocks={} flush_blocks={} memory_budget_mb={} index_p2tr_key_stats={}",
-        committed_profile_tip
+        "restored indexer state tip={} next_height={} emit_start_height={} last_uid={} fetch_blocks={} flush_blocks={} memory_budget_mb={} archive_dir={} index_db_dir={}",
+        committed_tip
             .map(|h| h.to_string())
             .unwrap_or_else(|| "none".to_string()),
         initial_next_height,
         emit_start_height,
         state.last_uid(),
-        state.live_uid_count(),
         catchup_batch_size,
         flush_blocks,
         memory_budget_bytes / 1024 / 1024,
-        index_p2tr_key_stats,
+        file_archive.root().display(),
+        index_db_dir.display(),
     );
 
     let mut chain_next_height = initial_next_height;
@@ -443,35 +355,36 @@ async fn run_command(
         let next_height = chain_next_height;
 
         println!(
-            "source={} watcher={} best_height={} best_hash={} finalized_tip={} next_height={} database={}",
+            "source={} watcher={} best_height={} best_hash={} finalized_tip={} next_height={} archive_dir={} index_db_dir={}",
             bundle.source.name(),
             bundle.watcher.name(),
             best_height,
             display_hash(best_hash),
             finalized_tip,
             next_height,
-            database_url,
+            file_archive.root().display(),
+            index_db_dir.display(),
         );
 
         if next_height <= finalized_tip {
             chain_next_height = catch_up_ranges(
-                &archive,
+                &file_archive,
+                &index_store,
+                network,
                 bundle.source.as_ref(),
                 bundle.undo_source.as_ref(),
                 &mut state,
                 CatchUpConfig {
-                    profile,
-                    profile_id: db_profile.profile_id,
                     emit_start_height,
+                    finality_depth,
                     fetch_batch_size: catchup_batch_size,
                     flush_blocks,
                     memory_budget_bytes,
-                    index_p2tr_key_stats,
                 },
                 next_height,
                 finalized_tip,
             )
-                .await?;
+            .await?;
 
             // Continue immediately after catch-up work. While processing a large
             // historical range, Core may advance again; do not wait until there
@@ -491,28 +404,26 @@ async fn run_command(
     }
 }
 
-const SQL_INSERT_CHUNK: usize = 128;
-const SQL_UTXO_MUTATION_CHUNK: usize = 512;
-
 // NOTE: source chunks are fetched/decoded in bounded batches, then compact
-// applied light data is buffered until the SQLite flush boundary. Silent
+// applied light data is buffered until the archive/index flush boundary. Silent
 // Payment tweaks are computed directly from Bitcoin Core undo data returned
 // by /rest/spenttxouts, so no mutable prevout store is needed.
 /// Bundles the per-run settings for [`catch_up_ranges`], replacing a long
 /// positional argument list. Handles (archive/source/state) and the
 /// dynamic range bounds stay as direct parameters.
 struct CatchUpConfig {
-    profile: Profile,
-    profile_id: i64,
     emit_start_height: u64,
+    finality_depth: u64,
     fetch_batch_size: usize,
     flush_blocks: usize,
     memory_budget_bytes: usize,
-    index_p2tr_key_stats: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn catch_up_ranges(
-    archive: &SqliteArchive,
+    file_archive: &FileArchive,
+    index_store: &RocksIndexStore,
+    network: ArchiveNetwork,
     source: &dyn BlockSource,
     undo_source: &dyn BlockSource,
     state: &mut P2trIndexerState,
@@ -521,13 +432,11 @@ async fn catch_up_ranges(
     finalized_tip: u64,
 ) -> anyhow::Result<u64> {
     let CatchUpConfig {
-        profile,
-        profile_id,
         emit_start_height,
+        finality_depth,
         fetch_batch_size,
         flush_blocks,
         memory_budget_bytes,
-        index_p2tr_key_stats,
     } = config;
     let remaining = finalized_tip - start_height + 1;
     let flush_count = usize::try_from(remaining.min(flush_blocks as u64))?;
@@ -550,9 +459,9 @@ async fn catch_up_ranges(
     let mut total_apply_elapsed = Duration::ZERO;
     let mut pending: Vec<Pending> = Vec::with_capacity(flush_count);
 
-    // Seeded from the committed profile tip so the first chunk's parent linkage
+    // Seeded from the committed tip so the first chunk's parent linkage
     // is checked against the last served block, not against itself.
-    let mut previous_tip_hash: Option<BlockHashBytes> = committed_tip_hash(archive, profile_id).await?;
+    let mut previous_tip_hash: Option<BlockHashBytes> = index_store.previous_tip_hash()?;
     let mut chunk_start = start_height;
     while chunk_start <= flush_end_height {
         let chunk_remaining = flush_end_height - chunk_start + 1;
@@ -561,13 +470,7 @@ async fn catch_up_ranges(
         // Stage 1: fetch + decode this bounded source chunk. The helper consumes
         // the raw frames instead of cloning their byte buffers, keeping peak
         // memory bounded to one source chunk plus its decoded block inputs.
-        let chunk = fetch_and_decode_chunk(
-            source,
-            undo_source,
-            chunk_start,
-            chunk_count,
-        )
-            .await?;
+        let chunk = fetch_and_decode_chunk(source, undo_source, chunk_start, chunk_count).await?;
         total_fetch_elapsed += chunk.fetch_elapsed;
         total_decode_elapsed += chunk.decode_elapsed;
         processed_raw_bytes_since_flush += chunk.raw_bytes;
@@ -600,40 +503,39 @@ async fn catch_up_ranges(
         );
 
         // Stage 2a: resolve historical spend UIDs missing from the small
-        // in-process map. SQLite owns history and its page cache/mmap keeps hot
-        // index pages warm. The resolved candidates are temporary and are
+        // in-process map. RocksDB owns historical outpoint lookup state. The resolved candidates are temporary and are
         // cleared immediately after this chunk is applied.
         let lookup_started = Instant::now();
-        let sqlite_spend_outpoints = lookup_spend_uids_for_chunk(archive, &mut *state, &decoded).await?;
+        let rocksdb_spend_outpoints =
+            lookup_spend_uids_for_chunk(index_store, &mut *state, &decoded)?;
         let lookup_elapsed = lookup_started.elapsed();
-        if !sqlite_spend_outpoints.is_empty() {
+        if !rocksdb_spend_outpoints.is_empty() {
             println!(
-                "resolved sqlite spend uid candidates chunk_start={} entries={} lookup_ms={}",
+                "resolved RocksDB spend UID candidates chunk_start={} entries={} lookup_ms={}",
                 chunk_first_height,
-                sqlite_spend_outpoints.len(),
+                rocksdb_spend_outpoints.len(),
                 lookup_elapsed.as_millis()
             );
         }
 
         // Stage 2b: serial, ordered apply. State advances in memory until the
         // flush transaction commits. A crash before commit will reprocess from
-        // the last committed profile tip.
+        // the last committed tip.
         let apply_started = Instant::now();
         for scan in decoded {
             let emit_light_payload = scan.height >= emit_start_height;
             if emit_light_payload {
-                let applied = state.apply_block_with_stats(scan, profile)?;
+                let applied = state.apply_block_with_stats(scan)?;
                 let payload = to_packed_bytes(&encode_light_block(&applied.light_block)?)?;
                 pending_payload_bytes = pending_payload_bytes.saturating_add(payload.len());
                 pending.push(Pending { applied, payload });
             }
         }
-        let cleared_sqlite_candidates = state.evict_spend_uid_candidates(sqlite_spend_outpoints);
-        if cleared_sqlite_candidates > 0 {
+        let cleared_rocksdb_candidates = state.evict_spend_uid_candidates(rocksdb_spend_outpoints);
+        if cleared_rocksdb_candidates > 0 {
             println!(
-                "cleared unresolved sqlite spend uid candidates chunk_start={} entries={}",
-                chunk_first_height,
-                cleared_sqlite_candidates
+                "cleared unresolved RocksDB spend UID candidates chunk_start={} entries={}",
+                chunk_first_height, cleared_rocksdb_candidates
             );
         }
         total_apply_elapsed += apply_started.elapsed();
@@ -665,216 +567,40 @@ async fn catch_up_ranges(
     let last_height = last_height.expect("last height set");
     let last_hash = last_hash.expect("last hash set");
 
-    // Stage 3: batched multi-row inserts in one transaction.
-    let sql_started = Instant::now();
-    let mut sql_timing = SqlTiming::default();
-    let mut tx = archive.pool().begin().await?;
-
-    let core_cache_started = Instant::now();
-    for chunk in pending.chunks(SQL_INSERT_CHUNK) {
-        {
-            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-                "INSERT INTO blocks \
-                 (height, block_hash, previous_block_hash, p2tr_created_count, p2tr_spent_count, anchor_last_uid) ",
-            );
-            qb.push_values(chunk, |mut b, p| {
-                let block = &p.applied.light_block;
-                let stats = &p.applied.stats;
-                b.push_bind(i64::try_from(block.height).expect("height fits in i64"))
-                    .push_bind(block.block_hash.as_bytes().to_vec())
-                    .push_bind(block.previous_block_hash.as_bytes().to_vec())
-                    .push_bind(i64::from(stats.indexed_output_count))
-                    .push_bind(i64::from(stats.indexed_spent_count))
-                    .push_bind(
-                        i64::try_from(block.block_anchor_last_uid).expect("UID fits in i64"),
-                    );
-            });
-            qb.build().execute(&mut *tx).await?;
-        }
-        {
-            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-                "INSERT INTO block_stats \
-                 (height, tx_count, output_count_total, p2tr_output_count, p2tr_sp_candidate_count, \
-                  p2tr_nums_count, p2tr_reused_count, p2tr_excluded_by_scope_count, \
-                  indexed_output_count, indexed_spent_count, tx_with_p2tr_output_count, \
-                  tx_with_indexed_output_count, tweak_count) ",
-            );
-            qb.push_values(chunk, |mut b, p| {
-                let block = &p.applied.light_block;
-                let s = &p.applied.stats;
-                b.push_bind(i64::try_from(block.height).expect("height fits in i64"))
-                    .push_bind(i64::from(s.tx_count))
-                    .push_bind(i64::from(s.output_count_total))
-                    .push_bind(i64::from(s.p2tr_output_count))
-                    .push_bind(i64::from(s.p2tr_sp_candidate_count))
-                    .push_bind(i64::from(s.p2tr_nums_count))
-                    .push_bind(i64::from(s.p2tr_reused_count))
-                    .push_bind(i64::from(s.p2tr_excluded_by_scope_count))
-                    .push_bind(i64::from(s.indexed_output_count))
-                    .push_bind(i64::from(s.indexed_spent_count))
-                    .push_bind(i64::from(s.tx_with_p2tr_output_count))
-                    .push_bind(i64::from(s.tx_with_indexed_output_count))
-                    .push_bind(i64::from(s.tweak_count));
-            });
-            qb.build().execute(&mut *tx).await?;
-        }
-        {
-            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-                "INSERT INTO payload_cache \
-                 (profile_id, height, block_hash, payload, payload_len, created_at) ",
-            );
-            qb.push_values(chunk, |mut b, p| {
-                let block = &p.applied.light_block;
-                b.push_bind(profile_id)
-                    .push_bind(i64::try_from(block.height).expect("height fits in i64"))
-                    .push_bind(block.block_hash.as_bytes().to_vec())
-                    .push_bind(p.payload.clone())
-                    .push_bind(i64::try_from(p.payload.len()).expect("payload length fits in i64"))
-                    .push("unixepoch()");
-            });
-            qb.build().execute(&mut *tx).await?;
-        }
+    // Write served block payloads to the file-backed archive before advancing the
+    // tip. Extra files above the committed tip are harmless after a crash;
+    // the RocksDB tip remains the recovery boundary.
+    let payload_file_started = Instant::now();
+    for p in &pending {
+        let block = &p.applied.light_block;
+        file_archive.write_block_bytes(block.height, &p.payload)?;
     }
-    sql_timing.core_cache_ms = core_cache_started.elapsed().as_millis();
+    let payload_file_ms = payload_file_started.elapsed().as_millis();
 
-    // Stage 4: persist lifecycle rows. Replay from the profile start remains
-    // deterministic, so no live UID snapshot is materialized here.
+    // Stage 3: commit indexer working state after payload files are durable.
+    let index_started = Instant::now();
+    index_store.commit_applied_blocks(
+        pending.iter().map(|p| &p.applied),
+        last_height,
+        last_hash,
+        state.last_uid(),
+    )?;
+    index_store.flush()?;
+    let index_ms = index_started.elapsed().as_millis();
 
-    let p2tr_created = pending
-        .iter()
-        .flat_map(|p| p.applied.created_utxos.iter())
-        .collect::<Vec<_>>();
-    let p2tr_output_started = Instant::now();
-    for chunk in p2tr_created.chunks(SQL_UTXO_MUTATION_CHUNK) {
-        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-            r#"INSERT INTO p2tr_outputs
-               (uid, created_height, tx_index, vout, value_sat, is_nums, is_reused,
-                reuse_count_at_creation, txid, script_pubkey, p2tr_xonly_key) "#,
-        );
-        qb.push_values(chunk, |mut b, created| {
-            let entry = &created.entry;
-            b.push_bind(i64::try_from(entry.uid).expect("uid fits in i64"))
-                .push_bind(i64::try_from(entry.created_height).expect("height fits in i64"))
-                .push_bind(i64::from(entry.tx_index))
-                .push_bind(i64::from(entry.outpoint.vout))
-                .push_bind(i64::try_from(entry.value_sat).expect("value_sat fits in i64"))
-                .push_bind(if created.is_nums { 1_i64 } else { 0_i64 })
-                .push_bind(if created.is_reused { 1_i64 } else { 0_i64 })
-                .push_bind(
-                    i64::try_from(created.reuse_count_at_creation)
-                        .expect("reuse_count_at_creation fits in i64"),
-                )
-                .push_bind(entry.outpoint.txid.as_bytes().to_vec())
-                .push_bind(entry.script_pubkey.clone())
-                .push_bind(entry.p2tr_xonly_key.to_vec());
-        });
-        qb.build().execute(&mut *tx).await?;
-    }
-    sql_timing.p2tr_output_ms = p2tr_output_started.elapsed().as_millis();
+    file_archive.write_manifest(&Manifest {
+        version: btc_data_light_server::WIRE_VERSION,
+        network: network.to_string(),
+        genesis_hash: None,
+        finality_depth,
+        suggested_reorg_cache_depth: finality_depth.max(144),
+        max_range_count: btc_data_light_server::DEFAULT_MAX_RANGE_COUNT,
+        tip: Some(ChainTip {
+            height: last_height,
+            block_hash: display_hash(*last_hash.as_bytes()),
+        }),
+    })?;
 
-    if index_p2tr_key_stats {
-        let p2tr_key_stats_started = Instant::now();
-        for chunk in p2tr_created.chunks(SQL_UTXO_MUTATION_CHUNK) {
-            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-                r#"INSERT INTO p2tr_key_stats
-                   (output_key, first_height, last_height, seen_count, first_uid, last_uid, is_nums) "#,
-            );
-            qb.push_values(chunk, |mut b, created| {
-                let entry = &created.entry;
-                b.push_bind(entry.p2tr_xonly_key.to_vec())
-                    .push_bind(i64::try_from(entry.created_height).expect("height fits in i64"))
-                    .push_bind(i64::try_from(entry.created_height).expect("height fits in i64"))
-                    .push_bind(1_i64)
-                    .push_bind(i64::try_from(entry.uid).expect("uid fits in i64"))
-                    .push_bind(i64::try_from(entry.uid).expect("uid fits in i64"))
-                    .push_bind(if created.is_nums { 1_i64 } else { 0_i64 });
-            });
-            qb.push(
-                r#" ON CONFLICT(output_key) DO UPDATE SET
-                     last_height = excluded.last_height,
-                     seen_count = p2tr_key_stats.seen_count + 1,
-                     last_uid = excluded.last_uid,
-                     is_nums = CASE WHEN p2tr_key_stats.is_nums != 0 OR excluded.is_nums != 0 THEN 1 ELSE 0 END"#,
-            );
-            qb.build().execute(&mut *tx).await?;
-        }
-        sql_timing.p2tr_key_stats_ms = p2tr_key_stats_started.elapsed().as_millis();
-    }
-
-    let p2tr_spent = pending
-        .iter()
-        .flat_map(|p| p.applied.spent_utxos.iter())
-        .collect::<Vec<_>>();
-    let p2tr_spend_started = Instant::now();
-    for chunk in p2tr_spent.chunks(SQL_UTXO_MUTATION_CHUNK) {
-        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-            r#"INSERT INTO p2tr_spends
-               (uid, spent_height, spent_block_hash, spend_tx_index) "#,
-        );
-        qb.push_values(chunk, |mut b, spent| {
-            b.push_bind(i64::try_from(spent.uid).expect("uid fits in i64"))
-                .push_bind(i64::try_from(spent.spent_height).expect("height fits in i64"))
-                .push_bind(spent.spent_block_hash.as_bytes().to_vec())
-                .push_bind(i64::from(spent.spend_tx_index));
-        });
-        qb.build().execute(&mut *tx).await?;
-    }
-    sql_timing.p2tr_spend_ms = p2tr_spend_started.elapsed().as_millis();
-
-    let tx_tweak_started = Instant::now();
-    let tx_tweaks = pending
-        .iter()
-        .flat_map(|p| {
-            let block = &p.applied.light_block;
-            block
-                .tx_tweak_indexes
-                .iter()
-                .copied()
-                .zip(block.tx_tweaks.iter().copied())
-                .map(move |(tx_index, tweak)| (block.height, tx_index, tweak))
-        })
-        .collect::<Vec<_>>();
-    for chunk in tx_tweaks.chunks(SQL_UTXO_MUTATION_CHUNK) {
-        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-            r#"INSERT INTO tx_tweaks
-               (height, tx_index, tweak) "#,
-        );
-        qb.push_values(chunk, |mut b, (height, tx_index, tweak)| {
-            b.push_bind(i64::try_from(*height).expect("height fits in i64"))
-                .push_bind(i64::from(*tx_index))
-                .push_bind(tweak.as_bytes().to_vec());
-        });
-        qb.push(" ON CONFLICT(height, tx_index) DO UPDATE SET tweak = excluded.tweak");
-        qb.build().execute(&mut *tx).await?;
-    }
-    sql_timing.tx_tweak_ms = tx_tweak_started.elapsed().as_millis();
-
-    // Advance the served profile tip once per emitted range. Deterministic
-    // replay from genesis/profile start plus committed SQL rows is the recovery model.
-    let profile_tip_started = Instant::now();
-    if !pending.is_empty() {
-        sqlx::query(
-            r#"UPDATE profiles
-               SET served_tip_height = ?, served_tip_hash = ?
-               WHERE profile_id = ?"#,
-        )
-            .bind(i64::try_from(last_height)?)
-            .bind(last_hash.as_bytes().to_vec())
-            .bind(profile_id)
-            .execute(&mut *tx)
-            .await?;
-    }
-    sql_timing.profile_tip_ms = profile_tip_started.elapsed().as_millis();
-
-    // SQLite is now the only durable archive state. Undo data is fetched from
-    // Bitcoin Core per block, so there is no secondary prevout database to keep
-    // in sync with the served profile tip.
-    let commit_started = Instant::now();
-    tx.commit().await?;
-    let commit_elapsed = commit_started.elapsed();
-
-
-    let sql_elapsed = sql_started.elapsed();
     let total_elapsed = range_started.elapsed();
 
     let mut totals = BlockScopeStats::default();
@@ -921,51 +647,17 @@ async fn catch_up_ranges(
         indexed_spent = totals.indexed_spent_count,
         tx_tweaks = totals.tweak_count,
         last_uid = state.last_uid(),
-        live_uids = state.live_uid_count(),
+        cached_outpoints = state.cached_outpoint_count(),
         fetch_ms = total_fetch_elapsed.as_millis(),
         decode_ms = total_decode_elapsed.as_millis(),
         apply_ms = total_apply_elapsed.as_millis(),
-        sql_ms = sql_elapsed.as_millis(),
-        sql_core_cache_ms = sql_timing.core_cache_ms,
-        sql_p2tr_output_ms = sql_timing.p2tr_output_ms,
-        sql_p2tr_key_stats_ms = sql_timing.p2tr_key_stats_ms,
-        sql_p2tr_spend_ms = sql_timing.p2tr_spend_ms,
-        sql_tx_tweak_ms = sql_timing.tx_tweak_ms,
-        sql_profile_tip_ms = sql_timing.profile_tip_ms,
-        commit_ms = commit_elapsed.as_millis(),
+        index_ms,
+        payload_file_ms,
         total_ms = total_elapsed.as_millis(),
         "indexed finalized range"
     );
 
     Ok(last_height + 1)
-}
-
-
-async fn committed_tip_hash(
-    archive: &SqliteArchive,
-    profile_id: i64,
-) -> anyhow::Result<Option<BlockHashBytes>> {
-    let row = sqlx::query(
-        r#"SELECT served_tip_hash
-           FROM profiles
-           WHERE profile_id = ? AND served_tip_hash IS NOT NULL"#,
-    )
-        .bind(profile_id)
-        .fetch_optional(archive.pool())
-        .await?;
-
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    let bytes: Vec<u8> = row.try_get("served_tip_hash")?;
-    anyhow::ensure!(
-        bytes.len() == 32,
-        "profile {profile_id} has invalid served_tip_hash length {}",
-        bytes.len()
-    );
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&bytes);
-    Ok(Some(BlockHashBytes::from(hash)))
 }
 
 /// One fetched-and-decoded source chunk plus the fetch/decode telemetry the
@@ -976,6 +668,39 @@ struct DecodedChunk {
     raw_bytes: usize,
     fetch_elapsed: Duration,
     decode_elapsed: Duration,
+}
+
+fn lookup_spend_uids_for_chunk(
+    index_store: &RocksIndexStore,
+    state: &mut P2trIndexerState,
+    decoded: &[BlockScanInput],
+) -> anyhow::Result<Vec<OutPointKey>> {
+    let mut outpoints = Vec::<OutPointKey>::new();
+    for block in decoded {
+        for tx in &block.txs {
+            for input in &tx.inputs {
+                let outpoint = input.previous_output;
+                if !outpoint.is_coinbase() && !state.contains_outpoint(&outpoint) {
+                    outpoints.push(outpoint);
+                }
+            }
+        }
+    }
+
+    outpoints.sort_by(|a, b| {
+        a.txid
+            .as_bytes()
+            .cmp(b.txid.as_bytes())
+            .then_with(|| a.vout.cmp(&b.vout))
+    });
+    outpoints.dedup_by(|a, b| a.txid == b.txid && a.vout == b.vout);
+
+    if outpoints.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let found = index_store.lookup_outpoint_uids(&outpoints)?;
+    Ok(state.cache_spend_uid_candidates(found))
 }
 
 async fn fetch_and_decode_chunk(
@@ -1022,7 +747,7 @@ async fn fetch_and_decode_chunk(
     let raw_bytes: usize = frames.iter().map(|frame| frame.bytes.len()).sum();
 
     let decode_started = Instant::now();
-    let mut blocks: Vec<BlockScanInput> = stream::iter(frames.into_iter())
+    let mut blocks: Vec<BlockScanInput> = stream::iter(frames)
         .map(|frame| {
             let height = frame.height;
             let hash = frame.hash;
@@ -1039,8 +764,8 @@ async fn fetch_and_decode_chunk(
                 tokio::task::spawn_blocking(move || {
                     decode_block_frame(height, hash, bytes.as_ref(), Some(&spent_txouts))
                 })
-                    .await
-                    .map_err(|e| anyhow::anyhow!("decode worker failed: {e}"))?
+                .await
+                .map_err(|e| anyhow::anyhow!("decode worker failed: {e}"))?
             }
         })
         .buffer_unordered(chunk_count)
@@ -1160,7 +885,8 @@ fn decode_block_frame(
             });
         }
 
-        let silent_payment_tweak = compute_sp_tweak_from_undo(tx_index, &inputs, &outputs, spent_txouts)?;
+        let silent_payment_tweak =
+            compute_sp_tweak_from_undo(tx_index, txid, &inputs, &outputs, spent_txouts)?;
 
         txs.push(TxScanInput {
             txid,
@@ -1183,6 +909,7 @@ fn decode_block_frame(
 
 fn compute_sp_tweak_from_undo(
     tx_index: u32,
+    txid: TxidBytes,
     inputs: &[TxInputScan],
     outputs: &[TxOutputScan],
     spent_txouts: Option<&BlockSpentTxOuts>,
@@ -1206,9 +933,7 @@ fn compute_sp_tweak_from_undo(
     // to the same index in spent_txouts.txs.
     let undo_tx_index = usize::try_from(tx_index)?;
     let undo_inputs = spent_txouts.txs.get(undo_tx_index).ok_or_else(|| {
-        anyhow::anyhow!(
-            "spenttxouts missing undo tx entry for tx_index={tx_index}"
-        )
+        anyhow::anyhow!("spenttxouts missing undo tx entry for tx_index={tx_index}")
     })?;
     anyhow::ensure!(
         undo_inputs.len() == inputs.len(),
@@ -1227,9 +952,44 @@ fn compute_sp_tweak_from_undo(
         });
     }
 
+    let p2tr_output_count = outputs.iter().filter(|output| output.is_p2tr).count();
+
     match compute_tx_scan_point(&input_context)? {
         ScanPointStatus::Computed(tweak) => Ok(Some(tweak)),
-        ScanPointStatus::Ineligible | ScanPointStatus::MissingPrevout { .. } => Ok(None),
+        ScanPointStatus::Ineligible {
+            reason: ScanPointIneligibleReason::PublicKeySumInfinity,
+        } => {
+            tracing::warn!(
+                tx_index,
+                txid = %display_txid(txid),
+                input_count = inputs.len(),
+                p2tr_output_count,
+                "eligible input public-key sum is infinity; skipping silent-payment tweak"
+            );
+            Ok(None)
+        }
+        ScanPointStatus::Ineligible { reason } => {
+            tracing::debug!(
+                tx_index,
+                txid = %display_txid(txid),
+                ?reason,
+                input_count = inputs.len(),
+                p2tr_output_count,
+                "transaction is ineligible for silent-payment tweak; skipping tweak"
+            );
+            Ok(None)
+        }
+        ScanPointStatus::MissingPrevout { missing_count } => {
+            tracing::warn!(
+                tx_index,
+                txid = %display_txid(txid),
+                missing_count,
+                input_count = inputs.len(),
+                p2tr_output_count,
+                "missing prevout while computing silent-payment tweak; skipping tweak"
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -1328,6 +1088,10 @@ fn display_hash(mut hash: [u8; 32]) -> String {
     hex::encode(hash)
 }
 
+fn display_txid(txid: TxidBytes) -> String {
+    display_hash(txid.into_inner())
+}
+
 type FixtureBlocks = (
     Vec<(
         u64,
@@ -1342,17 +1106,8 @@ type FixtureBlocks = (
     u64,
 );
 
-fn fixture_blocks(
-    scope: ArchiveScope,
-    start_height: u64,
-    count: u64,
-) -> anyhow::Result<FixtureBlocks> {
+fn fixture_blocks(start_height: u64, count: u64) -> anyhow::Result<FixtureBlocks> {
     anyhow::ensure!(count > 0, "count must be greater than zero");
-
-    let profile = Profile {
-        scope,
-        cutthrough_blocks: 0,
-    };
 
     let mut state = P2trIndexerState::new();
     let mut tip_hash = BlockHashBytes::from([0u8; 32]);
@@ -1423,22 +1178,19 @@ fn fixture_blocks(
             silent_payment_tweak: Some(TxTweak::from([2u8; 33])),
         });
 
-        if scope.include_p2tr_output(false) {
+        if true {
             previous_indexed_outpoint = Some(OutPointKey {
                 txid: txid_b,
                 vout: 0,
             });
         }
 
-        let applied = state.apply_block_with_stats(
-            BlockScanInput {
-                height,
-                block_hash: hash,
-                previous_block_hash: prev_hash,
-                txs,
-            },
-            profile,
-        )?;
+        let applied = state.apply_block_with_stats(BlockScanInput {
+            height,
+            block_hash: hash,
+            previous_block_hash: prev_hash,
+            txs,
+        })?;
 
         let bytes = to_packed_bytes(&encode_light_block(&applied.light_block)?)?;
 
@@ -1446,7 +1198,7 @@ fn fixture_blocks(
             height,
             hash,
             prev_hash,
-            applied.light_block.block_anchor_last_uid,
+            state.last_uid(),
             bytes,
             applied.stats,
         ));
@@ -1460,23 +1212,16 @@ fn fixture_blocks(
 fn write_fixture_archive(
     root: PathBuf,
     network: ArchiveNetwork,
-    scope: ArchiveScope,
     start_height: u64,
     count: u64,
 ) -> anyhow::Result<()> {
     let archive = FileArchive::new(root);
-    let profile = Profile {
-        scope,
-        cutthrough_blocks: 0,
-    };
 
-    let (blocks, tip_height, tip_hash, _last_uid) = fixture_blocks(scope, start_height, count)?;
+    let (blocks, tip_height, tip_hash, _last_uid) = fixture_blocks(start_height, count)?;
 
-    for (height, _hash, _prev_hash, _anchor_last_uid, bytes, stats) in blocks {
-        archive.write_block_bytes(height, profile, &bytes)?;
-        archive.write_block_stats(height, &stats)?;
+    for (height, _hash, _prev_hash, _anchor_last_uid, bytes, _stats) in blocks {
+        archive.write_block_bytes(height, &bytes)?;
     }
-
 
     archive.write_manifest(&Manifest {
         version: btc_data_light_server::WIRE_VERSION,
@@ -1485,374 +1230,19 @@ fn write_fixture_archive(
         finality_depth: 6,
         suggested_reorg_cache_depth: 144,
         max_range_count: btc_data_light_server::DEFAULT_MAX_RANGE_COUNT,
-        profiles: vec![ManifestProfile {
-            scope,
-            cutthrough_blocks: 0,
-            tip: Some(ChainTip {
-                height: tip_height,
-                block_hash: hex::encode(tip_hash.as_bytes()),
-            }),
-        }],
-        cutthrough_snapshots: Vec::new(),
+        tip: Some(ChainTip {
+            height: tip_height,
+            block_hash: hex::encode(tip_hash.as_bytes()),
+        }),
     })?;
 
     println!(
-        "wrote file-backed {} fixture archive at {} starting from height {}",
-        scope,
+        "wrote file-backed fixture archive at {} starting from height {}",
         archive.root().display(),
         start_height
     );
 
     Ok(())
-}
-
-async fn write_fixture_db(
-    database_url: String,
-    network: ArchiveNetwork,
-    scope: ArchiveScope,
-    start_height: u64,
-    count: u64,
-) -> anyhow::Result<()> {
-    let archive = SqliteArchive::connect(&database_url, true).await?;
-    configure_indexer_sqlite(&archive).await?;
-    archive.migrate().await?;
-    ensure_archive_meta(&archive, network, scope, start_height).await?;
-
-    let profile = Profile {
-        scope,
-        cutthrough_blocks: 0,
-    };
-
-    let db_profile = archive.resolve_profile(None, Some(profile)).await?;
-
-    let (blocks, tip_height, tip_hash, _last_uid) = fixture_blocks(scope, start_height, count)?;
-
-    let mut tx = archive.pool().begin().await?;
-
-    for (height, hash, prev_hash, anchor_last_uid, bytes, stats) in blocks {
-        sqlx::query(
-            r#"INSERT INTO blocks
-               (height, block_hash, previous_block_hash, p2tr_created_count, p2tr_spent_count, anchor_last_uid)
-               VALUES (?, ?, ?, ?, ?, ?)"#,
-        )
-            .bind(i64::try_from(height)?)
-            .bind(hash.as_bytes().to_vec())
-            .bind(prev_hash.as_bytes().to_vec())
-            .bind(i64::from(stats.indexed_output_count))
-            .bind(i64::from(stats.indexed_spent_count))
-            .bind(i64::try_from(anchor_last_uid)?)
-            .execute(&mut *tx)
-            .await?;
-
-        sqlx::query(
-            r#"INSERT INTO block_stats
-               (height, tx_count, output_count_total, p2tr_output_count, p2tr_sp_candidate_count,
-                p2tr_nums_count, p2tr_reused_count, p2tr_excluded_by_scope_count,
-                indexed_output_count, indexed_spent_count, tx_with_p2tr_output_count,
-                tx_with_indexed_output_count, tweak_count)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
-        )
-            .bind(i64::try_from(height)?)
-            .bind(i64::from(stats.tx_count))
-            .bind(i64::from(stats.output_count_total))
-            .bind(i64::from(stats.p2tr_output_count))
-            .bind(i64::from(stats.p2tr_sp_candidate_count))
-            .bind(i64::from(stats.p2tr_nums_count))
-            .bind(i64::from(stats.p2tr_reused_count))
-            .bind(i64::from(stats.p2tr_excluded_by_scope_count))
-            .bind(i64::from(stats.indexed_output_count))
-            .bind(i64::from(stats.indexed_spent_count))
-            .bind(i64::from(stats.tx_with_p2tr_output_count))
-            .bind(i64::from(stats.tx_with_indexed_output_count))
-            .bind(i64::from(stats.tweak_count))
-            .execute(&mut *tx)
-            .await?;
-
-        sqlx::query(
-            r#"INSERT INTO payload_cache
-               (profile_id, height, block_hash, payload, payload_len, created_at)
-               VALUES (?, ?, ?, ?, ?, unixepoch())"#,
-        )
-            .bind(db_profile.profile_id)
-            .bind(i64::try_from(height)?)
-            .bind(hash.as_bytes().to_vec())
-            .bind(bytes.clone())
-            .bind(i64::try_from(bytes.len())?)
-            .execute(&mut *tx)
-            .await?;
-    }
-
-
-    sqlx::query(
-        r#"UPDATE profiles
-           SET served_tip_height = ?, served_tip_hash = ?
-           WHERE profile_id = ?"#,
-    )
-        .bind(i64::try_from(tip_height)?)
-        .bind(tip_hash.as_bytes().to_vec())
-        .bind(db_profile.profile_id)
-        .execute(&mut *tx)
-        .await?;
-
-    tx.commit().await?;
-
-    println!(
-        "wrote SQLite {} fixture archive to {} starting from height {}",
-        scope, database_url, start_height
-    );
-
-    Ok(())
-}
-
-async fn ensure_archive_meta(
-    archive: &SqliteArchive,
-    network: ArchiveNetwork,
-    scope: ArchiveScope,
-    start_height: u64,
-) -> anyhow::Result<()> {
-    let existing_network = get_meta(archive, "network").await?;
-    let existing_scope = get_meta(archive, "scope").await?;
-    let existing_start_height = get_meta(archive, "start_height").await?;
-
-    if let Some(value) = existing_network {
-        anyhow::ensure!(
-            value == network.to_string(),
-            "archive network mismatch: db={} requested={}",
-            value,
-            network
-        );
-    }
-
-    if let Some(value) = existing_scope {
-        anyhow::ensure!(
-            value == scope.to_string(),
-            "archive scope mismatch: db={} requested={}",
-            value,
-            scope
-        );
-    }
-
-    if let Some(value) = existing_start_height {
-        anyhow::ensure!(
-            value == start_height.to_string(),
-            "archive start_height mismatch: db={} requested={}",
-            value,
-            start_height
-        );
-    }
-
-    sqlx::query(
-        r#"INSERT OR IGNORE INTO meta(key, value)
-           VALUES
-             ('network', ?),
-             ('scope', ?),
-             ('start_height', ?)"#,
-    )
-        .bind(network.to_string())
-        .bind(scope.to_string())
-        .bind(start_height.to_string())
-        .execute(archive.pool())
-        .await?;
-
-    Ok(())
-}
-
-async fn restore_indexer_state(
-    archive: &SqliteArchive,
-    committed_tip: Option<u64>,
-) -> anyhow::Result<P2trIndexerState> {
-    let Some(height) = committed_tip else {
-        return Ok(P2trIndexerState::restore_counts_only(0, 0));
-    };
-
-    let last_uid = sqlx::query_scalar::<_, Option<i64>>(
-        r#"SELECT anchor_last_uid FROM blocks WHERE height = ?"#,
-    )
-        .bind(i64::try_from(height)?)
-        .fetch_one(archive.pool())
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("missing committed tip block row at height {height}"))?;
-
-    // Do not count or preload historical live outputs on startup. SQLite is the
-    // durable history source, and exact old spend lookups are resolved from the
-    // indexed tables on demand. `live_uid_count` is therefore only an
-    // in-process/hot-window counter after recovery and must not be treated as a
-    // full historical UTXO count.
-    Ok(P2trIndexerState::restore_counts_only(u64::try_from(last_uid)?, 0))
-}
-
-async fn lookup_spend_uids_for_chunk(
-    archive: &SqliteArchive,
-    state: &mut P2trIndexerState,
-    decoded: &[BlockScanInput],
-) -> anyhow::Result<Vec<OutPointKey>> {
-    let mut outpoints = decoded
-        .iter()
-        .flat_map(|block| block.txs.iter())
-        .flat_map(|tx| tx.inputs.iter())
-        .map(|input| input.previous_output)
-        .filter(|outpoint| !outpoint.is_coinbase())
-        .collect::<Vec<_>>();
-
-    if outpoints.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    outpoints.sort_by(|a, b| {
-        a.txid
-            .as_bytes()
-            .cmp(b.txid.as_bytes())
-            .then_with(|| a.vout.cmp(&b.vout))
-    });
-    outpoints.dedup();
-
-    let mut cached = Vec::new();
-    for outpoint_chunk in outpoints.chunks(SQL_OUTPOINT_LOOKUP_CHUNK) {
-        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-            r#"WITH spend_candidates(txid, vout) AS (VALUES "#,
-        );
-
-        for (i, outpoint) in outpoint_chunk.iter().enumerate() {
-            if i > 0 {
-                qb.push(", ");
-            }
-            qb.push("(")
-                .push_bind(outpoint.txid.as_bytes().to_vec())
-                .push(", ")
-                .push_bind(i64::from(outpoint.vout))
-                .push(")");
-        }
-
-        qb.push(
-            r#")
-               SELECT o.txid, o.vout, o.uid
-               FROM spend_candidates c
-               JOIN p2tr_outputs o
-                 ON o.txid = c.txid
-                AND o.vout = c.vout
-               WHERE NOT EXISTS (
-                   SELECT 1 FROM p2tr_spends s WHERE s.uid = o.uid
-               )"#,
-        );
-
-        let rows = qb.build().fetch_all(archive.pool()).await?;
-        let mut candidates = Vec::with_capacity(rows.len());
-        for row in rows {
-            let txid: Vec<u8> = row.try_get("txid")?;
-            let txid: [u8; 32] = txid.try_into().map_err(|v: Vec<u8>| {
-                anyhow::anyhow!("invalid txid length in p2tr_outputs: {}", v.len())
-            })?;
-            let vout: i64 = row.try_get("vout")?;
-            let uid: i64 = row.try_get("uid")?;
-            candidates.push((
-                OutPointKey {
-                    txid: TxidBytes::from(txid),
-                    vout: u32::try_from(vout)?,
-                },
-                u64::try_from(uid)?,
-            ));
-        }
-        cached.extend(state.cache_spend_uid_candidates(candidates));
-    }
-
-    Ok(cached)
-}
-
-async fn get_meta(archive: &SqliteArchive, key: &str) -> anyhow::Result<Option<String>> {
-    let value = sqlx::query_scalar::<_, String>(r#"SELECT value FROM meta WHERE key = ?"#)
-        .bind(key)
-        .fetch_optional(archive.pool())
-        .await?;
-
-    Ok(value)
-}
-
-async fn validate_resume_boundary(
-    archive: &SqliteArchive,
-    profile_id: i64,
-    start_height: u64,
-) -> anyhow::Result<()> {
-    let row = sqlx::query(
-        r#"SELECT served_tip_height, served_tip_hash
-           FROM profiles
-           WHERE profile_id = ?"#,
-    )
-        .bind(profile_id)
-        .fetch_one(archive.pool())
-        .await?;
-
-    let served_tip_height: i64 = row.try_get("served_tip_height")?;
-    let served_tip_hash: Option<Vec<u8>> = row.try_get("served_tip_hash")?;
-
-    if served_tip_height <= 0 {
-        return Ok(());
-    }
-
-    let served_tip = u64::try_from(served_tip_height)?;
-    anyhow::ensure!(
-        served_tip >= start_height,
-        "profile served tip {} is below configured start height {}",
-        served_tip,
-        start_height
-    );
-
-    let expected_count = served_tip - start_height + 1;
-    let block_count = sqlx::query_scalar::<_, i64>(
-        r#"SELECT COUNT(*)
-           FROM blocks
-           WHERE height >= ? AND height <= ?"#,
-    )
-        .bind(i64::try_from(start_height)?)
-        .bind(i64::try_from(served_tip)?)
-        .fetch_one(archive.pool())
-        .await?;
-    anyhow::ensure!(
-        u64::try_from(block_count)? == expected_count,
-        "database has a gap in committed blocks for {}..={} (rows={}, expected={})",
-        start_height,
-        served_tip,
-        block_count,
-        expected_count
-    );
-
-    // payload_cache is a rebuildable serving cache, not recovery state. Do not
-    // scan/count it on startup; recovery is anchored by profile tip + blocks.
-
-    let block_hash: Vec<u8> =
-        sqlx::query_scalar(r#"SELECT block_hash FROM blocks WHERE height = ?"#)
-            .bind(i64::try_from(served_tip)?)
-            .fetch_one(archive.pool())
-            .await?;
-
-    if let Some(served_tip_hash) = served_tip_hash {
-        anyhow::ensure!(
-            served_tip_hash == block_hash,
-            "profile served tip hash does not match blocks row at height {}",
-            served_tip
-        );
-    }
-
-
-    Ok(())
-}
-
-async fn next_index_height(
-    archive: &SqliteArchive,
-    profile_id: i64,
-    start_height: u64,
-) -> anyhow::Result<u64> {
-    let served_tip_height = sqlx::query_scalar::<_, i64>(
-        r#"SELECT served_tip_height FROM profiles WHERE profile_id = ?"#,
-    )
-        .bind(profile_id)
-        .fetch_one(archive.pool())
-        .await?;
-
-    if served_tip_height <= 0 {
-        Ok(start_height)
-    } else {
-        Ok(u64::try_from(served_tip_height)? + 1)
-    }
 }
 
 fn deterministic_txid(height: u64, n: u8) -> TxidBytes {
