@@ -1,9 +1,10 @@
 use crate::p2tr_indexer::{BlockScanInput, OutPointKey};
 use crate::script_classify::{classify_script, ScriptKind};
 use crate::sp_tweak::{
-    compute_tx_scan_point, PrevoutInfo, PrevoutScript, ScanPointStatus, TxInputContext,
+    compute_tx_scan_point, PrevoutInfo, PrevoutScript, ScanPointIneligibleReason, ScanPointStatus,
+    TxInputContext,
 };
-use crate::types::BlockHashBytes;
+use crate::types::{BlockHashBytes, TxidBytes};
 use anyhow::Context;
 use bitcoin::hashes::Hash as _;
 use bitcoin::{key::XOnlyPublicKey, PubkeyHash, ScriptHash, WPubkeyHash};
@@ -303,14 +304,14 @@ fn decode_prevout_entry(bytes: &[u8]) -> anyhow::Result<CompactPrevoutContext> {
             || len == ENCODED_PREVOUT_HEADER_LEN + 1
             || len == ENCODED_PREVOUT_HEADER_LEN + HASH160_LEN
             || len == ENCODED_PREVOUT_HEADER_LEN + XONLY_KEY_LEN =>
-        {
-            (bytes[0], &bytes[1..])
-        }
+            {
+                (bytes[0], &bytes[1..])
+            }
         len if len == LEGACY_ENCODED_PREVOUT_HEADER_LEN + HASH160_LEN
             || len == LEGACY_ENCODED_PREVOUT_HEADER_LEN + XONLY_KEY_LEN =>
-        {
-            (bytes[8], &bytes[9..])
-        }
+            {
+                (bytes[8], &bytes[9..])
+            }
         len => anyhow::bail!("invalid prevout entry length {len}"),
     };
 
@@ -494,10 +495,43 @@ impl PrevoutStore {
             });
         }
 
+        let p2tr_output_count = tx.outputs.iter().filter(|output| output.is_p2tr).count();
+
         match compute_tx_scan_point(&input_context)? {
             ScanPointStatus::Computed(tweak) => tx.silent_payment_tweak = Some(tweak),
-            ScanPointStatus::Ineligible | ScanPointStatus::MissingPrevout { .. } => {
-                tx.silent_payment_tweak = None
+            ScanPointStatus::Ineligible {
+                reason: ScanPointIneligibleReason::PublicKeySumInfinity,
+            } => {
+                tracing::warn!(
+                    tx_index = tx.tx_index,
+                    txid = %display_txid(tx.txid),
+                    input_count = tx.inputs.len(),
+                    p2tr_output_count,
+                    "eligible input public-key sum is infinity; skipping silent-payment tweak"
+                );
+                tx.silent_payment_tweak = None;
+            }
+            ScanPointStatus::Ineligible { reason } => {
+                tracing::debug!(
+                    tx_index = tx.tx_index,
+                    txid = %display_txid(tx.txid),
+                    ?reason,
+                    input_count = tx.inputs.len(),
+                    p2tr_output_count,
+                    "transaction is ineligible for silent-payment tweak; skipping tweak"
+                );
+                tx.silent_payment_tweak = None;
+            }
+            ScanPointStatus::MissingPrevout { missing_count } => {
+                tracing::warn!(
+                    tx_index = tx.tx_index,
+                    txid = %display_txid(tx.txid),
+                    missing_count,
+                    input_count = tx.inputs.len(),
+                    p2tr_output_count,
+                    "missing prevout while computing silent-payment tweak; skipping tweak"
+                );
+                tx.silent_payment_tweak = None;
             }
         }
 
@@ -541,4 +575,10 @@ pub struct PrevoutMutationStats {
     pub contexts_created: usize,
     pub delete_attempts: usize,
     pub scan_point_prevout_lookups: usize,
+}
+
+fn display_txid(txid: TxidBytes) -> String {
+    let mut bytes = txid.into_inner();
+    bytes.reverse();
+    hex::encode(bytes)
 }

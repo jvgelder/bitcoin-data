@@ -1,5 +1,10 @@
-use crate::profile::{ArchiveScope, Profile};
+use crate::index::{
+    decode_stored_light_block, encode_stored_light_block,
+    stored_light_block_to_filtered_response_bytes, stored_light_block_to_response_bytes,
+    to_packed_bytes, StoredBlockResponseFilter,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -25,31 +30,11 @@ pub struct Manifest {
     /// Depth after which server responses can be treated as practically immutable
     /// for caching. Payloads closer to tip remain replaceable on reorg.
     pub finality_depth: u64,
-    /// Suggested number of recent blocks wallet clients should sync from the full
-    /// endpoint and retain undo metadata for. This is not a requirement to cache
-    /// full payload bytes.
+    /// Suggested number of recent blocks wallet clients should retain undo/hash
+    /// metadata for shallow reorg handling.
     pub suggested_reorg_cache_depth: u64,
     pub max_range_count: u32,
-    pub profiles: Vec<ManifestProfile>,
-    #[serde(default)]
-    pub cutthrough_snapshots: Vec<ManifestCutthroughSnapshot>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManifestProfile {
-    pub scope: ArchiveScope,
-    pub cutthrough_blocks: u32,
     pub tip: Option<ChainTip>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManifestCutthroughSnapshot {
-    pub scope: ArchiveScope,
-    pub cutthrough_blocks: u32,
-    pub height: u64,
-    pub block_hash: String,
-    pub latest_endpoint: String,
-    pub endpoint: String,
 }
 
 impl FileArchive {
@@ -64,79 +49,142 @@ impl FileArchive {
     pub fn blocks_dir(&self) -> PathBuf {
         self.root.join("blocks")
     }
-    pub fn stats_dir(&self) -> PathBuf {
-        self.root.join("block_stats")
-    }
+
     pub fn manifest_path(&self) -> PathBuf {
         self.root.join("manifest.json")
     }
 
-    pub fn block_path(&self, height: u64, profile: Profile) -> PathBuf {
-        self.blocks_dir()
-            .join(format!("{height:010}.{}.capnp", profile.file_tag()))
+    pub fn block_path(&self, height: u64) -> PathBuf {
+        self.blocks_dir().join(format!("{height:010}.capnp"))
     }
 
-
-    pub fn block_stats_path(&self, height: u64) -> PathBuf {
-        self.stats_dir().join(format!("{height:010}.stats.json"))
+    pub fn read_stored_block(&self, height: u64) -> anyhow::Result<Vec<u8>> {
+        Ok(fs::read(self.block_path(height))?)
     }
 
-    pub fn read_block(&self, height: u64, profile: Profile) -> anyhow::Result<Vec<u8>> {
-        let path = self.block_path(height, profile);
-        Ok(fs::read(path)?)
+    pub fn read_block(&self, height: u64) -> anyhow::Result<Vec<u8>> {
+        let stored = self.read_stored_block(height)?;
+        let (response, _block_hash) = stored_light_block_to_response_bytes(&stored)?;
+        Ok(response)
     }
 
-    pub fn read_blocks(
+    pub fn read_block_with_hash(&self, height: u64) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+        let stored = self.read_stored_block(height)?;
+        let (response, block_hash) = stored_light_block_to_response_bytes(&stored)?;
+        Ok((response, block_hash.as_bytes().to_vec()))
+    }
+
+    pub fn read_block_filtered_with_hash(
         &self,
-        start: u64,
-        count: u32,
-        profile: Profile,
-    ) -> anyhow::Result<Vec<Vec<u8>>> {
+        height: u64,
+        filter: StoredBlockResponseFilter,
+    ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+        let stored = self.read_stored_block(height)?;
+        let (response, block_hash) =
+            stored_light_block_to_filtered_response_bytes(&stored, filter)?;
+        Ok((response, block_hash.as_bytes().to_vec()))
+    }
+
+    pub fn read_blocks(&self, start: u64, count: u32) -> anyhow::Result<Vec<Vec<u8>>> {
         (0..count)
-            .map(|i| self.read_block(start + u64::from(i), profile))
+            .map(|i| self.read_block(start + u64::from(i)))
             .collect()
     }
 
-    pub fn write_block_bytes(
+    pub fn read_blocks_filtered(
         &self,
-        height: u64,
-        profile: Profile,
-        bytes: &[u8],
-    ) -> anyhow::Result<PathBuf> {
+        start: u64,
+        count: u32,
+        filter: StoredBlockResponseFilter,
+    ) -> anyhow::Result<Vec<Vec<u8>>> {
+        (0..count)
+            .map(|i| {
+                self.read_block_filtered_with_hash(start + u64::from(i), filter)
+                    .map(|(payload, _hash)| payload)
+            })
+            .collect()
+    }
+
+    pub fn write_block_bytes(&self, height: u64, bytes: &[u8]) -> anyhow::Result<PathBuf> {
         fs::create_dir_all(self.blocks_dir())?;
-        let path = self.block_path(height, profile);
-        fs::write(&path, bytes)?;
+        let path = self.block_path(height);
+        let tmp = path.with_extension("capnp.tmp");
+        fs::write(&tmp, bytes)?;
+        fs::rename(&tmp, &path)?;
         Ok(path)
     }
 
+    /// Update storage-only spent heights for outputs that were created in
+    /// already-written archive blocks. Missing creation-block files are skipped;
+    /// this can happen when the indexer resumes from a height newer than the
+    /// archive emit start.
+    pub fn mark_spent_outputs(
+        &self,
+        spends: impl IntoIterator<Item = (u64, u64, u64)>,
+    ) -> anyhow::Result<usize> {
+        let mut by_creation_height = BTreeMap::<u64, Vec<(u64, u32)>>::new();
+        for (creation_height, uid, spent_height) in spends {
+            by_creation_height
+                .entry(creation_height)
+                .or_default()
+                .push((uid, u32::try_from(spent_height)?));
+        }
 
-    pub fn tip(&self, profile: Profile) -> anyhow::Result<Option<ChainTip>> {
-        let manifest = self.read_manifest().ok();
-        if let Some(manifest) = manifest {
-            for p in manifest.profiles {
-                if p.scope == profile.scope
-                    && p.cutthrough_blocks == profile.cutthrough_blocks
-                    && p.tip.is_some()
-                {
-                    return Ok(p.tip);
+        let mut updated = 0usize;
+        for (creation_height, spends) in by_creation_height {
+            let path = self.block_path(creation_height);
+            if !path.exists() {
+                continue;
+            }
+
+            let stored_bytes = fs::read(&path)?;
+            let mut stored = decode_stored_light_block(&stored_bytes)?;
+            for (uid, spent_height) in spends {
+                let dense_index = dense_output_index_for_uid(&stored, uid).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "spent uid {uid} maps outside storage outputs for block {}",
+                        creation_height
+                    )
+                })?;
+                let output = stored.outputs.get_mut(dense_index).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "spent uid {uid} maps outside storage outputs for block {}",
+                        creation_height
+                    )
+                })?;
+                if output.spent_height != spent_height {
+                    output.spent_height = spent_height;
+                    updated += 1;
                 }
             }
+
+            let bytes = to_packed_bytes(&encode_stored_light_block(&stored)?)?;
+            self.write_block_bytes(creation_height, &bytes)?;
         }
-        self.tip_from_files(profile)
+        Ok(updated)
     }
 
-    pub fn tip_from_files(&self, profile: Profile) -> anyhow::Result<Option<ChainTip>> {
+    pub fn tip(&self) -> anyhow::Result<Option<ChainTip>> {
+        let manifest = self.read_manifest().ok();
+        if let Some(manifest) = manifest {
+            if manifest.tip.is_some() {
+                return Ok(manifest.tip);
+            }
+        }
+        self.tip_from_files()
+    }
+
+    pub fn tip_from_files(&self) -> anyhow::Result<Option<ChainTip>> {
         let dir = self.blocks_dir();
         if !dir.exists() {
             return Ok(None);
         }
-        let suffix = format!(".{}.capnp", profile.file_tag());
         let mut best = None;
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if let Some(prefix) = name.strip_suffix(&suffix) {
+            if let Some(prefix) = name.strip_suffix(".capnp") {
                 if let Ok(height) = prefix.parse::<u64>() {
                     if best.is_none_or(|b| height > b) {
                         best = Some(height);
@@ -148,22 +196,6 @@ impl FileArchive {
             height,
             block_hash: String::new(),
         }))
-    }
-
-    pub fn write_block_stats<T: Serialize>(
-        &self,
-        height: u64,
-        stats: &T,
-    ) -> anyhow::Result<PathBuf> {
-        fs::create_dir_all(self.stats_dir())?;
-        let path = self.block_stats_path(height);
-        fs::write(&path, serde_json::to_vec_pretty(stats)?)?;
-        Ok(path)
-    }
-
-    pub fn read_block_stats(&self, height: u64) -> anyhow::Result<serde_json::Value> {
-        let bytes = fs::read(self.block_stats_path(height))?;
-        Ok(serde_json::from_slice(&bytes)?)
     }
 
     pub fn read_manifest(&self) -> anyhow::Result<Manifest> {
@@ -179,103 +211,65 @@ impl FileArchive {
     }
 }
 
+fn dense_output_index_for_uid(
+    stored: &crate::index::StoredLightBlockInput,
+    uid: u64,
+) -> Option<usize> {
+    let flat_index = uid.checked_sub(stored.first_uid)?;
+    let flat_index = u16::try_from(flat_index).ok()?;
+    let mut skipped_iter = stored.skipped_outputs.iter().copied().peekable();
+    let mut current_flat = 0u16;
+    let mut dense_index = 0usize;
+
+    while dense_index < stored.outputs.len() {
+        while skipped_iter
+            .peek()
+            .is_some_and(|skipped| *skipped == current_flat)
+        {
+            skipped_iter.next();
+            current_flat = current_flat.checked_add(1)?;
+        }
+        if current_flat == flat_index {
+            return Some(dense_index);
+        }
+        dense_index += 1;
+        current_flat = current_flat.checked_add(1)?;
+    }
+    None
+}
+
 #[async_trait::async_trait]
 impl crate::storage::ArchiveBackend for FileArchive {
     async fn manifest(&self) -> anyhow::Result<Manifest> {
         self.read_manifest()
     }
 
-    async fn resolve_profile(
-        &self,
-        name: Option<&str>,
-        profile: Option<Profile>,
-    ) -> anyhow::Result<crate::storage::ServedProfile> {
-        let profile = if let Some(profile) = profile {
-            profile
-        } else if let Some(name) = name {
-            parse_profile_name(name)?
-        } else {
-            Profile::default()
-        };
-        let tip = self.tip(profile)?;
-        let name = if profile.cutthrough_blocks == 0 {
-            format!("{}-raw", profile.scope.as_str())
-        } else {
-            format!("{}-ct{}", profile.scope.as_str(), profile.cutthrough_blocks)
-        };
-        Ok(crate::storage::ServedProfile {
-            profile_id: 0,
-            name,
-            profile,
-            materialization_interval_blocks: if profile.cutthrough_blocks == 0 {
-                1
-            } else {
-                144
-            },
-            served_tip: tip,
-        })
+    async fn tip(&self) -> anyhow::Result<Option<ChainTip>> {
+        self.tip()
     }
 
-    async fn tip(
-        &self,
-        profile: &crate::storage::ServedProfile,
-    ) -> anyhow::Result<Option<ChainTip>> {
-        self.tip(profile.profile)
+    async fn read_block(&self, height: u64) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+        self.read_block_with_hash(height)
     }
 
-    async fn read_block(
+    async fn read_block_filtered(
         &self,
         height: u64,
-        profile: &crate::storage::ServedProfile,
+        filter: StoredBlockResponseFilter,
     ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
-        Ok((self.read_block(height, profile.profile)?, Vec::new()))
+        self.read_block_filtered_with_hash(height, filter)
     }
 
-    async fn read_blocks(
+    async fn read_blocks(&self, start: u64, count: u32) -> anyhow::Result<Vec<Vec<u8>>> {
+        self.read_blocks(start, count)
+    }
+
+    async fn read_blocks_filtered(
         &self,
         start: u64,
         count: u32,
-        profile: &crate::storage::ServedProfile,
+        filter: StoredBlockResponseFilter,
     ) -> anyhow::Result<Vec<Vec<u8>>> {
-        self.read_blocks(start, count, profile.profile)
+        self.read_blocks_filtered(start, count, filter)
     }
-
-    async fn read_cutthrough_delta_blocks(
-        &self,
-        _known_height: u64,
-        _max_end_height: u64,
-        _target_response_bytes: usize,
-        _profile: &crate::storage::ServedProfile,
-    ) -> anyhow::Result<crate::storage::CutthroughDeltaBlocks> {
-        anyhow::bail!("file-backed archives do not support SQLite cut-through delta ranges")
-    }
-
-    async fn read_cutthrough_snapshot(
-        &self,
-        _height: u64,
-        _profile: &crate::storage::ServedProfile,
-    ) -> anyhow::Result<crate::storage::CutthroughSnapshot> {
-        anyhow::bail!("file-backed archives do not support cut-through snapshots")
-    }
-
-
-    async fn block_stats(&self, height: u64) -> anyhow::Result<serde_json::Value> {
-        self.read_block_stats(height)
-    }
-}
-
-fn parse_profile_name(name: &str) -> anyhow::Result<Profile> {
-    if name == "raw-sp" || name == "p2tr-sp-raw" {
-        return Ok(Profile {
-            scope: ArchiveScope::P2trSp,
-            cutthrough_blocks: 0,
-        });
-    }
-    if let Some(rest) = name.strip_prefix("ct").and_then(|s| s.strip_suffix("-sp")) {
-        return Ok(Profile {
-            scope: ArchiveScope::P2trSp,
-            cutthrough_blocks: rest.parse()?,
-        });
-    }
-    anyhow::bail!("file backend cannot resolve profile name {name:?}; use scope+ct instead")
 }

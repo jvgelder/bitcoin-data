@@ -11,7 +11,6 @@ pub trait BlockSource: Send + Sync {
     async fn get_block_hash(&self, height: u64) -> anyhow::Result<[u8; 32]>;
     async fn get_block_raw(&self, hash: [u8; 32]) -> anyhow::Result<Bytes>;
 
-
     /// Fetch Bitcoin Core-style per-block spent txouts / undo data when available.
     async fn get_block_spent_txouts(
         &self,
@@ -83,7 +82,6 @@ pub trait BlockSource: Send + Sync {
     fn supports_block_range_batches(&self) -> bool {
         false
     }
-
 
     /// True when this source provides spent prevouts / undo data with block frames.
     fn supports_block_spent_txouts(&self) -> bool {

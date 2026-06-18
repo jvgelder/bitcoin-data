@@ -130,8 +130,9 @@ fn decode_rest_binary_or_hex(bytes: Bytes, what: &str) -> anyhow::Result<Bytes> 
         && trimmed.len() % 2 == 0
         && trimmed.iter().all(|b| b.is_ascii_hexdigit())
     {
-        let decoded = hex::decode(&trimmed)
-            .map_err(|e| anyhow::anyhow!("REST {what} looked like hex but failed to decode: {e}"))?;
+        let decoded = hex::decode(&trimmed).map_err(|e| {
+            anyhow::anyhow!("REST {what} looked like hex but failed to decode: {e}")
+        })?;
         return Ok(Bytes::from(decoded));
     }
 
@@ -188,10 +189,8 @@ impl BlockSource for RestSource {
         height: u64,
     ) -> anyhow::Result<btc_data_core::block::RawBlockFrame> {
         let hash = self.get_block_hash(height).await?;
-        let (bytes, spent_txouts) = tokio::try_join!(
-            self.get_block_raw(hash),
-            self.get_block_spent_txouts(hash),
-        )?;
+        let (bytes, spent_txouts) =
+            tokio::try_join!(self.get_block_raw(hash), self.get_block_spent_txouts(hash),)?;
         Ok(btc_data_core::block::RawBlockFrame {
             height,
             hash,
@@ -205,7 +204,6 @@ impl BlockSource for RestSource {
         let info: ChainInfo = serde_json::from_str(&text)?;
         Ok(info.blocks)
     }
-
 
     async fn get_blocks_spent_txouts(
         &self,

@@ -64,7 +64,6 @@ impl BlockSource for MultiSource {
         Err(last_err.unwrap())
     }
 
-
     async fn get_block_spent_txouts(
         &self,
         hash: [u8; 32],

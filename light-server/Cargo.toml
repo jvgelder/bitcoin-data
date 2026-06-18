@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 build = "build.rs"
-description = "Silent Payment light-data archive indexer and SQLite-backed HTTP server."
+description = "Silent Payment light-data archive indexer and file-backed HTTP server."
 
 [lib]
 name = "btc_data_light_server"
@@ -20,7 +20,6 @@ path = "src/bin/light_server.rs"
 
 [dependencies]
 axum = "0.8.9"
-sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 anyhow.workspace = true
 capnp.workspace = true
 clap.workspace = true
@@ -37,6 +36,7 @@ futures.workspace = true
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rocksdb = "0.24.0"
 [build-dependencies]
 capnpc.workspace = true
 

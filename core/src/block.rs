@@ -172,7 +172,10 @@ mod tests {
 
     #[test]
     fn decodes_empty_block_undo() {
-        assert_eq!(decode_spent_txouts_payload(&[0]).unwrap(), BlockSpentTxOuts::default());
+        assert_eq!(
+            decode_spent_txouts_payload(&[0]).unwrap(),
+            BlockSpentTxOuts::default()
+        );
     }
 
     #[test]
