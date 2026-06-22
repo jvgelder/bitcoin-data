@@ -18,6 +18,10 @@ path = "src/bin/light_indexer.rs"
 name = "light-server"
 path = "src/bin/light_server.rs"
 
+[[bin]]
+name = "light-archive-stats"
+path = "src/bin/light_archive_stats.rs"
+
 [dependencies]
 axum = "0.8.9"
 anyhow.workspace = true
