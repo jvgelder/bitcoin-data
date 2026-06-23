@@ -110,11 +110,8 @@ impl RocksIndexStore {
                     encode_spend_lookup(SpendLookup {
                         uid: created.entry.uid,
                         creation_height: created.entry.created_height,
-                        flags: if created.is_reused {
-                            crate::index::OUTPUT_FLAG_REUSED
-                        } else {
-                            0
-                        },
+                        output_index: created.entry.output_index,
+                        flags: 0,
                     }),
                 );
 
@@ -167,31 +164,30 @@ fn seen_key(xonly: [u8; 32]) -> [u8; 34] {
     key
 }
 
-fn encode_spend_lookup(spend: SpendLookup) -> [u8; 17] {
-    let mut out = [0u8; 17];
+fn encode_spend_lookup(spend: SpendLookup) -> [u8; 20] {
+    let mut out = [0u8; 20];
     out[..8].copy_from_slice(&spend.uid.to_be_bytes());
     out[8..16].copy_from_slice(&spend.creation_height.to_be_bytes());
-    out[16] = spend.flags;
+    out[16..20].copy_from_slice(&spend.output_index.to_be_bytes());
     out
 }
 
 fn read_spend_lookup(bytes: &[u8]) -> anyhow::Result<SpendLookup> {
     match bytes.len() {
-        // Backwards-compatible staged value from the first RocksDB patch.
-        8 => Ok(SpendLookup {
-            uid: read_u64(bytes, "outpoint uid")?,
-            creation_height: 0,
-            flags: 0,
-        }),
-        17 => {
+        20 => {
             let uid = read_u64(&bytes[..8], "outpoint uid")?;
             let creation_height = read_u64(&bytes[8..16], "outpoint creation height")?;
+            let output_index = read_u32(&bytes[16..20], "outpoint storage output index")?;
             Ok(SpendLookup {
                 uid,
                 creation_height,
-                flags: bytes[16],
+                output_index,
+                flags: 0,
             })
         }
+        8 | 16 | 17 => anyhow::bail!(
+            "legacy outpoint lookup value is missing storage output index; reindex light archive"
+        ),
         len => anyhow::bail!("invalid outpoint lookup value length {len}"),
     }
 }
@@ -208,4 +204,11 @@ fn read_32(bytes: &[u8], label: &str) -> anyhow::Result<[u8; 32]> {
     let mut out = [0u8; 32];
     out.copy_from_slice(bytes);
     Ok(out)
+}
+
+fn read_u32(bytes: &[u8], label: &str) -> anyhow::Result<u32> {
+    anyhow::ensure!(bytes.len() == 4, "invalid {label} length {}", bytes.len());
+    let mut out = [0u8; 4];
+    out.copy_from_slice(bytes);
+    Ok(u32::from_be_bytes(out))
 }

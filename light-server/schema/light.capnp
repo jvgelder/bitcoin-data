@@ -14,10 +14,9 @@ struct LightBlock {
   skippedTxsForTweaks @5 :List(UInt16);
   tweaks @6 :List(TweakEntry);
 
-  skippedOutputs @7 :List(UInt16);
-  outputs @8 :List(OutputEntry);
+  outputs @7 :List(OutputEntry);
 
-  spends @9 :List(SpendEntry);
+  spends @8 :List(SpendEntry);
 }
 
 struct TweakEntry {

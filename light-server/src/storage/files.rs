@@ -120,14 +120,14 @@ impl FileArchive {
     /// archive emit start.
     pub fn mark_spent_outputs(
         &self,
-        spends: impl IntoIterator<Item = (u64, u64, u64)>,
+        spends: impl IntoIterator<Item = (u64, u32, u64)>,
     ) -> anyhow::Result<usize> {
-        let mut by_creation_height = BTreeMap::<u64, Vec<(u64, u32)>>::new();
-        for (creation_height, uid, spent_height) in spends {
+        let mut by_creation_height = BTreeMap::<u64, Vec<(u32, u32)>>::new();
+        for (creation_height, output_index, spent_height) in spends {
             by_creation_height
                 .entry(creation_height)
                 .or_default()
-                .push((uid, u32::try_from(spent_height)?));
+                .push((output_index, u32::try_from(spent_height)?));
         }
 
         let mut updated = 0usize;
@@ -139,16 +139,10 @@ impl FileArchive {
 
             let stored_bytes = fs::read(&path)?;
             let mut stored = decode_stored_light_block(&stored_bytes)?;
-            for (uid, spent_height) in spends {
-                let dense_index = dense_output_index_for_uid(&stored, uid).ok_or_else(|| {
+            for (output_index, spent_height) in spends {
+                let output = stored.outputs.get_mut(usize::try_from(output_index)?).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "spent uid {uid} maps outside storage outputs for block {}",
-                        creation_height
-                    )
-                })?;
-                let output = stored.outputs.get_mut(dense_index).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "spent uid {uid} maps outside storage outputs for block {}",
+                        "storage output index {output_index} maps outside storage outputs for block {}",
                         creation_height
                     )
                 })?;
@@ -209,33 +203,6 @@ impl FileArchive {
         fs::write(self.manifest_path(), bytes)?;
         Ok(())
     }
-}
-
-fn dense_output_index_for_uid(
-    stored: &crate::index::StoredLightBlockInput,
-    uid: u64,
-) -> Option<usize> {
-    let flat_index = uid.checked_sub(stored.first_uid)?;
-    let flat_index = u16::try_from(flat_index).ok()?;
-    let mut skipped_iter = stored.skipped_outputs.iter().copied().peekable();
-    let mut current_flat = 0u16;
-    let mut dense_index = 0usize;
-
-    while dense_index < stored.outputs.len() {
-        while skipped_iter
-            .peek()
-            .is_some_and(|skipped| *skipped == current_flat)
-        {
-            skipped_iter.next();
-            current_flat = current_flat.checked_add(1)?;
-        }
-        if current_flat == flat_index {
-            return Some(dense_index);
-        }
-        dense_index += 1;
-        current_flat = current_flat.checked_add(1)?;
-    }
-    None
 }
 
 #[async_trait::async_trait]
