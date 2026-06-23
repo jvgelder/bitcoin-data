@@ -15,6 +15,7 @@ pub struct JsonLightBlock {
     pub block_hash: String,
     pub previous_block_hash: String,
     pub first_uid: u64,
+    pub p2tr_output_count: u32,
     pub skipped_txs_for_tweaks: Vec<u16>,
     pub tweaks: Vec<JsonTweakEntry>,
     pub skipped_outputs: Vec<u16>,
@@ -62,24 +63,24 @@ pub fn light_block_to_json(bytes: &[u8]) -> anyhow::Result<JsonLightBlock> {
     let output_reader = block.get_outputs()?;
     let mut outputs = Vec::with_capacity(output_reader.len() as usize);
     let mut skipped_iter = skipped_outputs.iter().copied().peekable();
-    let mut flattened_output_index = 0u64;
+    let mut p2tr_slot = 0u64;
     for i in 0..output_reader.len() {
         while skipped_iter
             .peek()
-            .is_some_and(|skipped| u64::from(*skipped) == flattened_output_index)
+            .is_some_and(|skipped| u64::from(*skipped) == p2tr_slot)
         {
             skipped_iter.next();
-            flattened_output_index += 1;
+            p2tr_slot += 1;
         }
 
         let entry = output_reader.get(i);
         let key = entry.get_key()?;
         anyhow::ensure!(key.len() == 32, "output entry {i} key is not 32 bytes");
         outputs.push(JsonOutputEntry {
-            uid: block.get_first_uid() + flattened_output_index,
+            uid: block.get_first_uid() + p2tr_slot,
             key: hex::encode(key),
         });
-        flattened_output_index += 1;
+        p2tr_slot += 1;
     }
 
     let spend_reader = block.get_spends()?;
@@ -96,6 +97,7 @@ pub fn light_block_to_json(bytes: &[u8]) -> anyhow::Result<JsonLightBlock> {
         block_hash: hex::encode(block.get_block_hash()?),
         previous_block_hash: hex::encode(block.get_previous_block_hash()?),
         first_uid: block.get_first_uid(),
+        p2tr_output_count: u32::try_from(outputs.len() + skipped_outputs.len())?,
         skipped_txs_for_tweaks,
         tweaks,
         skipped_outputs,

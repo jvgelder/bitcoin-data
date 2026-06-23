@@ -47,13 +47,13 @@ pub struct LightBlockInput {
     pub height: u64,
     pub block_hash: BlockHashBytes,
     pub previous_block_hash: BlockHashBytes,
-    /// First global output UID assigned to this block's output domain.
+    /// First global UID assigned to this block's native-P2TR output domain.
     pub first_uid: u64,
     /// Tx indexes without a corresponding dense tweak entry.
     pub skipped_txs_for_tweaks: Vec<u16>,
     /// One typed entry per dense tweak.
     pub tweaks: Vec<TweakEntryInput>,
-    /// Flattened block-output indexes not present in the dense output section.
+    /// Native-P2TR slot indexes not present in the dense output section.
     pub skipped_outputs: Vec<u16>,
     /// One dense output key per indexed output.
     pub outputs: Vec<OutputEntryInput>,
@@ -231,29 +231,49 @@ impl StoredLightBlockInput {
         Ok(response)
     }
 
-    /// Return each stored output with the flattened output index it originally
+    /// Return each stored output with the native-P2TR slot it originally
     /// occupied. `skipped_outputs` are holes and still consume UID space.
     pub fn output_positions(&self) -> anyhow::Result<Vec<(u16, &StoredOutputEntryInput)>> {
-        let mut out = Vec::with_capacity(self.outputs.len());
-        let mut skipped_iter = self.skipped_outputs.iter().copied().peekable();
-        let mut flat_index = 0u32;
+        validate_sorted_unique_u16(&self.skipped_outputs, "stored skipped outputs")?;
 
-        for output in &self.outputs {
-            while skipped_iter
-                .peek()
-                .is_some_and(|skipped| u32::from(*skipped) == flat_index)
-            {
+        let mut out = Vec::with_capacity(self.outputs.len());
+        let mut output_iter = self.outputs.iter();
+        let mut skipped_iter = self.skipped_outputs.iter().copied().peekable();
+
+        let p2tr_output_count =
+            derived_p2tr_output_count(self.outputs.len(), &self.skipped_outputs, "stored")?;
+
+        for slot in 0..p2tr_output_count {
+            let slot_u16 = u16::try_from(slot)
+                .map_err(|_| anyhow::anyhow!("P2TR slot {slot} exceeds u16 range"))?;
+            if skipped_iter.peek().copied() == Some(slot_u16) {
                 skipped_iter.next();
-                flat_index = flat_index
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("flattened output index overflow"))?;
+                continue;
             }
 
-            out.push((u16::try_from(flat_index)?, output));
-            flat_index = flat_index
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("flattened output index overflow"))?;
+            let output = output_iter.next().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "stored block {} has too few outputs for derived P2TR output count {}",
+                    self.height,
+                    p2tr_output_count
+                )
+            })?;
+            out.push((slot_u16, output));
         }
+
+        anyhow::ensure!(
+            output_iter.next().is_none(),
+            "stored block {} has more outputs than derived P2TR output count {} allows",
+            self.height,
+            p2tr_output_count
+        );
+        anyhow::ensure!(
+            skipped_iter.next().is_none(),
+            "stored block {} has skipped output slot outside derived P2TR output count {}",
+            self.height,
+            p2tr_output_count
+        );
+
         Ok(out)
     }
 }
@@ -510,6 +530,7 @@ pub fn validate_light_block_input(input: &LightBlockInput) -> anyhow::Result<()>
 
     validate_sorted_unique_u16(&input.skipped_txs_for_tweaks, "skipped txs for tweaks")?;
     validate_sorted_unique_u16(&input.skipped_outputs, "skipped outputs")?;
+    derived_p2tr_output_count(input.outputs.len(), &input.skipped_outputs, "response")?;
 
     let declared_outputs = input.tweaks.iter().try_fold(0usize, |acc, entry| {
         acc.checked_add(entry.output_count as usize)
@@ -562,6 +583,32 @@ pub fn validate_stored_light_block_input(input: &StoredLightBlockInput) -> anyho
         );
     }
     Ok(())
+}
+
+fn derived_p2tr_output_count(
+    output_count: usize,
+    skipped_outputs: &[u16],
+    label: &str,
+) -> anyhow::Result<u32> {
+    let count = output_count
+        .checked_add(skipped_outputs.len())
+        .ok_or_else(|| anyhow::anyhow!("{label} P2TR output domain count overflow"))?;
+
+    anyhow::ensure!(
+        count <= usize::from(u16::MAX) + 1,
+        "{label} derived P2TR output count {count} exceeds u16 slot domain"
+    );
+
+    for slot in skipped_outputs {
+        anyhow::ensure!(
+            usize::from(*slot) < count,
+            "{label} skipped output slot {} is outside derived P2TR output count {}",
+            slot,
+            count
+        );
+    }
+
+    Ok(u32::try_from(count)?)
 }
 
 fn ensure_u16_len(label: &str, len: usize) -> anyhow::Result<()> {
@@ -643,7 +690,7 @@ mod tests {
                 output_count: 1,
                 tweak: TxTweak::from([9u8; 33]),
             }],
-            skipped_outputs: vec![1, 4],
+            skipped_outputs: vec![1, 2],
             outputs: vec![OutputEntryInput { key: [3u8; 32] }],
             spends: vec![SpendEntryInput { spent_uid: 41 }],
         };
@@ -664,7 +711,7 @@ mod tests {
                 output_count: 1,
                 tweak: TxTweak::from([9u8; 33]),
             }],
-            skipped_outputs: vec![1, 4],
+            skipped_outputs: vec![1, 2],
             outputs: vec![StoredOutputEntryInput {
                 key: [3u8; 32],
                 spent_height: STORAGE_SPENT_HEIGHT_UNSPENT,

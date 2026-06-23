@@ -333,7 +333,6 @@ impl P2trIndexerState {
         let mut tx_tweaks = Vec::<TweakEntryInput>::new();
         let mut storage_tx_tweaks = Vec::<StoredTweakEntryInput>::new();
         let mut skipped_outputs = Vec::<u16>::new();
-        let mut flattened_output_index: u32 = 0;
         let mut stats = BlockScopeStats {
             tx_count: block.txs.len() as u32,
             ..Default::default()
@@ -369,62 +368,49 @@ impl P2trIndexerState {
             }
 
             for output in &tx.outputs {
-                let current_flattened_output_index = flattened_output_index;
-                flattened_output_index = flattened_output_index
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("flattened output index overflow"))?;
-
                 stats.output_count_total += 1;
-                let mut is_reused_output = false;
-                let p2tr_identity = if output.is_p2tr {
-                    let identity = p2tr_output_identity(output, block.height, tx.tx_index)?;
-                    tx_has_p2tr_output = true;
-                    stats.p2tr_output_count += 1;
-                    if output.is_nums {
-                        stats.p2tr_nums_count += 1;
-                    }
-                    stats.p2tr_sp_candidate_count += 1;
-                    if let Some(seen_p2tr_keys) = self.seen_p2tr_keys.as_mut() {
-                        is_reused_output = !seen_p2tr_keys.insert(identity);
-                        if is_reused_output {
-                            stats.p2tr_reused_count += 1;
-                        }
-                    }
-                    Some(identity)
-                } else {
-                    None
-                };
 
                 if !output.is_p2tr {
-                    skipped_outputs.push(u16::try_from(current_flattened_output_index)?);
                     continue;
                 }
 
-                // A P2TR output is only scannable if its transaction has a
-                // usable Silent Payments tweak. If the tweak is missing or
-                // ineligible, omit this output from both the response and the
-                // storage-output list, and preserve its original output slot in
-                // `skipped_outputs` so later output positions do not collapse.
-                if tx.silent_payment_tweak.is_none() {
-                    skipped_outputs.push(u16::try_from(current_flattened_output_index)?);
-                    continue;
+                let current_p2tr_slot = stats.p2tr_output_count;
+                let current_p2tr_slot_u16 = u16::try_from(current_p2tr_slot)?;
+                stats.p2tr_output_count = stats
+                    .p2tr_output_count
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("P2TR output count overflow"))?;
+
+                let p2tr_xonly_key = p2tr_output_identity(output, block.height, tx.tx_index)?;
+                tx_has_p2tr_output = true;
+                if output.is_nums {
+                    stats.p2tr_nums_count += 1;
+                }
+                stats.p2tr_sp_candidate_count += 1;
+
+                let mut is_reused_output = false;
+                if let Some(seen_p2tr_keys) = self.seen_p2tr_keys.as_mut() {
+                    is_reused_output = !seen_p2tr_keys.insert(p2tr_xonly_key);
+                    if is_reused_output {
+                        stats.p2tr_reused_count += 1;
+                    }
                 }
 
-                let p2tr_xonly_key = p2tr_identity.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "indexed P2TR output at height {} tx_index {} vout {} is missing x-only key",
-                        block.height,
-                        tx.tx_index,
-                        output.vout
-                    )
-                })?;
+                // Every native P2TR output consumes a UID slot, but statically
+                // omitted outputs stay out of the dense output list and are
+                // represented by their P2TR slot in `skipped_outputs`.
+                if output.is_nums || tx.silent_payment_tweak.is_none() {
+                    skipped_outputs.push(current_p2tr_slot_u16);
+                    stats.p2tr_excluded_by_scope_count += 1;
+                    continue;
+                }
 
                 stats.indexed_output_count += 1;
                 tx_indexed_output_count = tx_indexed_output_count
                     .checked_add(1)
                     .ok_or_else(|| anyhow::anyhow!("tx indexed output count exceeds u16"))?;
                 let uid = block_first_uid
-                    .checked_add(u64::from(current_flattened_output_index))
+                    .checked_add(u64::from(current_p2tr_slot))
                     .ok_or_else(|| anyhow::anyhow!("scoped UID overflow"))?;
                 let outpoint = OutPointKey {
                     txid: tx.txid,
@@ -486,14 +472,14 @@ impl P2trIndexerState {
                     });
                     stats.tweak_count += 1;
                 }
-            } else if tx_has_p2tr_output && tx.silent_payment_tweak.is_none() {
+            } else if tx_has_p2tr_output {
                 skipped_txs_for_tweaks.push(u16::try_from(tx.tx_index)?);
             }
         }
 
-        if flattened_output_index > 0 {
+        if stats.p2tr_output_count > 0 {
             self.next_uid = block_first_uid
-                .checked_add(u64::from(flattened_output_index))
+                .checked_add(u64::from(stats.p2tr_output_count))
                 .and_then(|next_after_block| next_after_block.checked_sub(1))
                 .ok_or_else(|| anyhow::anyhow!("scoped UID overflow"))?;
         }
@@ -554,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn p2tr_sp_includes_reuse_and_does_not_filter_output_nums() {
+    fn p2tr_sp_counts_nums_slots_but_skips_nums_outputs() {
         let mut state = P2trIndexerState::new();
         let block = BlockScanInput {
             height: 1,
@@ -594,7 +580,12 @@ mod tests {
             }],
         };
         let applied = state.apply_block_with_stats(block).unwrap();
-        assert_eq!(applied.light_block.outputs.len(), 3);
+        assert_eq!(applied.light_block.outputs.len(), 2);
+        assert_eq!(
+            applied.light_block.outputs.len() + applied.light_block.skipped_outputs.len(),
+            3
+        );
+        assert_eq!(applied.light_block.skipped_outputs, vec![2]);
         assert_eq!(applied.light_block.first_uid, 1);
         assert_eq!(applied.light_block.outputs[0].key, xonly_key(1));
         assert!(applied.created_utxos[1].is_reused);
@@ -602,10 +593,9 @@ mod tests {
             applied.storage_block.outputs[1].flags & STORAGE_OUTPUT_FLAG_REUSED,
             STORAGE_OUTPUT_FLAG_REUSED
         );
-        assert_eq!(applied.light_block.outputs[2].key, xonly_key(2));
         assert_eq!(applied.stats.p2tr_nums_count, 1);
         assert_eq!(applied.stats.p2tr_reused_count, 1);
-        assert_eq!(applied.stats.indexed_output_count, 3);
+        assert_eq!(applied.stats.indexed_output_count, 2);
     }
 
     #[test]
@@ -642,6 +632,8 @@ mod tests {
         };
         let light1 = state.apply_block(block1).unwrap();
         assert_eq!(light1.outputs.len(), 1);
+        assert_eq!(light1.outputs.len() + light1.skipped_outputs.len(), 1);
+        assert_eq!(light1.skipped_outputs, Vec::<u16>::new());
         assert_eq!(light1.first_uid, 1);
 
         let block2 = BlockScanInput {
@@ -677,9 +669,9 @@ mod tests {
                 .iter()
                 .map(|s| s.spent_uid)
                 .collect::<Vec<_>>(),
-            vec![2]
+            vec![1]
         );
-        assert_eq!(light2.first_uid, 3);
-        assert_eq!(state.live_uids_sorted(), vec![3]);
+        assert_eq!(light2.first_uid, 2);
+        assert_eq!(state.live_uids_sorted(), vec![2]);
     }
 }
