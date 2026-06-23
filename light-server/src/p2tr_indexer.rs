@@ -30,6 +30,7 @@ impl OutPointKey {
 pub struct SpendLookup {
     pub uid: u64,
     pub creation_height: u64,
+    pub output_index: u32,
     pub flags: u8,
 }
 
@@ -44,6 +45,8 @@ pub struct ScopedUtxoEntry {
     pub created_height: u64,
     pub created_block_hash: BlockHashBytes,
     pub tx_index: u32,
+    /// Dense index in the stored output list for this creation block.
+    pub output_index: u32,
     pub value_sat: u64,
     pub script_pubkey: Vec<u8>,
     /// Required for the p2tr-sp scope: this is the previous-output key needed
@@ -67,6 +70,7 @@ pub struct SpentScopedUtxo {
     pub outpoint: OutPointKey,
     pub uid: u64,
     pub creation_height: u64,
+    pub output_index: u32,
     pub flags: u8,
     pub spent_height: u64,
     pub spent_block_hash: BlockHashBytes,
@@ -188,6 +192,7 @@ impl P2trIndexerState {
                 SpendLookup {
                     uid: entry.uid,
                     creation_height: entry.created_height,
+                    output_index: entry.output_index,
                     flags: 0,
                 },
             );
@@ -212,6 +217,7 @@ impl P2trIndexerState {
                 SpendLookup {
                     uid: entry.uid,
                     creation_height: entry.created_height,
+                    output_index: entry.output_index,
                     flags: 0,
                 },
             );
@@ -332,7 +338,7 @@ impl P2trIndexerState {
         let mut skipped_txs_for_tweaks = Vec::<u16>::new();
         let mut tx_tweaks = Vec::<TweakEntryInput>::new();
         let mut storage_tx_tweaks = Vec::<StoredTweakEntryInput>::new();
-        let mut skipped_outputs = Vec::<u16>::new();
+        let mut storage_skipped_outputs = Vec::<u16>::new();
         let mut stats = BlockScopeStats {
             tx_count: block.txs.len() as u32,
             ..Default::default()
@@ -358,6 +364,7 @@ impl P2trIndexerState {
                         outpoint: input.previous_output,
                         uid: spend_ref.uid,
                         creation_height: spend_ref.creation_height,
+                        output_index: spend_ref.output_index,
                         flags: spend_ref.flags,
                         spent_height: block.height,
                         spent_block_hash: block.block_hash,
@@ -396,11 +403,12 @@ impl P2trIndexerState {
                     }
                 }
 
-                // Every native P2TR output consumes a UID slot, but statically
-                // omitted outputs stay out of the dense output list and are
-                // represented by their P2TR slot in `skipped_outputs`.
+                // Every native P2TR output consumes a UID slot. Statically
+                // omitted outputs stay out of the dense output list; the client
+                // can recover the UID after a match by counting P2TR outputs in
+                // the full block up to the matched outpoint.
                 if output.is_nums || tx.silent_payment_tweak.is_none() {
-                    skipped_outputs.push(current_p2tr_slot_u16);
+                    storage_skipped_outputs.push(current_p2tr_slot_u16);
                     stats.p2tr_excluded_by_scope_count += 1;
                     continue;
                 }
@@ -421,12 +429,14 @@ impl P2trIndexerState {
                 } else {
                     0
                 };
+                let output_index = u32::try_from(storage_output_entries.len())?;
                 let entry = ScopedUtxoEntry {
                     outpoint,
                     uid,
                     created_height: block.height,
                     created_block_hash: block.block_hash,
                     tx_index: tx.tx_index,
+                    output_index,
                     value_sat: output.value_sat,
                     script_pubkey: output.script_pubkey.clone(),
                     p2tr_xonly_key,
@@ -436,6 +446,7 @@ impl P2trIndexerState {
                     SpendLookup {
                         uid,
                         creation_height: block.height,
+                        output_index,
                         flags,
                     },
                 );
@@ -492,7 +503,6 @@ impl P2trIndexerState {
                 first_uid: block_first_uid,
                 skipped_txs_for_tweaks: skipped_txs_for_tweaks.clone(),
                 tweaks: tx_tweaks.clone(),
-                skipped_outputs: skipped_outputs.clone(),
                 outputs: output_entries,
                 spends,
             },
@@ -503,7 +513,7 @@ impl P2trIndexerState {
                 first_uid: block_first_uid,
                 skipped_txs_for_tweaks,
                 tweaks: storage_tx_tweaks,
-                skipped_outputs,
+                skipped_outputs: storage_skipped_outputs,
                 outputs: storage_output_entries,
                 spends: storage_spends,
             },
@@ -581,18 +591,14 @@ mod tests {
         };
         let applied = state.apply_block_with_stats(block).unwrap();
         assert_eq!(applied.light_block.outputs.len(), 2);
-        assert_eq!(
-            applied.light_block.outputs.len() + applied.light_block.skipped_outputs.len(),
-            3
-        );
-        assert_eq!(applied.light_block.skipped_outputs, vec![2]);
         assert_eq!(applied.light_block.first_uid, 1);
         assert_eq!(applied.light_block.outputs[0].key, xonly_key(1));
-        assert!(applied.created_utxos[1].is_reused);
+        assert_eq!(applied.created_utxos[1].is_reused, true);
         assert_eq!(
             applied.storage_block.outputs[1].flags & STORAGE_OUTPUT_FLAG_REUSED,
             STORAGE_OUTPUT_FLAG_REUSED
         );
+        assert_eq!(applied.storage_block.skipped_outputs, vec![2]);
         assert_eq!(applied.stats.p2tr_nums_count, 1);
         assert_eq!(applied.stats.p2tr_reused_count, 1);
         assert_eq!(applied.stats.indexed_output_count, 2);
@@ -632,8 +638,6 @@ mod tests {
         };
         let light1 = state.apply_block(block1).unwrap();
         assert_eq!(light1.outputs.len(), 1);
-        assert_eq!(light1.outputs.len() + light1.skipped_outputs.len(), 1);
-        assert_eq!(light1.skipped_outputs, Vec::<u16>::new());
         assert_eq!(light1.first_uid, 1);
 
         let block2 = BlockScanInput {
