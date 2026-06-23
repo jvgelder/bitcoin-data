@@ -129,7 +129,7 @@ fn open_csv(path: &Path, truncate: bool) -> anyhow::Result<BufWriter<File>> {
     if needs_header {
         writeln!(
             writer,
-            "height,stored_bytes,response_bytes,stored_minus_response_bytes,skipped_txs_for_tweaks,skipped_outputs,total_outputs,total_tweaks,spent_count,spent_id_list_bytes,spent_id_elias_delta_bytes,spent_id_elias_delta_savings_bytes"
+            "height,stored_bytes,response_bytes,stored_minus_response_bytes,skipped_txs_for_tweaks,skipped_outputs,p2tr_output_count,stored_outputs,stored_tweaks,uid_domain_ok,spent_count,spent_id_list_bytes,spent_id_elias_delta_bytes,spent_id_elias_delta_savings_bytes"
         )?;
     }
     Ok(writer)
@@ -151,17 +151,49 @@ fn block_stats_row(
     let spent_id_elias_delta_savings_bytes =
         spent_id_list_bytes as i64 - spent_id_elias_delta_bytes as i64;
 
+    let p2tr_output_count = response.outputs.len() + response.skipped_outputs.len();
+    let uid_domain_ok = validate_response_uid_domain(&response).is_ok();
+
     Ok(format!(
-        "{height},{stored_bytes_len},{response_bytes_len},{stored_minus_response_bytes},{skipped_txs},{skipped_outputs},{total_outputs},{total_tweaks},{spent_count},{spent_id_list_bytes},{spent_id_elias_delta_bytes},{spent_id_elias_delta_savings_bytes}",
+        "{height},{stored_bytes_len},{response_bytes_len},{stored_minus_response_bytes},{skipped_txs},{skipped_outputs},{p2tr_output_count},{stored_outputs},{stored_tweaks},{uid_domain_ok},{spent_count},{spent_id_list_bytes},{spent_id_elias_delta_bytes},{spent_id_elias_delta_savings_bytes}",
         stored_bytes_len = stored_bytes.len(),
         response_bytes_len = response_bytes.len(),
         stored_minus_response_bytes = stored_bytes.len() as i64 - response_bytes.len() as i64,
         skipped_txs = response.skipped_txs_for_tweaks.len(),
         skipped_outputs = response.skipped_outputs.len(),
-        total_outputs = response.outputs.len(),
-        total_tweaks = response.tweaks.len(),
+        p2tr_output_count = p2tr_output_count,
+        stored_outputs = response.outputs.len(),
+        stored_tweaks = response.tweaks.len(),
+        uid_domain_ok = uid_domain_ok,
         spent_count = response.spends.len(),
     ))
+}
+
+fn validate_response_uid_domain(response: &LightBlockInput) -> anyhow::Result<()> {
+    let p2tr_output_count = response
+        .outputs
+        .len()
+        .checked_add(response.skipped_outputs.len())
+        .context("P2TR output count overflow")?;
+    anyhow::ensure!(
+        p2tr_output_count <= usize::from(u16::MAX) + 1,
+        "P2TR output count exceeds u16 slot domain"
+    );
+    for pair in response.skipped_outputs.windows(2) {
+        anyhow::ensure!(
+            pair[0] < pair[1],
+            "skipped_outputs must be sorted and unique"
+        );
+    }
+    for slot in &response.skipped_outputs {
+        anyhow::ensure!(
+            usize::from(*slot) < p2tr_output_count,
+            "skipped output slot {} outside P2TR domain {}",
+            slot,
+            p2tr_output_count
+        );
+    }
+    Ok(())
 }
 
 fn sorted_spent_id_elias_delta_bytes(response: &LightBlockInput) -> anyhow::Result<usize> {
