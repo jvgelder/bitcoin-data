@@ -97,8 +97,18 @@ struct SyncRangeQuery {
     /// Omit outputs marked reused in the storage block.
     #[serde(default)]
     filter_reuse: bool,
+    /// Requested label budget. `labels=2` serves the two-label fingerprint stream;
+    /// any larger value or omission serves the hundred-label stream.
+    labels: Option<u16>,
     /// Optional per-request response byte cap. Must not exceed the server cap.
     max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SingleBlockQuery {
+    /// Requested label budget. `labels=2` serves the two-label fingerprint stream;
+    /// any larger value or omission serves the hundred-label stream.
+    labels: Option<u16>,
 }
 
 pub async fn serve(config: ServerConfig, archive: Arc<dyn ArchiveBackend>) -> anyhow::Result<()> {
@@ -145,12 +155,22 @@ async fn tip(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>
 async fn single_block(
     State(state): State<AppState>,
     Path(height): Path<u64>,
+    Query(q): Query<SingleBlockQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let format = response_format(&headers)?;
     ensure_height_served(&state.archive, height).await?;
 
-    let (payload, block_hash) = state.archive.read_block(height).await?;
+    let (payload, block_hash) = state
+        .archive
+        .read_block_filtered(
+            height,
+            StoredBlockResponseFilter {
+                labels: q.labels,
+                ..StoredBlockResponseFilter::default()
+            },
+        )
+        .await?;
     let cache_control = cache_control(&state.archive, height).await?;
     let mut response = match format {
         ResponseFormat::Capnp => binary_response(payload, cache_control),
@@ -222,6 +242,7 @@ async fn block_range(
         cutthrough_start,
         cutthrough_tip: cutthrough_start.map(|_| tip.height),
         filter_reuse: q.filter_reuse,
+        labels: q.labels,
     };
 
     let mut messages = Vec::<Vec<u8>>::new();
@@ -252,7 +273,7 @@ async fn block_range(
             "range response builder made no progress from start height {}",
             q.start
         )
-        .into());
+            .into());
     }
 
     let count = u32::try_from(messages.len()).map_err(anyhow::Error::from)?;

@@ -17,7 +17,9 @@ pub struct JsonLightBlock {
     pub first_uid: u64,
     pub skipped_txs_for_tweaks: Vec<u16>,
     pub tweaks: Vec<JsonTweakEntry>,
-    pub outputs: Vec<JsonOutputEntry>,
+    pub output_fingerprint_bits: u8,
+    pub output_fingerprint_bytes: usize,
+    pub output_fingerprints: String,
     pub spends: Vec<JsonSpendEntry>,
 }
 
@@ -25,12 +27,6 @@ pub struct JsonLightBlock {
 pub struct JsonTweakEntry {
     pub output_count: u16,
     pub tweak: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct JsonOutputEntry {
-    pub response_output_index: u32,
-    pub key: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -57,19 +53,7 @@ pub fn light_block_to_json(bytes: &[u8]) -> anyhow::Result<JsonLightBlock> {
         });
     }
 
-    let output_reader = block.get_outputs()?;
-    let mut outputs = Vec::with_capacity(output_reader.len() as usize);
-    for i in 0..output_reader.len() {
-        let entry = output_reader.get(i);
-        let key = entry.get_key()?;
-        anyhow::ensure!(key.len() == 32, "output entry {i} key is not 32 bytes");
-        outputs.push(JsonOutputEntry {
-            // The canonical UID for a matched output is recovered from the full
-            // block by counting all native P2TR outputs up to the matched outpoint.
-            response_output_index: i,
-            key: hex::encode(key),
-        });
-    }
+    let output_fingerprints = block.get_output_fingerprints()?;
 
     let spend_reader = block.get_spends()?;
     let mut spends = Vec::with_capacity(spend_reader.len() as usize);
@@ -87,7 +71,9 @@ pub fn light_block_to_json(bytes: &[u8]) -> anyhow::Result<JsonLightBlock> {
         first_uid: block.get_first_uid(),
         skipped_txs_for_tweaks,
         tweaks,
-        outputs,
+        output_fingerprint_bits: block.get_output_fingerprint_bits(),
+        output_fingerprint_bytes: output_fingerprints.len(),
+        output_fingerprints: hex::encode(output_fingerprints),
         spends,
     })
 }

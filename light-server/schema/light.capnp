@@ -1,7 +1,7 @@
 @0xb17c0da7a4510001;
 
 # Client/server response format. This stays compact and does not expose
-# server-side storage metadata such as reuse or spent height.
+# server-side storage metadata such as reuse, spent height, or full output keys.
 struct LightBlock {
   version @0 :UInt16;
   height @1 :UInt64;
@@ -14,18 +14,19 @@ struct LightBlock {
   skippedTxsForTweaks @5 :List(UInt16);
   tweaks @6 :List(TweakEntry);
 
-  outputs @7 :List(OutputEntry);
+  # Number of bits in each packed output fingerprint. The server chooses this
+  # from the stored raw block size and the requested label budget.
+  outputFingerprintBits @7 :UInt8;
+  # Packed output fingerprints in dense output order.
+  # len = ceil(sum(tweak.outputCount) * outputFingerprintBits / 8)
+  outputFingerprints @8 :Data;
 
-  spends @8 :List(SpendEntry);
+  spends @9 :List(SpendEntry);
 }
 
 struct TweakEntry {
   outputCount @0 :UInt16;
   tweak @1 :Data;              # 32 bytes
-}
-
-struct OutputEntry {
-  key @0 :Data;                # 32 bytes
 }
 
 struct SpendEntry {
@@ -50,6 +51,14 @@ struct StoredLightBlock {
   outputs @8 :List(StoredOutputEntry);
 
   spends @9 :List(StoredSpendEntry);
+
+  # Raw serialized Bitcoin block size, excluding undo/spenttxouts data.
+  rawBlockBytes @10 :UInt32;
+
+  # Storage-side precomputed response fingerprints for the two public label
+  # budgets. Full 32-byte keys remain in outputs so this can be regenerated.
+  outputFingerprintsForTwoLabels @11 :Data;
+  outputFingerprintsForHundredLabels @12 :Data;
 }
 
 struct StoredTweakEntry {

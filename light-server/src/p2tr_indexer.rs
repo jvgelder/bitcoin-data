@@ -6,9 +6,10 @@
 //! NUMS is handled on input-side BIP352 spend eligibility, not output creation.
 
 use crate::index::{
-    LightBlockInput, OutputEntryInput, SpendEntryInput, StoredLightBlockInput,
-    StoredOutputEntryInput, StoredSpendEntryInput, StoredTweakEntryInput, TweakEntryInput,
-    STORAGE_OUTPUT_FLAG_REUSED, STORAGE_SPENT_HEIGHT_UNSPENT,
+    build_stored_output_fingerprints, choose_output_fingerprint_bits, light_block_output_count, LightBlockInput,
+    SpendEntryInput, StoredLightBlockInput, StoredOutputEntryInput, StoredSpendEntryInput,
+    StoredTweakEntryInput, TweakEntryInput, RESPONSE_LABEL_BUDGET_HUNDRED,
+    RESPONSE_LABEL_BUDGET_TWO, STORAGE_OUTPUT_FLAG_REUSED, STORAGE_SPENT_HEIGHT_UNSPENT,
 };
 use crate::types::{BlockHashBytes, TxTweak, TxidBytes};
 use serde::{Deserialize, Serialize};
@@ -118,6 +119,8 @@ pub struct BlockScanInput {
     pub height: u64,
     pub block_hash: BlockHashBytes,
     pub previous_block_hash: BlockHashBytes,
+    /// Raw serialized Bitcoin block size, excluding undo/spenttxouts data.
+    pub raw_block_bytes: u32,
     pub txs: Vec<TxScanInput>,
 }
 
@@ -331,7 +334,6 @@ impl P2trIndexerState {
         block: BlockScanInput,
     ) -> anyhow::Result<AppliedBlock> {
         let block_first_uid = self.next_uid.saturating_add(1);
-        let mut output_entries = Vec::<OutputEntryInput>::new();
         let mut storage_output_entries = Vec::<StoredOutputEntryInput>::new();
         let mut spends = Vec::<SpendEntryInput>::new();
         let mut storage_spends = Vec::<StoredSpendEntryInput>::new();
@@ -457,9 +459,6 @@ impl P2trIndexerState {
                     is_reused: is_reused_output,
                     reuse_count_at_creation: 1,
                 });
-                output_entries.push(OutputEntryInput {
-                    key: p2tr_xonly_key,
-                });
                 storage_output_entries.push(StoredOutputEntryInput {
                     key: p2tr_xonly_key,
                     spent_height: STORAGE_SPENT_HEIGHT_UNSPENT,
@@ -495,6 +494,24 @@ impl P2trIndexerState {
                 .ok_or_else(|| anyhow::anyhow!("scoped UID overflow"))?;
         }
 
+        let output_fingerprints_for_two_labels = build_stored_output_fingerprints(
+            block.block_hash,
+            block.raw_block_bytes,
+            &storage_output_entries,
+            RESPONSE_LABEL_BUDGET_TWO,
+        )?;
+        let output_fingerprints_for_hundred_labels = build_stored_output_fingerprints(
+            block.block_hash,
+            block.raw_block_bytes,
+            &storage_output_entries,
+            RESPONSE_LABEL_BUDGET_HUNDRED,
+        )?;
+        let default_output_fingerprint_bits = choose_output_fingerprint_bits(
+            storage_output_entries.len(),
+            block.raw_block_bytes,
+            RESPONSE_LABEL_BUDGET_HUNDRED,
+        );
+
         Ok(AppliedBlock {
             light_block: LightBlockInput {
                 height: block.height,
@@ -503,7 +520,8 @@ impl P2trIndexerState {
                 first_uid: block_first_uid,
                 skipped_txs_for_tweaks: skipped_txs_for_tweaks.clone(),
                 tweaks: tx_tweaks.clone(),
-                outputs: output_entries,
+                output_fingerprint_bits: default_output_fingerprint_bits,
+                output_fingerprints: output_fingerprints_for_hundred_labels.clone(),
                 spends,
             },
             storage_block: StoredLightBlockInput {
@@ -516,6 +534,9 @@ impl P2trIndexerState {
                 skipped_outputs: storage_skipped_outputs,
                 outputs: storage_output_entries,
                 spends: storage_spends,
+                raw_block_bytes: block.raw_block_bytes,
+                output_fingerprints_for_two_labels,
+                output_fingerprints_for_hundred_labels,
             },
             stats,
             created_utxos,
@@ -556,6 +577,7 @@ mod tests {
             height: 1,
             block_hash: [1; 32].into(),
             previous_block_hash: [0; 32].into(),
+            raw_block_bytes: 1_000,
             txs: vec![TxScanInput {
                 txid: txid(10),
                 tx_index: 0,
@@ -590,10 +612,9 @@ mod tests {
             }],
         };
         let applied = state.apply_block_with_stats(block).unwrap();
-        assert_eq!(applied.light_block.outputs.len(), 2);
+        assert_eq!(light_block_output_count(&applied.light_block).unwrap(), 2);
         assert_eq!(applied.light_block.first_uid, 1);
-        assert_eq!(applied.light_block.outputs[0].key, xonly_key(1));
-        assert_eq!(applied.created_utxos[1].is_reused, true);
+        assert!(applied.created_utxos[1].is_reused);
         assert_eq!(
             applied.storage_block.outputs[1].flags & STORAGE_OUTPUT_FLAG_REUSED,
             STORAGE_OUTPUT_FLAG_REUSED
@@ -611,6 +632,7 @@ mod tests {
             height: 1,
             block_hash: [1; 32].into(),
             previous_block_hash: [0; 32].into(),
+            raw_block_bytes: 1_000,
             txs: vec![TxScanInput {
                 txid: txid(10),
                 tx_index: 0,
@@ -637,13 +659,14 @@ mod tests {
             }],
         };
         let light1 = state.apply_block(block1).unwrap();
-        assert_eq!(light1.outputs.len(), 1);
+        assert_eq!(light_block_output_count(&light1).unwrap(), 1);
         assert_eq!(light1.first_uid, 1);
 
         let block2 = BlockScanInput {
             height: 2,
             block_hash: [2; 32].into(),
             previous_block_hash: [1; 32].into(),
+            raw_block_bytes: 1_000,
             txs: vec![TxScanInput {
                 txid: txid(11),
                 tx_index: 0,
