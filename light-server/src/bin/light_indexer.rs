@@ -3,7 +3,7 @@ use bitcoin::hashes::Hash as BitcoinHash;
 use bitcoin::Block;
 use btc_data_core::block::{BlockSpentTxOuts, SpentTxOut};
 use btc_data_core::source::{BlockSource, TipWatcher};
-use btc_data_light_server::index::{encode_light_block, to_packed_bytes};
+use btc_data_light_server::index::{encode_stored_light_block, to_packed_bytes};
 use btc_data_light_server::index_store::RocksIndexStore;
 use btc_data_light_server::p2tr_indexer::{
     BlockScanInput, BlockScopeStats, OutPointKey, P2trIndexerState, TxInputScan, TxOutputScan,
@@ -526,7 +526,7 @@ async fn catch_up_ranges(
             let emit_light_payload = scan.height >= emit_start_height;
             if emit_light_payload {
                 let applied = state.apply_block_with_stats(scan)?;
-                let payload = to_packed_bytes(&encode_light_block(&applied.light_block)?)?;
+                let payload = to_packed_bytes(&encode_stored_light_block(&applied.storage_block)?)?;
                 pending_payload_bytes = pending_payload_bytes.saturating_add(payload.len());
                 pending.push(Pending { applied, payload });
             }
@@ -903,6 +903,7 @@ fn decode_block_frame(
         height,
         block_hash: BlockHashBytes::from(source_hash),
         previous_block_hash: BlockHashBytes::from(block.header.prev_blockhash.to_byte_array()),
+        raw_block_bytes: u32::try_from(bytes.len())?,
         txs,
     })
 }
@@ -1189,10 +1190,11 @@ fn fixture_blocks(start_height: u64, count: u64) -> anyhow::Result<FixtureBlocks
             height,
             block_hash: hash,
             previous_block_hash: prev_hash,
+            raw_block_bytes: 1_000,
             txs,
         })?;
 
-        let bytes = to_packed_bytes(&encode_light_block(&applied.light_block)?)?;
+        let bytes = to_packed_bytes(&encode_stored_light_block(&applied.storage_block)?)?;
 
         blocks.push((
             height,

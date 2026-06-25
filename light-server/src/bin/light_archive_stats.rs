@@ -1,8 +1,8 @@
 use anyhow::Context;
 use btc_data_light_server::codec::elias_delta::encode_elias_delta_values;
 use btc_data_light_server::index::{
-    decode_stored_light_block, encode_light_block, to_packed_bytes, LightBlockInput,
-    StoredBlockResponseFilter,
+    decode_stored_light_block, encode_light_block, light_block_output_count, to_packed_bytes,
+    LightBlockInput, StoredBlockResponseFilter,
 };
 use clap::Parser;
 use std::fs::{self, File, OpenOptions};
@@ -75,6 +75,7 @@ fn main() -> anyhow::Result<()> {
         cutthrough_start: args.cutthrough_start,
         cutthrough_tip: args.cutthrough_tip.or(Some(archive_tip)),
         filter_reuse: args.filter_reuse,
+        labels: None,
     };
 
     let mut csv = open_csv(&args.csv, args.truncate)?;
@@ -129,7 +130,7 @@ fn open_csv(path: &Path, truncate: bool) -> anyhow::Result<BufWriter<File>> {
     if needs_header {
         writeln!(
             writer,
-            "height,stored_bytes,response_bytes,stored_minus_response_bytes,stored_skipped_txs_for_tweaks,stored_skipped_outputs,stored_p2tr_output_count,stored_outputs,stored_tweaks,stored_uid_domain_ok,response_outputs,response_tweaks,spent_count,spent_id_list_bytes,spent_id_elias_delta_bytes,spent_id_elias_delta_savings_bytes"
+            "height,stored_bytes,response_bytes_labels100,response_bytes_labels2,response_bytes_full_key,stored_minus_response100_bytes,stored_skipped_txs_for_tweaks,stored_skipped_outputs,stored_p2tr_output_count,stored_outputs,stored_tweaks,stored_uid_domain_ok,response_outputs,response_tweaks,spent_count,spent_id_list_bytes,spent_id_elias_delta_bytes,spent_id_elias_delta_savings_bytes"
         )?;
     }
     Ok(writer)
@@ -142,9 +143,23 @@ fn block_stats_row(
 ) -> anyhow::Result<String> {
     let stored_bytes = fs::read(path)?;
     let stored = decode_stored_light_block(&stored_bytes)?;
-    let response = stored.to_filtered_response_input(filter)?;
-    let response_msg = encode_light_block(&response)?;
-    let response_bytes = to_packed_bytes(&response_msg)?;
+
+    let response_for_labels = |labels| -> anyhow::Result<LightBlockInput> {
+        let mut filter = filter;
+        filter.labels = Some(labels);
+        stored.to_filtered_response_input(filter)
+    };
+
+    let response = response_for_labels(100)?;
+    let response_100_bytes = to_packed_bytes(&encode_light_block(&response)?)?;
+    let response_2_bytes_len = to_packed_bytes(&encode_light_block(&response_for_labels(2)?)?)?
+        .len();
+
+    let response_output_count = light_block_output_count(&response)?;
+    let response_full_key_bytes = response_100_bytes
+        .len()
+        .saturating_sub(response.output_fingerprints.len())
+        .saturating_add(response_output_count.saturating_mul(32));
 
     let stored_p2tr_output_count = stored.outputs.len() + stored.skipped_outputs.len();
     let stored_uid_domain_ok = validate_stored_uid_domain(&stored).is_ok();
@@ -154,17 +169,19 @@ fn block_stats_row(
         spent_id_list_bytes as i64 - spent_id_elias_delta_bytes as i64;
 
     Ok(format!(
-        "{height},{stored_bytes_len},{response_bytes_len},{stored_minus_response_bytes},{stored_skipped_txs},{stored_skipped_outputs},{stored_p2tr_output_count},{stored_outputs},{stored_tweaks},{stored_uid_domain_ok},{response_outputs},{response_tweaks},{spent_count},{spent_id_list_bytes},{spent_id_elias_delta_bytes},{spent_id_elias_delta_savings_bytes}",
+        "{height},{stored_bytes_len},{response_100_bytes_len},{response_2_bytes_len},{response_full_key_bytes},{stored_minus_response100_bytes},{stored_skipped_txs},{stored_skipped_outputs},{stored_p2tr_output_count},{stored_outputs},{stored_tweaks},{stored_uid_domain_ok},{response_outputs},{response_tweaks},{spent_count},{spent_id_list_bytes},{spent_id_elias_delta_bytes},{spent_id_elias_delta_savings_bytes}",
         stored_bytes_len = stored_bytes.len(),
-        response_bytes_len = response_bytes.len(),
-        stored_minus_response_bytes = stored_bytes.len() as i64 - response_bytes.len() as i64,
+        response_100_bytes_len = response_100_bytes.len(),
+        response_2_bytes_len = response_2_bytes_len,
+        response_full_key_bytes = response_full_key_bytes,
+        stored_minus_response100_bytes = stored_bytes.len() as i64 - response_100_bytes.len() as i64,
         stored_skipped_txs = stored.skipped_txs_for_tweaks.len(),
         stored_skipped_outputs = stored.skipped_outputs.len(),
         stored_p2tr_output_count = stored_p2tr_output_count,
         stored_outputs = stored.outputs.len(),
         stored_tweaks = stored.tweaks.len(),
         stored_uid_domain_ok = stored_uid_domain_ok,
-        response_outputs = response.outputs.len(),
+        response_outputs = response_output_count,
         response_tweaks = response.tweaks.len(),
         spent_count = response.spends.len(),
     ))

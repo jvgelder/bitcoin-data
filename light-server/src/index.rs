@@ -4,6 +4,7 @@ use crate::WIRE_VERSION;
 use capnp::message::{Builder, HeapAllocator, ReaderOptions};
 use std::collections::BTreeSet;
 use std::io::Cursor;
+use sha2::{Digest, Sha256};
 
 pub const MAX_U16_SECTION_COUNT: usize = u16::MAX as usize;
 pub const STORAGE_OUTPUT_FLAG_REUSED: u8 = 1 << 0;
@@ -31,12 +32,6 @@ pub struct StoredTweakEntryInput {
 }
 
 #[derive(Debug, Clone)]
-pub struct OutputEntryInput {
-    /// 32-byte P2TR x-only output key.
-    pub key: [u8; 32],
-}
-
-#[derive(Debug, Clone)]
 pub struct SpendEntryInput {
     /// Global UID spent by this block. The spend height is this block's height.
     pub spent_uid: u64,
@@ -53,8 +48,10 @@ pub struct LightBlockInput {
     pub skipped_txs_for_tweaks: Vec<u16>,
     /// One typed entry per dense tweak.
     pub tweaks: Vec<TweakEntryInput>,
-    /// One dense output key per indexed output.
-    pub outputs: Vec<OutputEntryInput>,
+    /// Number of bits in every packed output fingerprint.
+    pub output_fingerprint_bits: u8,
+    /// Packed output fingerprints in dense output order.
+    pub output_fingerprints: Vec<u8>,
     /// One spent UID per spent indexed output in this block.
     pub spends: Vec<SpendEntryInput>,
 }
@@ -88,6 +85,12 @@ pub struct StoredLightBlockInput {
     pub skipped_outputs: Vec<u16>,
     pub outputs: Vec<StoredOutputEntryInput>,
     pub spends: Vec<StoredSpendEntryInput>,
+    /// Raw serialized Bitcoin block size, excluding undo/spenttxouts data.
+    pub raw_block_bytes: u32,
+    /// Packed fingerprints for clients with up to two labels.
+    pub output_fingerprints_for_two_labels: Vec<u8>,
+    /// Packed fingerprints for clients with more than two labels.
+    pub output_fingerprints_for_hundred_labels: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -102,11 +105,32 @@ pub struct StoredBlockResponseFilter {
     pub cutthrough_tip: Option<u64>,
     /// Omit outputs marked with STORAGE_OUTPUT_FLAG_REUSED.
     pub filter_reuse: bool,
+    /// Optional requested wallet label budget. `<= 2` serves the two-label
+    /// fingerprint stream; larger or omitted serves the hundred-label stream.
+    pub labels: Option<u16>,
 }
 
 impl StoredLightBlockInput {
     pub fn to_response_input(&self) -> LightBlockInput {
-        LightBlockInput {
+        self.to_response_input_for_labels(None)
+            .expect("stored block should have valid default response fingerprints")
+    }
+
+    pub fn to_response_input_for_labels(&self, labels: Option<u16>) -> anyhow::Result<LightBlockInput> {
+        let label_budget = response_label_budget(labels);
+        let output_count = self.outputs.len();
+        let output_fingerprint_bits = choose_output_fingerprint_bits(
+            output_count,
+            self.raw_block_bytes,
+            label_budget,
+        );
+        let output_fingerprints = match label_budget {
+            RESPONSE_LABEL_BUDGET_TWO => self.output_fingerprints_for_two_labels.clone(),
+            RESPONSE_LABEL_BUDGET_HUNDRED => self.output_fingerprints_for_hundred_labels.clone(),
+            _ => unreachable!("label budget is normalized"),
+        };
+
+        let response = LightBlockInput {
             height: self.height,
             block_hash: self.block_hash,
             previous_block_hash: self.previous_block_hash,
@@ -120,11 +144,8 @@ impl StoredLightBlockInput {
                     tweak: entry.tweak,
                 })
                 .collect(),
-            outputs: self
-                .outputs
-                .iter()
-                .map(|entry| OutputEntryInput { key: entry.key })
-                .collect(),
+            output_fingerprint_bits,
+            output_fingerprints,
             spends: self
                 .spends
                 .iter()
@@ -132,7 +153,9 @@ impl StoredLightBlockInput {
                     spent_uid: entry.spent_uid,
                 })
                 .collect(),
-        }
+        };
+        validate_light_block_input(&response)?;
+        Ok(response)
     }
 
     pub fn to_filtered_response_input(
@@ -140,7 +163,7 @@ impl StoredLightBlockInput {
         filter: StoredBlockResponseFilter,
     ) -> anyhow::Result<LightBlockInput> {
         if !filter.filter_reuse && filter.cutthrough_start.is_none() {
-            return Ok(self.to_response_input());
+            return self.to_response_input_for_labels(filter.labels);
         }
 
         let mut skipped_txs_for_tweaks = self
@@ -149,7 +172,7 @@ impl StoredLightBlockInput {
             .copied()
             .collect::<BTreeSet<_>>();
 
-        let mut outputs = Vec::<OutputEntryInput>::new();
+        let mut output_keys = Vec::<[u8; 32]>::new();
         let mut tweaks = Vec::<TweakEntryInput>::new();
         let mut output_cursor = 0usize;
         let tweak_tx_indexes =
@@ -175,7 +198,7 @@ impl StoredLightBlockInput {
                 if should_omit_stored_output(self.height, output, filter) {
                     continue;
                 }
-                outputs.push(OutputEntryInput { key: output.key });
+                output_keys.push(output.key);
                 kept_count = kept_count
                     .checked_add(1)
                     .ok_or_else(|| anyhow::anyhow!("filtered tweak output count overflow"))?;
@@ -207,6 +230,15 @@ impl StoredLightBlockInput {
             })
             .collect();
 
+        let label_budget = response_label_budget(filter.labels);
+        let output_fingerprint_bits =
+            choose_output_fingerprint_bits(output_keys.len(), self.raw_block_bytes, label_budget);
+        let output_fingerprints = pack_output_fingerprints_from_keys(
+            self.block_hash,
+            output_keys.iter(),
+            output_fingerprint_bits,
+        )?;
+
         let response = LightBlockInput {
             height: self.height,
             block_hash: self.block_hash,
@@ -214,7 +246,8 @@ impl StoredLightBlockInput {
             first_uid: self.first_uid,
             skipped_txs_for_tweaks: skipped_txs_for_tweaks.into_iter().collect(),
             tweaks,
-            outputs,
+            output_fingerprint_bits,
+            output_fingerprints,
             spends,
         };
         validate_light_block_input(&response)?;
@@ -309,11 +342,8 @@ pub fn encode_light_block(input: &LightBlockInput) -> anyhow::Result<Builder<Hea
             t.set_tweak(tx_tweak_payload_bytes(&entry.tweak)?);
         }
 
-        let mut outputs = b.reborrow().init_outputs(input.outputs.len() as u32);
-        for (i, entry) in input.outputs.iter().enumerate() {
-            let mut o = outputs.reborrow().get(i as u32);
-            o.set_key(&entry.key);
-        }
+        b.set_output_fingerprint_bits(input.output_fingerprint_bits);
+        b.set_output_fingerprints(&input.output_fingerprints);
 
         let mut spends = b.reborrow().init_spends(input.spends.len() as u32);
         for (i, entry) in input.spends.iter().enumerate() {
@@ -374,6 +404,10 @@ pub fn encode_stored_light_block(
             s.set_spent_uid(entry.spent_uid);
             s.set_creation_height(entry.creation_height);
         }
+
+        b.set_raw_block_bytes(input.raw_block_bytes);
+        b.set_output_fingerprints_for_two_labels(&input.output_fingerprints_for_two_labels);
+        b.set_output_fingerprints_for_hundred_labels(&input.output_fingerprints_for_hundred_labels);
     }
     Ok(msg)
 }
@@ -436,6 +470,9 @@ pub fn decode_stored_light_block(bytes: &[u8]) -> anyhow::Result<StoredLightBloc
         skipped_outputs,
         outputs,
         spends,
+        raw_block_bytes: block.get_raw_block_bytes(),
+        output_fingerprints_for_two_labels: block.get_output_fingerprints_for_two_labels()?.to_vec(),
+        output_fingerprints_for_hundred_labels: block.get_output_fingerprints_for_hundred_labels()?.to_vec(),
     };
     validate_stored_light_block_input(&input)?;
     Ok(input)
@@ -461,20 +498,31 @@ pub fn stored_light_block_to_filtered_response_bytes(
 pub fn validate_light_block_input(input: &LightBlockInput) -> anyhow::Result<()> {
     ensure_u16_len("skipped txs for tweaks", input.skipped_txs_for_tweaks.len())?;
     ensure_u16_len("tweaks", input.tweaks.len())?;
-    ensure_u16_len("outputs", input.outputs.len())?;
-
     validate_sorted_unique_u16(&input.skipped_txs_for_tweaks, "skipped txs for tweaks")?;
 
-    let declared_outputs = input.tweaks.iter().try_fold(0usize, |acc, entry| {
-        acc.checked_add(entry.output_count as usize)
-            .ok_or_else(|| anyhow::anyhow!("tweak output count sum overflow"))
-    })?;
+    let declared_outputs = light_block_output_count(input)?;
+    let expected_fingerprint_len =
+        packed_fingerprint_len(declared_outputs, input.output_fingerprint_bits)?;
     anyhow::ensure!(
-        declared_outputs == input.outputs.len(),
-        "sum(tweak.output_count) {} does not match output count {}",
+        expected_fingerprint_len == input.output_fingerprints.len(),
+        "output fingerprint byte length {} does not match expected {} for {} outputs at {} bits",
+        input.output_fingerprints.len(),
+        expected_fingerprint_len,
         declared_outputs,
-        input.outputs.len()
+        input.output_fingerprint_bits
     );
+
+    if declared_outputs == 0 {
+        anyhow::ensure!(
+            input.output_fingerprint_bits == 0,
+            "empty output fingerprint stream must use 0 bits"
+        );
+    } else {
+        anyhow::ensure!(
+            input.output_fingerprint_bits > 0,
+            "non-empty output fingerprint stream must use a positive bit width"
+        );
+    }
 
     for entry in &input.tweaks {
         anyhow::ensure!(
@@ -506,6 +554,8 @@ pub fn validate_stored_light_block_input(input: &StoredLightBlockInput) -> anyho
     )?;
     validate_sorted_unique_u16(&input.skipped_outputs, "stored skipped outputs")?;
     validate_stored_p2tr_uid_domain(input.outputs.len(), &input.skipped_outputs)?;
+
+    validate_stored_output_fingerprints(input)?;
 
     let response = input.to_response_input();
     validate_light_block_input(&response)?;
@@ -555,6 +605,154 @@ fn validate_stored_p2tr_uid_domain(
             p2tr_output_count
         );
     }
+
+    Ok(())
+}
+
+pub const RESPONSE_LABEL_BUDGET_TWO: u16 = 2;
+pub const RESPONSE_LABEL_BUDGET_HUNDRED: u16 = 100;
+// "bitcoindata/light-output-fingerprint/v1";
+const OUTPUT_FINGERPRINT_TAG_HASH: [u8; 32] = [
+    0xa0, 0x38, 0xb9, 0x9b, 0xe2, 0x7a, 0x13, 0x6e, 0xa7, 0xbb, 0x51, 0xc9, 0xec, 0x88, 0x71, 0x92,
+    0x62, 0x4a, 0x04, 0xe2, 0x41, 0xae, 0x15, 0x2c, 0x20, 0xc7, 0xf2, 0xe6, 0x45, 0x94, 0xcc, 0x5f,
+];
+
+pub fn response_label_budget(labels: Option<u16>) -> u16 {
+    match labels {
+        Some(1 | 2) => RESPONSE_LABEL_BUDGET_TWO,
+        _ => RESPONSE_LABEL_BUDGET_HUNDRED,
+    }
+}
+
+/// Simple log-based policy:
+///
+/// bits = ceil(log2(4 * label_budget * raw_block_bytes))
+///
+/// The factor 4 is the one-more-bit marginal break-even approximation for
+/// packed bits vs expected false full-block download bytes.
+pub fn choose_output_fingerprint_bits(
+    output_count: usize,
+    raw_block_bytes: u32,
+    label_budget: u16,
+) -> u8 {
+    if output_count == 0 || raw_block_bytes == 0 {
+        return 0;
+    }
+
+    let value = 4.0 * f64::from(raw_block_bytes) * f64::from(label_budget.max(1));
+    value.log2().ceil().clamp(1.0, 255.0) as u8
+}
+
+pub fn light_block_output_count(input: &LightBlockInput) -> anyhow::Result<usize> {
+    input.tweaks.iter().try_fold(0usize, |acc, entry| {
+        acc.checked_add(entry.output_count as usize)
+            .ok_or_else(|| anyhow::anyhow!("tweak output count sum overflow"))
+    })
+}
+
+pub fn packed_fingerprint_len(output_count: usize, bits: u8) -> anyhow::Result<usize> {
+    if output_count == 0 || bits == 0 {
+        return Ok(0);
+    }
+    let total_bits = output_count
+        .checked_mul(usize::from(bits))
+        .ok_or_else(|| anyhow::anyhow!("output fingerprint bit length overflow"))?;
+    Ok(total_bits.div_ceil(8))
+}
+
+pub fn pack_output_fingerprints_from_stored_outputs(
+    block_hash: BlockHashBytes,
+    outputs: &[StoredOutputEntryInput],
+    bits: u8,
+) -> anyhow::Result<Vec<u8>> {
+    pack_output_fingerprints_from_keys(block_hash, outputs.iter().map(|entry| &entry.key), bits)
+}
+
+pub fn pack_output_fingerprints_from_keys<'a>(
+    block_hash: BlockHashBytes,
+    keys: impl IntoIterator<Item = &'a [u8; 32]>,
+    bits: u8,
+) -> anyhow::Result<Vec<u8>> {
+    if bits == 0 {
+        return Ok(Vec::new());
+    }
+
+    let keys = keys.into_iter().collect::<Vec<_>>();
+    let mut out = vec![0u8; packed_fingerprint_len(keys.len(), bits)?];
+    let mut out_bit = 0usize;
+    let base_hasher = output_fingerprint_base_hasher(block_hash);
+
+    for key in keys {
+        let digest = output_fingerprint_digest_from_base(&base_hasher, key);
+        for bit in 0..usize::from(bits) {
+            let src = (digest[bit / 8] >> (7 - (bit % 8))) & 1;
+            if src != 0 {
+                let byte = out_bit / 8;
+                let shift = 7 - (out_bit % 8);
+                out[byte] |= 1 << shift;
+            }
+            out_bit += 1;
+        }
+    }
+
+    Ok(out)
+}
+
+fn output_fingerprint_digest(block_hash: BlockHashBytes, key: &[u8; 32]) -> [u8; 32] {
+    let base_hasher = output_fingerprint_base_hasher(block_hash);
+    output_fingerprint_digest_from_base(&base_hasher, key)
+}
+
+fn output_fingerprint_digest_from_base(base_hasher: &Sha256, key: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = base_hasher.clone();
+    hasher.update(key);
+    hasher.finalize().into()
+}
+
+fn output_fingerprint_base_hasher(block_hash: BlockHashBytes) -> Sha256 {
+    let mut hasher = Sha256::new();
+    hasher.update(OUTPUT_FINGERPRINT_TAG_HASH);
+    hasher.update(OUTPUT_FINGERPRINT_TAG_HASH);
+    hasher.update(block_hash.as_bytes());
+    hasher
+}
+
+pub fn build_stored_output_fingerprints(
+    block_hash: BlockHashBytes,
+    raw_block_bytes: u32,
+    outputs: &[StoredOutputEntryInput],
+    label_budget: u16,
+) -> anyhow::Result<Vec<u8>> {
+    let bits = choose_output_fingerprint_bits(outputs.len(), raw_block_bytes, label_budget);
+    pack_output_fingerprints_from_stored_outputs(block_hash, outputs, bits)
+}
+
+fn validate_stored_output_fingerprints(input: &StoredLightBlockInput) -> anyhow::Result<()> {
+    let bits_two = choose_output_fingerprint_bits(
+        input.outputs.len(),
+        input.raw_block_bytes,
+        RESPONSE_LABEL_BUDGET_TWO,
+    );
+    let expected_two = packed_fingerprint_len(input.outputs.len(), bits_two)?;
+    anyhow::ensure!(
+        input.output_fingerprints_for_two_labels.len() == expected_two,
+        "stored two-label output fingerprint byte length {} does not match expected {}",
+        input.output_fingerprints_for_two_labels.len(),
+        expected_two
+    );
+
+    let bits_hundred = choose_output_fingerprint_bits(
+        input.outputs.len(),
+        input.raw_block_bytes,
+        RESPONSE_LABEL_BUDGET_HUNDRED,
+    );
+    let expected_hundred = packed_fingerprint_len(input.outputs.len(), bits_hundred)?;
+    anyhow::ensure!(
+        input.output_fingerprints_for_hundred_labels.len() == expected_hundred,
+        "stored hundred-label output fingerprint byte length {} does not match expected {}",
+        input.output_fingerprints_for_hundred_labels.len(),
+        expected_hundred
+    );
 
     Ok(())
 }
@@ -611,29 +809,8 @@ pub fn to_bytes(msg: &Builder<HeapAllocator>) -> anyhow::Result<Vec<u8>> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn encodes_typed_light_block() {
-        let input = LightBlockInput {
-            height: 100,
-            block_hash: BlockHashBytes::from([1u8; 32]),
-            previous_block_hash: BlockHashBytes::from([2u8; 32]),
-            first_uid: 42,
-            skipped_txs_for_tweaks: vec![0, 3],
-            tweaks: vec![TweakEntryInput {
-                output_count: 1,
-                tweak: TxTweak::from([9u8; 33]),
-            }],
-            outputs: vec![OutputEntryInput { key: [3u8; 32] }],
-            spends: vec![SpendEntryInput { spent_uid: 41 }],
-        };
-        let msg = encode_light_block(&input).unwrap();
-        let bytes = to_packed_bytes(&msg).unwrap();
-        assert!(!bytes.is_empty());
-    }
-
-    #[test]
-    fn encodes_and_decodes_stored_light_block_to_response() {
-        let stored = StoredLightBlockInput {
+    fn stored_block_for_test() -> StoredLightBlockInput {
+        let mut stored = StoredLightBlockInput {
             height: 100,
             block_hash: BlockHashBytes::from([1u8; 32]),
             previous_block_hash: BlockHashBytes::from([2u8; 32]),
@@ -653,7 +830,70 @@ mod tests {
                 spent_uid: 41,
                 creation_height: 99,
             }],
+            raw_block_bytes: 2_500_000,
+            output_fingerprints_for_two_labels: Vec::new(),
+            output_fingerprints_for_hundred_labels: Vec::new(),
         };
+        stored.output_fingerprints_for_two_labels = build_stored_output_fingerprints(
+            stored.block_hash,
+            stored.raw_block_bytes,
+            &stored.outputs,
+            RESPONSE_LABEL_BUDGET_TWO,
+        )
+        .unwrap();
+        stored.output_fingerprints_for_hundred_labels = build_stored_output_fingerprints(
+            stored.block_hash,
+            stored.raw_block_bytes,
+            &stored.outputs,
+            RESPONSE_LABEL_BUDGET_HUNDRED,
+        )
+        .unwrap();
+        stored
+    }
+
+    #[test]
+    fn output_fingerprint_uses_bip340_tagged_hash() {
+        let block_hash = BlockHashBytes::from([1u8; 32]);
+        let key = [3u8; 32];
+        const OUTPUT_FINGERPRINT_DOMAIN: &str = "bitcoindata/light-output-fingerprint/v1";
+
+        let tag_hash: [u8; 32] = Sha256::digest(OUTPUT_FINGERPRINT_DOMAIN.as_bytes()).into();
+        assert_eq!(OUTPUT_FINGERPRINT_TAG_HASH, tag_hash);
+
+        let mut reference = Sha256::new();
+        reference.update(tag_hash);
+        reference.update(tag_hash);
+        reference.update(block_hash.as_bytes());
+        reference.update(&key);
+        let expected: [u8; 32] = reference.finalize().into();
+
+        assert_eq!(output_fingerprint_digest(block_hash, &key), expected);
+    }
+
+    #[test]
+    fn encodes_typed_light_block() {
+        let input = LightBlockInput {
+            height: 100,
+            block_hash: BlockHashBytes::from([1u8; 32]),
+            previous_block_hash: BlockHashBytes::from([2u8; 32]),
+            first_uid: 42,
+            skipped_txs_for_tweaks: vec![0, 3],
+            tweaks: vec![TweakEntryInput {
+                output_count: 1,
+                tweak: TxTweak::from([9u8; 33]),
+            }],
+            output_fingerprint_bits: 8,
+            output_fingerprints: vec![3],
+            spends: vec![SpendEntryInput { spent_uid: 41 }],
+        };
+        let msg = encode_light_block(&input).unwrap();
+        let bytes = to_packed_bytes(&msg).unwrap();
+        assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn encodes_and_decodes_stored_light_block_to_response() {
+        let stored = stored_block_for_test();
         let bytes = to_packed_bytes(&encode_stored_light_block(&stored).unwrap()).unwrap();
         let decoded = decode_stored_light_block(&bytes).unwrap();
         assert_eq!(
@@ -666,6 +906,7 @@ mod tests {
         );
         assert_eq!(decoded.spends[0].creation_height, 99);
         assert_eq!(decoded.skipped_outputs, vec![1]);
+        assert_eq!(decoded.raw_block_bytes, 2_500_000);
 
         let (response_bytes, block_hash) = stored_light_block_to_response_bytes(&bytes).unwrap();
         assert_eq!(block_hash.as_bytes(), &[1u8; 32]);
@@ -673,7 +914,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_tweak_output_counts_match_outputs() {
+    fn validates_tweak_output_counts_match_fingerprint_stream() {
         let input = LightBlockInput {
             height: 100,
             block_hash: BlockHashBytes::from([1u8; 32]),
@@ -684,7 +925,8 @@ mod tests {
                 output_count: 2,
                 tweak: TxTweak::from([9u8; 33]),
             }],
-            outputs: vec![OutputEntryInput { key: [3u8; 32] }],
+            output_fingerprint_bits: 8,
+            output_fingerprints: vec![3],
             spends: vec![],
         };
         assert!(validate_light_block_input(&input).is_err());
@@ -692,7 +934,7 @@ mod tests {
 
     #[test]
     fn filters_reused_outputs_and_recomputes_dense_tweak_counts() {
-        let stored = StoredLightBlockInput {
+        let mut stored = StoredLightBlockInput {
             height: 100,
             block_hash: BlockHashBytes::from([1u8; 32]),
             previous_block_hash: BlockHashBytes::from([2u8; 32]),
@@ -716,15 +958,32 @@ mod tests {
                 },
             ],
             spends: vec![],
+            raw_block_bytes: 2_500_000,
+            output_fingerprints_for_two_labels: Vec::new(),
+            output_fingerprints_for_hundred_labels: Vec::new(),
         };
+        stored.output_fingerprints_for_two_labels = build_stored_output_fingerprints(
+            stored.block_hash,
+            stored.raw_block_bytes,
+            &stored.outputs,
+            RESPONSE_LABEL_BUDGET_TWO,
+        )
+        .unwrap();
+        stored.output_fingerprints_for_hundred_labels = build_stored_output_fingerprints(
+            stored.block_hash,
+            stored.raw_block_bytes,
+            &stored.outputs,
+            RESPONSE_LABEL_BUDGET_HUNDRED,
+        )
+        .unwrap();
+
         let response = stored
             .to_filtered_response_input(StoredBlockResponseFilter {
                 filter_reuse: true,
                 ..StoredBlockResponseFilter::default()
             })
             .unwrap();
-        assert_eq!(response.outputs.len(), 1);
-        assert_eq!(response.outputs[0].key, [3u8; 32]);
+        assert_eq!(light_block_output_count(&response).unwrap(), 1);
         assert_eq!(response.tweaks[0].output_count, 1);
     }
 }
