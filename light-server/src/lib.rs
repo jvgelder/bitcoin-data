@@ -14,6 +14,7 @@ pub mod script_classify;
 pub mod server;
 pub mod sp_tweak;
 pub mod storage;
+pub mod tagged_hash;
 pub mod types;
 
 pub const WIRE_VERSION: u16 = 1;

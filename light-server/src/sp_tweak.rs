@@ -8,19 +8,11 @@
 
 use crate::p2tr_indexer::OutPointKey;
 use crate::script_classify::{classify_script, ScriptKind};
+use crate::tagged_hash::{TaggedSha256, BIP352_INPUTS_TAG_HASH, TAPROOT_NUMS_H_XONLY};
 use crate::types::TxTweak;
 use bitcoin::hashes::{hash160, Hash};
 use bitcoin::secp256k1::{Parity, PublicKey, Scalar, Secp256k1, XOnlyPublicKey};
-use sha2::{Digest, Sha256};
-
-const BIP352_INPUTS_TAG_HASH: [u8; 32] = [
-    0x1e, 0x7b, 0x96, 0xeb, 0x16, 0x0a, 0x68, 0x81, 0x9f, 0x97, 0x76, 0x4b, 0x43, 0xd5, 0xd7, 0x7e,
-    0x66, 0x59, 0xd7, 0x58, 0x77, 0x9d, 0x43, 0xa8, 0xa7, 0x75, 0x5f, 0x5b, 0xe4, 0x5a, 0x7e, 0x33,
-];
-const TAPROOT_NUMS_H_XONLY: [u8; 32] = [
-    0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a, 0x5e,
-    0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80, 0x3a, 0xc0,
-];
+use std::sync::OnceLock;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SpTweakError {
@@ -289,12 +281,14 @@ fn serialize_outpoint(input: &TxInputContext) -> [u8; 36] {
     outpoint
 }
 
+fn bip352_inputs_hasher() -> &'static TaggedSha256 {
+    static HASHER: OnceLock<TaggedSha256> = OnceLock::new();
+
+    HASHER.get_or_init(|| TaggedSha256::from_tag_hash(BIP352_INPUTS_TAG_HASH))
+}
+
 fn bip352_inputs_tagged_sha256(msg: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(BIP352_INPUTS_TAG_HASH);
-    hasher.update(BIP352_INPUTS_TAG_HASH);
-    hasher.update(msg);
-    hasher.finalize().into()
+    bip352_inputs_hasher().digest_32(msg)
 }
 
 fn hash160_bytes(bytes: &[u8]) -> [u8; 20] {
