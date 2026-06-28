@@ -575,6 +575,21 @@ async fn catch_up_ranges(
         let block = &p.applied.light_block;
         file_archive.write_block_bytes(block.height, &p.payload)?;
     }
+
+    // Populate storage-only spent heights in the creation block files before
+    // committing the RocksDB transaction that deletes spent outpoint lookup rows.
+    // The AppliedBlock values still carry the RocksDB-derived
+    // creation_height/output_index pointers needed to rewrite older archive
+    // files for output-side cut-through.
+    let marked_spent_outputs = file_archive.mark_spent_outputs(pending.iter().flat_map(|p| {
+        p.applied.spent_utxos.iter().map(|spent| {
+            (
+                spent.creation_height,
+                spent.output_index,
+                spent.spent_height,
+            )
+        })
+    }))?;
     let payload_file_ms = payload_file_started.elapsed().as_millis();
 
     // Stage 3: commit indexer working state after payload files are durable.
@@ -646,6 +661,7 @@ async fn catch_up_ranges(
         indexed_created = totals.indexed_output_count,
         indexed_spent = totals.indexed_spent_count,
         tx_tweaks = totals.tweak_count,
+        marked_spent_outputs,
         last_uid = state.last_uid(),
         cached_outpoints = state.cached_outpoint_count(),
         fetch_ms = total_fetch_elapsed.as_millis(),
