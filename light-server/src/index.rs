@@ -1,9 +1,9 @@
 use crate::helper::{read_32, read_u16_list};
 use crate::light_capnp::{light_block, stored_light_block};
+use crate::tagged_hash::{TaggedSha256, TRUNCATED_OUTPUT_HASH_TAG_HASH};
 use crate::types::{BlockHashBytes, TxTweak};
 use crate::WIRE_VERSION;
 use capnp::message::{Builder, HeapAllocator, ReaderOptions};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::io::Cursor;
 use std::sync::OnceLock;
@@ -657,11 +657,6 @@ fn validate_stored_p2tr_uid_domain(
 
 pub const RESPONSE_LABEL_BUDGET_TWO: u16 = 2;
 pub const RESPONSE_LABEL_BUDGET_HUNDRED: u16 = 100;
-// "bitcoindata/light-truncated-output-hash/v1";
-const TRUNCATED_OUTPUT_HASH_TAG_HASH: [u8; 32] = [
-    0xa0, 0x38, 0xb9, 0x9b, 0xe2, 0x7a, 0x13, 0x6e, 0xa7, 0xbb, 0x51, 0xc9, 0xec, 0x88, 0x71, 0x92,
-    0x62, 0x4a, 0x04, 0xe2, 0x41, 0xae, 0x15, 0x2c, 0x20, 0xc7, 0xf2, 0xe6, 0x45, 0x94, 0xcc, 0x5f,
-];
 
 pub fn response_label_budget(labels: Option<u16>) -> u16 {
     match labels {
@@ -716,10 +711,11 @@ pub fn pack_truncated_output_hash_from_keys<'a>(
 
     let mut out = vec![0u8; packed_truncated_output_hash_len(keys.len(), bits)?];
     let mut out_bit = 0usize;
-    let base_hasher = truncated_output_base_hasher();
+    let tagged_hasher = truncated_output_hash_base_hasher();
 
     for key in keys {
-        let digest = truncated_output_hash_digest_from_base(&base_hasher, key);
+        let digest = tagged_hasher.digest_32(key);
+
         for bit in 0..usize::from(bits) {
             let src = (digest[bit / 8] >> (7 - (bit % 8))) & 1;
             if src != 0 {
@@ -734,20 +730,9 @@ pub fn pack_truncated_output_hash_from_keys<'a>(
     Ok(out)
 }
 
-fn truncated_output_hash_digest_from_base(base_hasher: &Sha256, key: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = base_hasher.clone();
-    hasher.update(key);
-    hasher.finalize().into()
-}
-
-fn truncated_output_base_hasher() -> &'static Sha256 {
-    static BASE_HASHER: OnceLock<Sha256> = OnceLock::new();
-    BASE_HASHER.get_or_init(|| {
-        let mut hasher = Sha256::new();
-        hasher.update(TRUNCATED_OUTPUT_HASH_TAG_HASH);
-        hasher.update(TRUNCATED_OUTPUT_HASH_TAG_HASH);
-        hasher
-    })
+fn truncated_output_hash_base_hasher() -> &'static TaggedSha256 {
+    static HASHER: OnceLock<TaggedSha256> = OnceLock::new();
+    HASHER.get_or_init(|| TaggedSha256::from_tag_hash(TRUNCATED_OUTPUT_HASH_TAG_HASH))
 }
 
 pub fn build_stored_truncated_output_hashes(
@@ -820,6 +805,8 @@ pub fn to_bytes(msg: &Builder<HeapAllocator>) -> anyhow::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tagged_hash::TRUNCATED_OUTPUT_HASH_TAG_HASH;
+    use sha2::{Digest, Sha256};
 
     fn stored_block_for_test() -> StoredLightBlockInput {
         let mut stored = StoredLightBlockInput {
@@ -863,7 +850,6 @@ mod tests {
 
     #[test]
     fn truncated_output_hash_uses_bip340_tagged_hash() {
-        let block_hash = BlockHashBytes::from([1u8; 32]);
         let key = [3u8; 32];
         const TRUNCATED_OUTPUT_HASH_DOMAIN: &str = "bitcoindata/light-truncated-output-hash/v1";
 
@@ -873,12 +859,11 @@ mod tests {
         let mut reference = Sha256::new();
         reference.update(tag_hash);
         reference.update(tag_hash);
-        reference.update(block_hash.as_bytes());
         reference.update(&key);
         let expected: [u8; 32] = reference.finalize().into();
 
         assert_eq!(
-            truncated_output_hash_digest_from_base(&truncated_output_base_hasher(), &key),
+            truncated_output_hash_base_hasher().digest_32(&key),
             expected
         );
     }

@@ -527,6 +527,7 @@ fn p2tr_output_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::light_block_output_count;
 
     fn txid(n: u8) -> TxidBytes {
         [n; 32].into()
