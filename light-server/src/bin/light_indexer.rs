@@ -610,7 +610,7 @@ async fn catch_up_ranges(
         totals.tx_count += s.tx_count;
         totals.output_count_total += s.output_count_total;
         totals.p2tr_output_count += s.p2tr_output_count;
-        totals.p2tr_sp_candidate_count += s.p2tr_sp_candidate_count;
+        totals.p2tr_count += s.p2tr_count;
         totals.p2tr_nums_count += s.p2tr_nums_count;
         totals.p2tr_reused_count += s.p2tr_reused_count;
         totals.p2tr_excluded_by_scope_count += s.p2tr_excluded_by_scope_count;

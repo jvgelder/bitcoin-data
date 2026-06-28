@@ -1,8 +1,8 @@
 //! Strong byte-array domain types used at API boundaries.
 //!
 //! Many Bitcoin/light-sync values are 32 bytes. Keeping them as distinct
-//! newtypes avoids accidentally passing a txid where a block hash, output-id
-//! hash, or Silent Payment tweak public key is expected.
+//! newtypes avoids accidentally passing a txid where a block hash or Silent
+//! Payment tweak public key is expected.
 
 macro_rules! byte32_type {
     ($name:ident) => {
@@ -76,4 +76,3 @@ impl AsRef<[u8]> for TxTweak {
         &self.0
     }
 }
-byte32_type!(OutputIdHash);

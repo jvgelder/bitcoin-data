@@ -2,12 +2,33 @@ use anyhow::Context;
 use btc_data_light_server::codec::elias_delta::encode_elias_delta_values;
 use btc_data_light_server::index::{
     decode_stored_light_block, encode_light_block, light_block_output_count, to_packed_bytes,
-    LightBlockInput, StoredBlockResponseFilter,
+    LightBlockInput, StoredBlockResponseFilter, RESPONSE_LABEL_BUDGET_HUNDRED,
+    RESPONSE_LABEL_BUDGET_TWO,
 };
 use clap::Parser;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+
+const CSV_HEADER: &[&str] = &[
+    "height",
+    "stored_bytes",
+    "response_bytes_labels100",
+    "response_bytes_labels2",
+    "estimated_response_full_key_bytes",
+    "stored_minus_response100_bytes",
+    "stored_skipped_txs_for_tweaks",
+    "stored_skipped_outputs",
+    "stored_p2tr_output_count",
+    "stored_outputs",
+    "stored_tweaks",
+    "response_outputs",
+    "response_tweaks",
+    "spent_count",
+    "spent_id_list_bytes",
+    "spent_id_elias_delta_bytes",
+    "spent_id_elias_delta_savings_bytes",
+];
 
 #[derive(Debug, Parser)]
 #[command(name = "light-archive-stats")]
@@ -68,12 +89,14 @@ fn main() -> anyhow::Result<()> {
         blocks_dir.display()
     );
 
-    let archive_tip = *heights
-        .last()
-        .expect("heights is non-empty after ensure above");
+    let Some(&archive_tip) = heights.last() else {
+        anyhow::bail!("no .capnp block files found in {}", blocks_dir.display());
+    };
     let filter = StoredBlockResponseFilter {
         cutthrough_start: args.cutthrough_start,
-        cutthrough_tip: args.cutthrough_tip.or(Some(archive_tip)),
+        cutthrough_tip: args
+            .cutthrough_start
+            .map(|_| args.cutthrough_tip.unwrap_or(archive_tip)),
         filter_reuse: args.filter_reuse,
         labels: None,
     };
@@ -128,10 +151,7 @@ fn open_csv(path: &Path, truncate: bool) -> anyhow::Result<BufWriter<File>> {
     };
     let mut writer = BufWriter::new(file);
     if needs_header {
-        writeln!(
-            writer,
-            "height,stored_bytes,response_bytes_labels100,response_bytes_labels2,response_bytes_full_key,stored_minus_response100_bytes,stored_skipped_txs_for_tweaks,stored_skipped_outputs,stored_p2tr_output_count,stored_outputs,stored_tweaks,stored_uid_domain_ok,response_outputs,response_tweaks,spent_count,spent_id_list_bytes,spent_id_elias_delta_bytes,spent_id_elias_delta_savings_bytes"
-        )?;
+        writeln!(writer, "{}", CSV_HEADER.join(","))?;
     }
     Ok(writer)
 }
@@ -144,80 +164,57 @@ fn block_stats_row(
     let stored_bytes = fs::read(path)?;
     let stored = decode_stored_light_block(&stored_bytes)?;
 
-    let response_for_labels = |labels| -> anyhow::Result<LightBlockInput> {
+    let response_for_label_budget = |labels| -> anyhow::Result<LightBlockInput> {
         let mut filter = filter;
         filter.labels = Some(labels);
         stored.to_filtered_response_input(filter)
     };
 
-    let response = response_for_labels(100)?;
-    let response_100_bytes = to_packed_bytes(&encode_light_block(&response)?)?;
-    let response_2_bytes_len = to_packed_bytes(&encode_light_block(&response_for_labels(2)?)?)?
-        .len();
+    let response = response_for_label_budget(RESPONSE_LABEL_BUDGET_HUNDRED)?;
+    let response_100_bytes = packed_response_bytes(&response)?;
+    let response_2_bytes_len =
+        packed_response_len(&response_for_label_budget(RESPONSE_LABEL_BUDGET_TWO)?)?;
 
     let response_output_count = light_block_output_count(&response)?;
-    let response_full_key_bytes = response_100_bytes
+    let estimated_response_full_key_bytes = response_100_bytes
         .len()
         .saturating_sub(response.output_fingerprints.len())
         .saturating_add(response_output_count.saturating_mul(32));
 
     let stored_p2tr_output_count = stored.outputs.len() + stored.skipped_outputs.len();
-    let stored_uid_domain_ok = validate_stored_uid_domain(&stored).is_ok();
     let spent_id_list_bytes = response.spends.len() * std::mem::size_of::<u64>();
     let spent_id_elias_delta_bytes = sorted_spent_id_elias_delta_bytes(&response)?;
     let spent_id_elias_delta_savings_bytes =
         spent_id_list_bytes as i64 - spent_id_elias_delta_bytes as i64;
 
-    Ok(format!(
-        "{height},{stored_bytes_len},{response_100_bytes_len},{response_2_bytes_len},{response_full_key_bytes},{stored_minus_response100_bytes},{stored_skipped_txs},{stored_skipped_outputs},{stored_p2tr_output_count},{stored_outputs},{stored_tweaks},{stored_uid_domain_ok},{response_outputs},{response_tweaks},{spent_count},{spent_id_list_bytes},{spent_id_elias_delta_bytes},{spent_id_elias_delta_savings_bytes}",
-        stored_bytes_len = stored_bytes.len(),
-        response_100_bytes_len = response_100_bytes.len(),
-        response_2_bytes_len = response_2_bytes_len,
-        response_full_key_bytes = response_full_key_bytes,
-        stored_minus_response100_bytes = stored_bytes.len() as i64 - response_100_bytes.len() as i64,
-        stored_skipped_txs = stored.skipped_txs_for_tweaks.len(),
-        stored_skipped_outputs = stored.skipped_outputs.len(),
-        stored_p2tr_output_count = stored_p2tr_output_count,
-        stored_outputs = stored.outputs.len(),
-        stored_tweaks = stored.tweaks.len(),
-        stored_uid_domain_ok = stored_uid_domain_ok,
-        response_outputs = response_output_count,
-        response_tweaks = response.tweaks.len(),
-        spent_count = response.spends.len(),
-    ))
+    let row = [
+        height.to_string(),
+        stored_bytes.len().to_string(),
+        response_100_bytes.len().to_string(),
+        response_2_bytes_len.to_string(),
+        estimated_response_full_key_bytes.to_string(),
+        (stored_bytes.len() as i64 - response_100_bytes.len() as i64).to_string(),
+        stored.skipped_txs_for_tweaks.len().to_string(),
+        stored.skipped_outputs.len().to_string(),
+        stored_p2tr_output_count.to_string(),
+        stored.outputs.len().to_string(),
+        stored.tweaks.len().to_string(),
+        response_output_count.to_string(),
+        response.tweaks.len().to_string(),
+        response.spends.len().to_string(),
+        spent_id_list_bytes.to_string(),
+        spent_id_elias_delta_bytes.to_string(),
+        spent_id_elias_delta_savings_bytes.to_string(),
+    ];
+    Ok(row.join(","))
 }
 
-fn validate_stored_uid_domain(
-    stored: &btc_data_light_server::index::StoredLightBlockInput,
-) -> anyhow::Result<()> {
-    let p2tr_output_count = stored
-        .outputs
-        .len()
-        .checked_add(stored.skipped_outputs.len())
-        .context("stored P2TR output count overflow")?;
+fn packed_response_len(response: &LightBlockInput) -> anyhow::Result<usize> {
+    Ok(packed_response_bytes(response)?.len())
+}
 
-    anyhow::ensure!(
-        p2tr_output_count <= usize::from(u16::MAX) + 1,
-        "stored P2TR output count exceeds u16 slot domain"
-    );
-
-    for pair in stored.skipped_outputs.windows(2) {
-        anyhow::ensure!(
-            pair[0] < pair[1],
-            "stored skipped_outputs must be sorted and unique"
-        );
-    }
-
-    for slot in &stored.skipped_outputs {
-        anyhow::ensure!(
-            usize::from(*slot) < p2tr_output_count,
-            "stored skipped output slot {} outside P2TR domain {}",
-            slot,
-            p2tr_output_count
-        );
-    }
-
-    Ok(())
+fn packed_response_bytes(response: &LightBlockInput) -> anyhow::Result<Vec<u8>> {
+    to_packed_bytes(&encode_light_block(response)?)
 }
 
 fn sorted_spent_id_elias_delta_bytes(response: &LightBlockInput) -> anyhow::Result<usize> {

@@ -6,10 +6,10 @@
 //! NUMS is handled on input-side BIP352 spend eligibility, not output creation.
 
 use crate::index::{
-    build_stored_output_fingerprints, choose_output_fingerprint_bits, light_block_output_count, LightBlockInput,
-    SpendEntryInput, StoredLightBlockInput, StoredOutputEntryInput, StoredSpendEntryInput,
-    StoredTweakEntryInput, TweakEntryInput, RESPONSE_LABEL_BUDGET_HUNDRED,
-    RESPONSE_LABEL_BUDGET_TWO, STORAGE_OUTPUT_FLAG_REUSED, STORAGE_SPENT_HEIGHT_UNSPENT,
+    build_stored_output_fingerprints, LightBlockInput, StoredLightBlockInput,
+    StoredOutputEntryInput, StoredSpendEntryInput, StoredTweakEntryInput, TweakEntryInput,
+    RESPONSE_LABEL_BUDGET_HUNDRED, RESPONSE_LABEL_BUDGET_TWO, STORAGE_OUTPUT_FLAG_REUSED,
+    STORAGE_SPENT_HEIGHT_UNSPENT,
 };
 use crate::types::{BlockHashBytes, TxTweak, TxidBytes};
 use serde::{Deserialize, Serialize};
@@ -129,7 +129,7 @@ pub struct BlockScopeStats {
     pub tx_count: u32,
     pub output_count_total: u32,
     pub p2tr_output_count: u32,
-    pub p2tr_sp_candidate_count: u32,
+    pub p2tr_count: u32,
     pub p2tr_nums_count: u32,
     pub p2tr_reused_count: u32,
     pub p2tr_excluded_by_scope_count: u32,
@@ -309,16 +309,6 @@ impl P2trIndexerState {
         uids
     }
 
-    /// Compatibility alias for earlier P2TR-only code.
-    pub fn last_p2tr_uid(&self) -> u64 {
-        self.last_uid()
-    }
-
-    /// Compatibility alias for earlier P2TR-only code.
-    pub fn live_p2tr_uids_sorted(&self) -> Vec<u64> {
-        self.live_uids_sorted()
-    }
-
     /// Apply one block to the scoped UID state and return the corresponding
     /// `LightBlockInput` plus debug/statistical counters.
     ///
@@ -335,10 +325,8 @@ impl P2trIndexerState {
     ) -> anyhow::Result<AppliedBlock> {
         let block_first_uid = self.next_uid.saturating_add(1);
         let mut storage_output_entries = Vec::<StoredOutputEntryInput>::new();
-        let mut spends = Vec::<SpendEntryInput>::new();
         let mut storage_spends = Vec::<StoredSpendEntryInput>::new();
         let mut skipped_txs_for_tweaks = Vec::<u16>::new();
-        let mut tx_tweaks = Vec::<TweakEntryInput>::new();
         let mut storage_tx_tweaks = Vec::<StoredTweakEntryInput>::new();
         let mut storage_skipped_outputs = Vec::<u16>::new();
         let mut stats = BlockScopeStats {
@@ -355,9 +343,6 @@ impl P2trIndexerState {
             for input in &tx.inputs {
                 if let Some(spend_ref) = self.outpoint_to_spend.remove(&input.previous_output) {
                     self.live_uid_count = self.live_uid_count.saturating_sub(1);
-                    spends.push(SpendEntryInput {
-                        spent_uid: spend_ref.uid,
-                    });
                     storage_spends.push(StoredSpendEntryInput {
                         spent_uid: spend_ref.uid,
                         creation_height: u32::try_from(spend_ref.creation_height)?,
@@ -395,7 +380,7 @@ impl P2trIndexerState {
                 if output.is_nums {
                     stats.p2tr_nums_count += 1;
                 }
-                stats.p2tr_sp_candidate_count += 1;
+                stats.p2tr_count += 1;
 
                 let mut is_reused_output = false;
                 if let Some(seen_p2tr_keys) = self.seen_p2tr_keys.as_mut() {
@@ -457,7 +442,7 @@ impl P2trIndexerState {
                     entry,
                     is_nums: output.is_nums,
                     is_reused: is_reused_output,
-                    reuse_count_at_creation: 1,
+                    reuse_count_at_creation: 0,
                 });
                 storage_output_entries.push(StoredOutputEntryInput {
                     key: p2tr_xonly_key,
@@ -472,11 +457,7 @@ impl P2trIndexerState {
             if tx_indexed_output_count > 0 {
                 stats.tx_with_indexed_output_count += 1;
                 if let Some(tweak) = tx.silent_payment_tweak {
-                    tx_tweaks.push(TweakEntryInput {
-                        output_count: tx_indexed_output_count,
-                        tweak,
-                    });
-                    storage_tx_tweaks.push(StoredTweakEntryInput {
+                    storage_tx_tweaks.push(TweakEntryInput {
                         output_count: tx_indexed_output_count,
                         tweak,
                     });
@@ -506,38 +487,25 @@ impl P2trIndexerState {
             &storage_output_entries,
             RESPONSE_LABEL_BUDGET_HUNDRED,
         )?;
-        let default_output_fingerprint_bits = choose_output_fingerprint_bits(
-            storage_output_entries.len(),
-            block.raw_block_bytes,
-            RESPONSE_LABEL_BUDGET_HUNDRED,
-        );
+        let storage_block = StoredLightBlockInput {
+            height: block.height,
+            block_hash: block.block_hash,
+            previous_block_hash: block.previous_block_hash,
+            first_uid: block_first_uid,
+            skipped_txs_for_tweaks,
+            tweaks: storage_tx_tweaks,
+            skipped_outputs: storage_skipped_outputs,
+            outputs: storage_output_entries,
+            spends: storage_spends,
+            raw_block_bytes: block.raw_block_bytes,
+            output_fingerprints_for_two_labels,
+            output_fingerprints_for_hundred_labels,
+        };
+        let light_block = storage_block.to_response_input_for_labels(None)?;
 
         Ok(AppliedBlock {
-            light_block: LightBlockInput {
-                height: block.height,
-                block_hash: block.block_hash,
-                previous_block_hash: block.previous_block_hash,
-                first_uid: block_first_uid,
-                skipped_txs_for_tweaks: skipped_txs_for_tweaks.clone(),
-                tweaks: tx_tweaks.clone(),
-                output_fingerprint_bits: default_output_fingerprint_bits,
-                output_fingerprints: output_fingerprints_for_hundred_labels.clone(),
-                spends,
-            },
-            storage_block: StoredLightBlockInput {
-                height: block.height,
-                block_hash: block.block_hash,
-                previous_block_hash: block.previous_block_hash,
-                first_uid: block_first_uid,
-                skipped_txs_for_tweaks,
-                tweaks: storage_tx_tweaks,
-                skipped_outputs: storage_skipped_outputs,
-                outputs: storage_output_entries,
-                spends: storage_spends,
-                raw_block_bytes: block.raw_block_bytes,
-                output_fingerprints_for_two_labels,
-                output_fingerprints_for_hundred_labels,
-            },
+            light_block,
+            storage_block,
             stats,
             created_utxos,
             spent_utxos,
