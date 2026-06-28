@@ -85,13 +85,14 @@ Preferred order for each commit window:
 3. Encode the block as a Cap'n Proto StoredLightBlock.
 4. Write blocks/<height>.capnp.tmp.
 5. fsync and rename to blocks/<height>.capnp.
-6. Commit the RocksDB batch:
+6. Rewrite older archive blocks to mark stored outputs as spent, using the creation-height/output-index pointers resolved before the RocksDB commit.
+7. Commit the RocksDB batch:
    - insert new scannable outpoint -> uid/output_index entries
    - delete spent outpoints
    - update seen key counts
    - update last_uid
    - update tip height/hash
-7. Rewrite manifest/tip metadata if needed.
+8. Rewrite manifest/tip metadata if needed.
 ```
 
 Critical invariant:
@@ -130,8 +131,8 @@ struct TweakEntry {
   tweak @1 :Data;              # 32-byte x-coordinate of the scan point
 }
 
-struct SpendEntry {
-  spentUid @0 :UInt64;
+enum SpentIdCodec {
+  eliasDeltaAscendingAbsolute @0;
 }
 ```
 
@@ -145,10 +146,18 @@ tweak B outputCount = 2 -> truncatedOutputHashes[3..5]
 tweak C outputCount = 5 -> truncatedOutputHashes[5..10]
 ```
 
-Required invariant:
+Required invariants:
 
 ```text
 ceil(sum(tweaks.outputCount) * truncatedOutputHashBits / 8) == truncatedOutputHash.len()
+spentIds decodes exactly spentCount UIDs according to spentIdCodec
+```
+
+`spentIdCodec = eliasDeltaAscendingAbsolute` means the decoded spent UID set is sorted ascending and encoded as:
+
+```text
+EliasDelta(first_spent_uid + 1)
+EliasDelta(spent_uid[i] - spent_uid[i - 1])
 ```
 
 The indexer may represent a scan point internally as a 33-byte compressed public key. The served `TweakEntry.tweak` stores the 32-byte x-coordinate.
@@ -202,7 +211,7 @@ such as NUMS outputs or P2TR outputs from transactions without a usable Silent P
 It is useful for statistics and implementation checks, but clients do not receive it and do not need it for UID recovery.
 
 Dynamic response filters do not mutate storage. When `cutthrough` or `filter_reuse` is requested, the server derives a 
-response by omitting filtered stored outputs, recomputing every `TweakEntry.outputCount`, and rebuilding the packed truncated output hash stream so the response still maps cleanly to the dense truncated output hash order.
+response by omitting filtered stored outputs, recomputing every `TweakEntry.outputCount`, dropping tweak entries whose filtered output count becomes zero, adding those transaction indexes to `skippedTxsForTweaks`, rebuilding the packed fingerprint stream, and re-encoding retained spent IDs into `spentIds`.
 
 truncated output hashes are selected by the requested label budget. `labels <= 2` serves `truncatedOutputHashForTwoLabels`; larger values and omitted `labels` serve `truncatedOutputHashForHundredLabels`. The truncated output hash bit width is derived from the raw block size and the normalized label budget.
 
@@ -226,8 +235,7 @@ cut-through-filtered outputs
 
 Non-P2TR outputs do not consume UID slots.
 
-The client does not need undo data or server skip lists to recover a UID after a candidate match. It fetches the full block, 
-finds the matched outpoint, counts native P2TR outputs in block order up to that outpoint, and computes:
+The client does not need undo data, response skip lists, or server-assigned per-output UIDs to recover a UID after a candidate match. It fetches the full block, verifies the block against the header chain / proof of work, finds the matched outpoint, counts native P2TR outputs in block order up to that outpoint, and computes:
 
 ```text
 uid = firstUid + count_native_p2tr_outputs_before_matched_outpoint
@@ -252,6 +260,14 @@ Normal no-eligible-input cases are expected and should be logged at debug level.
 warnings because they may indicate source or data issues worth investigating.
 
 `StoredLightBlock.skippedOutputs` contains storage-only native-P2TR slot indexes for statically omitted outputs. It is not in the response and should not be used for client UID recovery.
+
+## Client trust and verification model
+
+Light payloads are candidate discovery payloads, not authoritative wallet events. A client MUST confirm any candidate received output or spend against the full Bitcoin block before recording wallet state. The client should verify the header chain / accumulated proof of work, verify the full block hash against `LightBlock.blockHash`, and then verify the matched output or spend directly from the block contents.
+
+The server is still trusted for completeness: it can omit candidates or spends. Full-block confirmation prevents the server from creating fake wallet outputs or fake spends, but it does not prove the light payload was complete.
+
+Because full-block confirmation is mandatory on hits, cut-through and reuse-filtered responses may compact output lists. Response output indexes are not stable UID slots and MUST NOT be used for UID assignment.
 
 ## Client sync model
 
@@ -354,26 +370,23 @@ The client should store the UID with its wallet note/UTXO state. Later spend not
 
 ## Client spend scanning
 
-`spends` is a dense list of global spent UIDs for outputs spent by the containing block.
+`spentIds` is a packed exact set of candidate spent UIDs for outputs spent by the containing block. The v1 codec is `eliasDeltaAscendingAbsolute`.
 
 For each response block:
 
 ```text
-for spend in block.spends:
-  if wallet owns spend.spentUid:
-    mark wallet output as potentially spent at block.height
+spent_ids = decode_elias_delta_ascending_absolute(block.spentIds, block.spentCount)
+
+for spent_uid in spent_ids:
+  if wallet tracks spent_uid:
+    mark wallet output as candidate-spent at block.height
+    download the full Bitcoin block
+    verify the block hash and proof-of-work chain
+    verify a transaction input spends the stored outpoint for that UID
+    only then mark the wallet output spent
 ```
 
-If the client wants confirmation beyond trusting the light server, it can download the full Bitcoin block and verify:
-
-```text
-1. The downloaded block hash equals LightBlock.blockHash.
-2. A transaction input spends the previously known outpoint for that UID.
-3. The spending transaction is included in the confirmed block.
-```
-
-The light response does not include the spent outpoint itself. The wallet learns and stores the outpoint when it first confirms the received output, 
-so it can verify future spends from full blocks.
+The light response does not include the spent outpoint itself. The wallet learns and stores the outpoint when it first confirms the received output, so it can verify future spends from full blocks.
 
 ## Running the indexer
 
@@ -505,6 +518,7 @@ start                 required first block height
 count                 requested block count, capped by server max_range_count
 cutthrough=true       use start as the cut-through boundary
 cutthrough_start=H    explicit cut-through boundary; preferred for resumed sync
+cutthrough_tip=H      explicit cut-through tip; omit for current served tip
 filter_reuse=true     omit outputs marked reused in storage
 labels=N              labels <= 2 returns the two-label truncated_output_hash stream; omitted/larger uses hundred-label
 max_bytes=N           per-request response byte cap, capped by server max_response_bytes
@@ -534,7 +548,8 @@ cargo run -p btc-data-light-server --bin light-archive-stats -- \
   --filter-reuse
 ```
 
-The stats output is useful for checking stored/response byte deltas, stored skipped outputs, dense response output counts, spend-list bytes, and Elias-delta spend-ID estimates.
+The stats output is useful for checking stored/response byte deltas, stored skipped outputs, dense response output counts, the hypothetical u64 spend-list baseline, actual packed `spentIds` bytes, and alternative spent-ID codec estimates.
+
 
 ## Fixture generation
 
@@ -606,6 +621,7 @@ RocksDB tip only advances after archive files exist
 last_uid is monotonic
 last_uid advances by every native P2TR output, not just stored outputs
 new outpoint lookups are written before later blocks can spend them
+stored output spentHeight is updated before spent outpoints are removed from RocksDB
 spent outpoints are removed from RocksDB during the commit that emits their spentUid
 missing prevouts should be warnings, not silently treated as no eligible inputs
 public-key sum infinity should be rare and investigated

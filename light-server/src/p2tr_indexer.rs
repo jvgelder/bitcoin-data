@@ -313,8 +313,8 @@ impl P2trIndexerState {
     /// `LightBlockInput` plus debug/statistical counters.
     ///
     /// Inputs are processed before outputs within each tx, matching Bitcoin
-    /// spend semantics while still using an end-of-block UID anchor for
-    /// same-block spends.
+    /// spend semantics. Spent UID encoding is independent from the output
+    /// creation list and is derived from the stored spent UID set.
     pub fn apply_block(&mut self, block: BlockScanInput) -> anyhow::Result<LightBlockInput> {
         Ok(self.apply_block_with_stats(block)?.light_block)
     }
@@ -527,7 +527,6 @@ fn p2tr_output_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::light_block_output_count;
 
     fn txid(n: u8) -> TxidBytes {
         [n; 32].into()

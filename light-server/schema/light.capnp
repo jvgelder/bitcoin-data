@@ -21,7 +21,9 @@ struct LightBlock {
   # len = ceil(sum(tweak.outputCount) * truncatedOutputHashBits / 8)
   truncatedOutputHashes @8 :Data;
 
-  spends @9 :List(SpendEntry);
+  spentIdCodec @9 :SpentIdCodec;
+  spentCount @10 :UInt32;
+  spentIds @11 :Data;      # Elias-delta encoded spent UIDs.
 }
 
 struct TweakEntry {
@@ -29,8 +31,8 @@ struct TweakEntry {
   tweak @1 :Data;              # 32 bytes
 }
 
-struct SpendEntry {
-  spentUid @0 :UInt64;
+enum SpentIdCodec {
+  eliasDeltaAscendingAbsolute @0;
 }
 
 # File archive storage format. The server reads this richer format and derives

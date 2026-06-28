@@ -1,3 +1,4 @@
+use crate::codec::{decode_elias_delta_values, encode_elias_delta_values};
 use crate::helper::{read_32, read_u16_list};
 use crate::light_capnp::{light_block, stored_light_block};
 use crate::tagged_hash::{TaggedSha256, TRUNCATED_OUTPUT_HASH_TAG_HASH};
@@ -23,10 +24,9 @@ pub struct TweakEntryInput {
 
 pub type StoredTweakEntryInput = TweakEntryInput;
 
-#[derive(Debug, Clone)]
-pub struct SpendEntryInput {
-    /// Global UID spent by this block. The spend height is this block's height.
-    pub spent_uid: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpentIdCodec {
+    EliasDeltaAscendingAbsolute,
 }
 
 #[derive(Debug, Clone)]
@@ -44,8 +44,13 @@ pub struct LightBlockInput {
     pub truncated_output_hash_bits: u8,
     /// Packed truncated output hashes in dense output order.
     pub truncated_output_hashes: Vec<u8>,
-    /// One spent UID per spent indexed output in this block.
-    pub spends: Vec<SpendEntryInput>,
+    /// Codec used by `spent_ids`.
+    pub spent_id_codec: SpentIdCodec,
+    /// Number of decoded spent UIDs in `spent_ids`.
+    pub spent_count: u32,
+    /// Packed spent UID stream. For v1 this is sorted ascending, Elias-delta encoded
+    /// as first+1 followed by positive deltas.
+    pub spent_ids: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,11 +121,15 @@ impl StoredLightBlockInput {
         let output_count = self.outputs.len();
         let truncated_output_hash_bits =
             choose_truncated_output_hash_bits(output_count, self.raw_block_bytes, label_budget);
-        let trunacted_output_hashes = match label_budget {
+        let truncated_output_hashes = match label_budget {
             RESPONSE_LABEL_BUDGET_TWO => self.truncated_output_hash_for_two_labels.clone(),
             RESPONSE_LABEL_BUDGET_HUNDRED => self.truncated_output_hash_for_hundred_labels.clone(),
             _ => unreachable!("label budget is normalized"),
         };
+
+        let (spent_count, spent_ids) = encode_spent_ids_elias_delta_ascending_absolute(
+            self.spends.iter().map(|entry| entry.spent_uid),
+        )?;
 
         let response = LightBlockInput {
             height: self.height,
@@ -129,16 +138,13 @@ impl StoredLightBlockInput {
             first_uid: self.first_uid,
             skipped_txs_for_tweaks: self.skipped_txs_for_tweaks.clone(),
             tweaks: self.tweaks.clone(),
-            truncated_output_hash_bits: truncated_output_hash_bits,
-            truncated_output_hashes: trunacted_output_hashes,
-            spends: self
-                .spends
-                .iter()
-                .map(|entry| SpendEntryInput {
-                    spent_uid: entry.spent_uid,
-                })
-                .collect(),
+            truncated_output_hash_bits,
+            truncated_output_hashes,
+            spent_id_codec: SpentIdCodec::EliasDeltaAscendingAbsolute,
+            spent_count,
+            spent_ids,
         };
+
         validate_light_block_input(&response)?;
         Ok(response)
     }
@@ -206,14 +212,12 @@ impl StoredLightBlockInput {
             self.height
         );
 
-        let spends = self
-            .spends
-            .iter()
-            .filter(|spend| !should_omit_stored_spend(spend, filter))
-            .map(|spend| SpendEntryInput {
-                spent_uid: spend.spent_uid,
-            })
-            .collect();
+        let (spent_count, spent_ids) = encode_spent_ids_elias_delta_ascending_absolute(
+            self.spends
+                .iter()
+                .filter(|spend| !should_omit_stored_spend(spend, filter))
+                .map(|spend| spend.spent_uid),
+        )?;
 
         let label_budget = response_label_budget(filter.labels);
         let truncated_output_hash_bits = choose_truncated_output_hash_bits(
@@ -233,7 +237,9 @@ impl StoredLightBlockInput {
             tweaks,
             truncated_output_hash_bits,
             truncated_output_hashes,
-            spends,
+            spent_id_codec: SpentIdCodec::EliasDeltaAscendingAbsolute,
+            spent_count,
+            spent_ids,
         };
         validate_light_block_input(&response)?;
         Ok(response)
@@ -329,12 +335,9 @@ pub fn encode_light_block(input: &LightBlockInput) -> anyhow::Result<Builder<Hea
 
         b.set_truncated_output_hash_bits(input.truncated_output_hash_bits);
         b.set_truncated_output_hashes(&input.truncated_output_hashes);
-
-        let mut spends = b.reborrow().init_spends(input.spends.len() as u32);
-        for (i, entry) in input.spends.iter().enumerate() {
-            let mut s = spends.reborrow().get(i as u32);
-            s.set_spent_uid(entry.spent_uid);
-        }
+        b.set_spent_id_codec(spent_id_codec_to_capnp(input.spent_id_codec));
+        b.set_spent_count(input.spent_count);
+        b.set_spent_ids(&input.spent_ids);
     }
     Ok(msg)
 }
@@ -422,13 +425,11 @@ pub fn decode_light_block(bytes: &[u8]) -> anyhow::Result<LightBlockInput> {
         });
     }
 
-    let spend_reader = block.get_spends()?;
-    let mut spends = Vec::with_capacity(spend_reader.len() as usize);
-    for i in 0..spend_reader.len() {
-        spends.push(SpendEntryInput {
-            spent_uid: spend_reader.get(i).get_spent_uid(),
-        });
-    }
+    let spent_id_codec = spent_id_codec_from_capnp(
+        block
+            .get_spent_id_codec()
+            .map_err(|err| anyhow::anyhow!("unsupported spent id codec: {:?}", err))?,
+    )?;
 
     let input = LightBlockInput {
         height: block.get_height(),
@@ -442,7 +443,9 @@ pub fn decode_light_block(bytes: &[u8]) -> anyhow::Result<LightBlockInput> {
         tweaks,
         truncated_output_hash_bits: block.get_truncated_output_hash_bits(),
         truncated_output_hashes: block.get_truncated_output_hashes()?.to_vec(),
-        spends,
+        spent_id_codec,
+        spent_count: block.get_spent_count(),
+        spent_ids: block.get_spent_ids()?.to_vec(),
     };
     validate_light_block_input(&input)?;
     Ok(input)
@@ -541,6 +544,97 @@ pub fn stored_light_block_to_filtered_response_bytes(
     Ok((to_packed_bytes(&message)?, block_hash))
 }
 
+fn spent_id_codec_to_capnp(codec: SpentIdCodec) -> crate::light_capnp::SpentIdCodec {
+    match codec {
+        SpentIdCodec::EliasDeltaAscendingAbsolute => {
+            crate::light_capnp::SpentIdCodec::EliasDeltaAscendingAbsolute
+        }
+    }
+}
+
+fn spent_id_codec_from_capnp(
+    codec: crate::light_capnp::SpentIdCodec,
+) -> anyhow::Result<SpentIdCodec> {
+    match codec {
+        crate::light_capnp::SpentIdCodec::EliasDeltaAscendingAbsolute => {
+            Ok(SpentIdCodec::EliasDeltaAscendingAbsolute)
+        }
+    }
+}
+
+pub fn encode_spent_ids_elias_delta_ascending_absolute(
+    spent_ids: impl IntoIterator<Item = u64>,
+) -> anyhow::Result<(u32, Vec<u8>)> {
+    let mut ids = spent_ids.into_iter().collect::<Vec<_>>();
+    ids.sort_unstable();
+
+    if ids.is_empty() {
+        return Ok((0, Vec::new()));
+    }
+
+    let mut values = Vec::with_capacity(ids.len());
+    let mut prev: Option<u64> = None;
+
+    for uid in ids {
+        let value = match prev {
+            None => uid
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("spent uid overflow while encoding first value"))?,
+            Some(prev_uid) => uid
+                .checked_sub(prev_uid)
+                .ok_or_else(|| anyhow::anyhow!("spent ids are not sorted ascending"))?,
+        };
+        anyhow::ensure!(
+            value > 0,
+            "duplicate spent uid {uid} cannot be Elias-delta encoded as a positive delta"
+        );
+        values.push(value);
+        prev = Some(uid);
+    }
+
+    let count = u32::try_from(values.len())?;
+    Ok((count, encode_elias_delta_values(&values)?))
+}
+
+pub fn decode_spent_ids_elias_delta_ascending_absolute(
+    spent_count: u32,
+    spent_ids: &[u8],
+) -> anyhow::Result<Vec<u64>> {
+    if spent_count == 0 {
+        anyhow::ensure!(
+            spent_ids.is_empty(),
+            "empty spent stream must have no bytes"
+        );
+        return Ok(Vec::new());
+    }
+
+    let values = decode_elias_delta_values(spent_ids, usize::try_from(spent_count)?)?;
+    let first = values[0]
+        .checked_sub(1)
+        .ok_or_else(|| anyhow::anyhow!("invalid first spent id value"))?;
+
+    let mut out = Vec::with_capacity(values.len());
+    out.push(first);
+    let mut uid = first;
+
+    for delta in &values[1..] {
+        uid = uid
+            .checked_add(*delta)
+            .ok_or_else(|| anyhow::anyhow!("spent uid delta overflow"))?;
+        out.push(uid);
+    }
+
+    Ok(out)
+}
+
+pub fn decode_light_block_spent_ids(input: &LightBlockInput) -> anyhow::Result<Vec<u64>> {
+    match input.spent_id_codec {
+        SpentIdCodec::EliasDeltaAscendingAbsolute => {
+            decode_spent_ids_elias_delta_ascending_absolute(input.spent_count, &input.spent_ids)
+        }
+    }
+}
+
 pub fn validate_light_block_input(input: &LightBlockInput) -> anyhow::Result<()> {
     ensure_u16_len("skipped txs for tweaks", input.skipped_txs_for_tweaks.len())?;
     ensure_u16_len("tweaks", input.tweaks.len())?;
@@ -576,6 +670,14 @@ pub fn validate_light_block_input(input: &LightBlockInput) -> anyhow::Result<()>
             "tweak payload must be 32 bytes"
         );
     }
+
+    let decoded_spends = decode_light_block_spent_ids(input)?;
+    anyhow::ensure!(
+        decoded_spends.len() == usize::try_from(input.spent_count)?,
+        "spent count {} does not match decoded spent ID count {}",
+        input.spent_count,
+        decoded_spends.len()
+    );
 
     Ok(())
 }
@@ -869,6 +971,15 @@ mod tests {
     }
 
     #[test]
+    fn spent_ids_elias_delta_ascending_absolute_roundtrip() {
+        let ids = [0u64, 41, 41_000, 1_000_000];
+        let (count, bytes) = encode_spent_ids_elias_delta_ascending_absolute(ids).unwrap();
+        assert_eq!(count, ids.len() as u32);
+        let decoded = decode_spent_ids_elias_delta_ascending_absolute(count, &bytes).unwrap();
+        assert_eq!(decoded, ids);
+    }
+
+    #[test]
     fn encodes_typed_light_block() {
         let input = LightBlockInput {
             height: 100,
@@ -882,7 +993,11 @@ mod tests {
             }],
             truncated_output_hash_bits: 8,
             truncated_output_hashes: vec![3],
-            spends: vec![SpendEntryInput { spent_uid: 41 }],
+            spent_id_codec: SpentIdCodec::EliasDeltaAscendingAbsolute,
+            spent_count: 1,
+            spent_ids: encode_spent_ids_elias_delta_ascending_absolute([41u64])
+                .unwrap()
+                .1,
         };
         let msg = encode_light_block(&input).unwrap();
         let bytes = to_packed_bytes(&msg).unwrap();
@@ -925,7 +1040,9 @@ mod tests {
             }],
             truncated_output_hash_bits: 8,
             truncated_output_hashes: vec![3],
-            spends: vec![],
+            spent_id_codec: SpentIdCodec::EliasDeltaAscendingAbsolute,
+            spent_count: 0,
+            spent_ids: Vec::new(),
         };
         assert!(validate_light_block_input(&input).is_err());
     }
