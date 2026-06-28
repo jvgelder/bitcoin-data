@@ -119,9 +119,10 @@ struct LightBlock {
   skippedTxsForTweaks @5 :List(UInt16);
   tweaks @6 :List(TweakEntry);
 
-  outputs @7 :List(OutputEntry);
+  outputFingerprintBits @7 :UInt8;
+  outputFingerprints @8 :Data; # packed dense output fingerprints
 
-  spends @8 :List(SpendEntry);
+  spends @9 :List(SpendEntry);
 }
 
 struct TweakEntry {
@@ -129,29 +130,25 @@ struct TweakEntry {
   tweak @1 :Data;              # 32-byte x-coordinate of the scan point
 }
 
-struct OutputEntry {
-  key @0 :Data;                # currently 32-byte P2TR x-only output key
-}
-
 struct SpendEntry {
   spentUid @0 :UInt64;
 }
 ```
 
-The response has a dense output array. It is a candidate-scanning format, not a full reconstruction of every native P2TR output slot.
+The response has a dense packed output-fingerprint stream. It is a candidate-scanning format, not a full reconstruction of every native P2TR output slot.
 
-`TweakEntry.outputCount` always maps to consecutive entries in the dense response `outputs` array after all static and dynamic filtering:
+`TweakEntry.outputCount` always maps to consecutive fingerprint entries after all static and dynamic filtering:
 
 ```text
-tweak A outputCount = 3 -> outputs[0..3]
-tweak B outputCount = 2 -> outputs[3..5]
-tweak C outputCount = 5 -> outputs[5..10]
+tweak A outputCount = 3 -> fingerprints[0..3]
+tweak B outputCount = 2 -> fingerprints[3..5]
+tweak C outputCount = 5 -> fingerprints[5..10]
 ```
 
 Required invariant:
 
 ```text
-sum(tweaks.outputCount) == outputs.len()
+ceil(sum(tweaks.outputCount) * outputFingerprintBits / 8) == outputFingerprints.len()
 ```
 
 The indexer may represent a scan point internally as a 33-byte compressed public key. The served `TweakEntry.tweak` stores the 32-byte x-coordinate.
@@ -177,6 +174,10 @@ struct StoredLightBlock {
   outputs @8 :List(StoredOutputEntry);
 
   spends @9 :List(StoredSpendEntry);
+
+  rawBlockBytes @10 :UInt32;
+  outputFingerprintsForTwoLabels @11 :Data;
+  outputFingerprintsForHundredLabels @12 :Data;
 }
 
 struct StoredTweakEntry {
@@ -201,7 +202,9 @@ such as NUMS outputs or P2TR outputs from transactions without a usable Silent P
 It is useful for statistics and implementation checks, but clients do not receive it and do not need it for UID recovery.
 
 Dynamic response filters do not mutate storage. When `cutthrough` or `filter_reuse` is requested, the server derives a 
-response by omitting filtered stored outputs and recomputing every `TweakEntry.outputCount` so the response still maps cleanly to the dense output array.
+response by omitting filtered stored outputs, recomputing every `TweakEntry.outputCount`, and rebuilding the packed fingerprint stream so the response still maps cleanly to the dense fingerprint order.
+
+Output fingerprints are selected by the requested label budget. `labels <= 2` serves `outputFingerprintsForTwoLabels`; larger values and omitted `labels` serve `outputFingerprintsForHundredLabels`. The fingerprint bit width is derived from the raw block size and the normalized label budget.
 
 ## UID semantics
 
@@ -305,26 +308,28 @@ For each response block:
 ```text
 1. Keep firstUid, height, blockHash, previousBlockHash.
 2. Walk tweaks in order.
-3. For each tweak, take the next outputCount entries from the dense outputs array.
-4. For each wallet scan key and each output in that range, derive the expected output key for that tweak.
-5. Compare the derived key with the response output key.
+3. For each tweak, take the next outputCount entries from the dense fingerprint stream.
+4. For each wallet scan key and each fingerprint in that range, derive the expected output key for that tweak and compute its fingerprint.
+5. Compare the derived fingerprint with the response fingerprint.
 6. Treat a match as a candidate and download the full Bitcoin block for confirmation.
 ```
 
 Pseudocode:
 
 ```text
+fingerprints = unpack_fixed_width_bits(block.outputFingerprints, block.outputFingerprintBits)
 output_index = 0
 
 for tweak in block.tweaks:
   range_start = output_index
   range_end = output_index + tweak.outputCount
 
-  for output in block.outputs[range_start..range_end]:
+  for fingerprint in fingerprints[range_start..range_end]:
     for scan_key in wallet.scan_keys:
       candidate_key = derive_silent_payment_output_key(scan_key, tweak.tweak)
-      if candidate_key == output.key:
-        mark_candidate(block.height, block.blockHash, tweak, output.key)
+      candidate_fingerprint = fingerprint(candidate_key, block.blockHash, block.outputFingerprintBits)
+      if candidate_fingerprint == fingerprint:
+        mark_candidate(block.height, block.blockHash, tweak, candidate_key)
 
   output_index = range_end
 ```
@@ -501,6 +506,7 @@ count                 requested block count, capped by server max_range_count
 cutthrough=true       use start as the cut-through boundary
 cutthrough_start=H    explicit cut-through boundary; preferred for resumed sync
 filter_reuse=true     omit outputs marked reused in storage
+labels=N              labels <= 2 returns the two-label fingerprint stream; omitted/larger uses hundred-label
 max_bytes=N           per-request response byte cap, capped by server max_response_bytes
 ```
 
@@ -572,9 +578,9 @@ These invariants should hold for every encoded response block:
 ```text
 blockHash.len() == 32
 previousBlockHash.len() == 32
-all OutputEntry.key values are 32 bytes
 all TweakEntry.tweak values are 32 bytes
-sum(tweaks.outputCount) == outputs.len()
+outputFingerprintBits == 0 when sum(tweaks.outputCount) == 0
+ceil(sum(tweaks.outputCount) * outputFingerprintBits / 8) == outputFingerprints.len()
 skippedTxsForTweaks is sorted and unique
 ```
 
@@ -586,6 +592,8 @@ previousBlockHash.len() == 32
 all StoredOutputEntry.key values are 32 bytes
 all StoredTweakEntry.tweak values are 32 bytes
 sum(tweaks.outputCount) == outputs.len()
+rawBlockBytes is set for fingerprint bit selection
+stored two-label and hundred-label fingerprint streams have expected packed lengths
 skippedTxsForTweaks is sorted and unique
 skippedOutputs is sorted and unique
 stored P2TR output domain size = outputs.len() + skippedOutputs.len()

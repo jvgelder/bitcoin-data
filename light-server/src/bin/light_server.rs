@@ -27,8 +27,10 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let archive: Arc<dyn ArchiveBackend> = Arc::new(FileArchive::new(args.archive));
 
-    let mut config = ServerConfig::new(args.bind);
-    config.max_range_count = args.max_range_count;
-    config.max_response_bytes = args.max_response_bytes;
+    let config = ServerConfig {
+        bind: args.bind,
+        max_range_count: args.max_range_count,
+        max_response_bytes: args.max_response_bytes,
+    };
     serve(config, archive).await
 }

@@ -3,10 +3,8 @@
 //! The binary Cap'n Proto payload remains canonical. These helpers decode it
 //! into stable human-readable JSON for debugging only.
 
-use crate::light_capnp::light_block;
-use capnp::message::ReaderOptions;
+use crate::index::{decode_light_block, LightBlockInput};
 use serde::Serialize;
-use std::io::Cursor;
 
 #[derive(Debug, Serialize)]
 pub struct JsonLightBlock {
@@ -35,53 +33,35 @@ pub struct JsonSpendEntry {
 }
 
 pub fn light_block_to_json(bytes: &[u8]) -> anyhow::Result<JsonLightBlock> {
-    let mut cursor = Cursor::new(bytes);
-    let message = capnp::serialize_packed::read_message(&mut cursor, ReaderOptions::new())?;
-    let block = message.get_root::<light_block::Reader>()?;
-
-    let skipped_txs_for_tweaks = read_u16_list(block.get_skipped_txs_for_tweaks()?);
-
-    let tweak_reader = block.get_tweaks()?;
-    let mut tweaks = Vec::with_capacity(tweak_reader.len() as usize);
-    for i in 0..tweak_reader.len() {
-        let entry = tweak_reader.get(i);
-        let tweak = entry.get_tweak()?;
-        anyhow::ensure!(tweak.len() == 32, "tweak entry {i} is not 32 bytes");
-        tweaks.push(JsonTweakEntry {
-            output_count: entry.get_output_count(),
-            tweak: hex::encode(tweak),
-        });
-    }
-
-    let output_fingerprints = block.get_output_fingerprints()?;
-
-    let spend_reader = block.get_spends()?;
-    let mut spends = Vec::with_capacity(spend_reader.len() as usize);
-    for i in 0..spend_reader.len() {
-        spends.push(JsonSpendEntry {
-            spent_uid: spend_reader.get(i).get_spent_uid(),
-        });
-    }
-
-    Ok(JsonLightBlock {
-        version: block.get_version(),
-        height: block.get_height(),
-        block_hash: hex::encode(block.get_block_hash()?),
-        previous_block_hash: hex::encode(block.get_previous_block_hash()?),
-        first_uid: block.get_first_uid(),
-        skipped_txs_for_tweaks,
-        tweaks,
-        output_fingerprint_bits: block.get_output_fingerprint_bits(),
-        output_fingerprint_bytes: output_fingerprints.len(),
-        output_fingerprints: hex::encode(output_fingerprints),
-        spends,
-    })
+    light_block_input_to_json(decode_light_block(bytes)?)
 }
 
-fn read_u16_list(list: capnp::primitive_list::Reader<'_, u16>) -> Vec<u16> {
-    let mut out = Vec::with_capacity(list.len() as usize);
-    for i in 0..list.len() {
-        out.push(list.get(i));
-    }
-    out
+fn light_block_input_to_json(input: LightBlockInput) -> anyhow::Result<JsonLightBlock> {
+    let output_fingerprint_bytes = input.output_fingerprints.len();
+    Ok(JsonLightBlock {
+        version: crate::WIRE_VERSION,
+        height: input.height,
+        block_hash: hex::encode(input.block_hash.as_bytes()),
+        previous_block_hash: hex::encode(input.previous_block_hash.as_bytes()),
+        first_uid: input.first_uid,
+        skipped_txs_for_tweaks: input.skipped_txs_for_tweaks,
+        tweaks: input
+            .tweaks
+            .into_iter()
+            .map(|entry| JsonTweakEntry {
+                output_count: entry.output_count,
+                tweak: hex::encode(&entry.tweak.as_bytes()[1..]),
+            })
+            .collect(),
+        output_fingerprint_bits: input.output_fingerprint_bits,
+        output_fingerprint_bytes,
+        output_fingerprints: hex::encode(input.output_fingerprints),
+        spends: input
+            .spends
+            .into_iter()
+            .map(|entry| JsonSpendEntry {
+                spent_uid: entry.spent_uid,
+            })
+            .collect(),
+    })
 }

@@ -23,33 +23,33 @@ pub fn classify_script(script_bytes: &[u8]) -> ScriptKind {
     let script = Script::from_bytes(script_bytes);
 
     if script.is_p2pkh() {
-        let mut hash160 = [0u8; 20];
-        hash160.copy_from_slice(&script_bytes[3..23]);
-        return ScriptKind::P2pkh { hash160 };
+        return ScriptKind::P2pkh {
+            hash160: copy_20(&script_bytes[3..23]),
+        };
     }
 
     if script.is_p2sh() {
-        let mut hash160 = [0u8; 20];
-        hash160.copy_from_slice(&script_bytes[2..22]);
-        return ScriptKind::P2sh { hash160 };
+        return ScriptKind::P2sh {
+            hash160: copy_20(&script_bytes[2..22]),
+        };
     }
 
     if script.is_p2wpkh() {
-        let mut hash160 = [0u8; 20];
-        hash160.copy_from_slice(&script_bytes[2..22]);
-        return ScriptKind::P2wpkh { hash160 };
+        return ScriptKind::P2wpkh {
+            hash160: copy_20(&script_bytes[2..22]),
+        };
     }
 
     if script.is_p2wsh() {
-        let mut sha256 = [0u8; 32];
-        sha256.copy_from_slice(&script_bytes[2..34]);
-        return ScriptKind::P2wsh { sha256 };
+        return ScriptKind::P2wsh {
+            sha256: copy_32(&script_bytes[2..34]),
+        };
     }
 
     if script.is_p2tr() {
-        let mut xonly_key = [0u8; 32];
-        xonly_key.copy_from_slice(&script_bytes[2..34]);
-        return ScriptKind::P2tr { xonly_key };
+        return ScriptKind::P2tr {
+            xonly_key: copy_32(&script_bytes[2..34]),
+        };
     }
 
     if script.is_witness_program() {
@@ -70,6 +70,18 @@ pub fn classify_script(script_bytes: &[u8]) -> ScriptKind {
     }
 
     ScriptKind::Other
+}
+
+fn copy_20(bytes: &[u8]) -> [u8; 20] {
+    let mut out = [0u8; 20];
+    out.copy_from_slice(bytes);
+    out
+}
+
+fn copy_32(bytes: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(bytes);
+    out
 }
 
 pub fn extract_p2tr_xonly(script: &[u8]) -> Option<[u8; 32]> {

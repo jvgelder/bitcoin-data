@@ -13,7 +13,10 @@ use bitcoin::hashes::{hash160, Hash};
 use bitcoin::secp256k1::{Parity, PublicKey, Scalar, Secp256k1, XOnlyPublicKey};
 use sha2::{Digest, Sha256};
 
-const BIP352_INPUTS_TAG: &str = "BIP0352/Inputs";
+const BIP352_INPUTS_TAG_HASH: [u8; 32] = [
+    0x1e, 0x7b, 0x96, 0xeb, 0x16, 0x0a, 0x68, 0x81, 0x9f, 0x97, 0x76, 0x4b, 0x43, 0xd5, 0xd7, 0x7e,
+    0x66, 0x59, 0xd7, 0x58, 0x77, 0x9d, 0x43, 0xa8, 0xa7, 0x75, 0x5f, 0x5b, 0xe4, 0x5a, 0x7e, 0x33,
+];
 const TAPROOT_NUMS_H_XONLY: [u8; 32] = [
     0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a, 0x5e,
     0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80, 0x3a, 0xc0,
@@ -151,7 +154,7 @@ pub fn compute_tx_scan_point(inputs: &[TxInputContext]) -> SpTweakResult<ScanPoi
     input_hash_preimage.extend_from_slice(&outpoint_l);
     input_hash_preimage.extend_from_slice(&sum.serialize());
 
-    let input_hash = tagged_sha256(BIP352_INPUTS_TAG, &input_hash_preimage);
+    let input_hash = bip352_inputs_tagged_sha256(&input_hash_preimage);
     let scalar =
         Scalar::from_be_bytes(input_hash).map_err(|_| SpTweakError::InvalidInputHashScalar)?;
 
@@ -238,7 +241,7 @@ fn extract_p2pkh_input_pubkey(
     expected_hash: [u8; 20],
 ) -> SpTweakResult<Option<PublicKey>> {
     for push in parse_script_pushes(&input.script_sig).into_iter().rev() {
-        if let Some(pubkey) = parse_compressed_pubkey_matching_hash(&push, expected_hash)? {
+        if let Some(pubkey) = parse_compressed_pubkey_matching_hash(push, expected_hash)? {
             return Ok(Some(pubkey));
         }
     }
@@ -286,11 +289,10 @@ fn serialize_outpoint(input: &TxInputContext) -> [u8; 36] {
     outpoint
 }
 
-fn tagged_sha256(tag: &str, msg: &[u8]) -> [u8; 32] {
-    let tag_hash = Sha256::digest(tag.as_bytes());
+fn bip352_inputs_tagged_sha256(msg: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(tag_hash);
-    hasher.update(tag_hash);
+    hasher.update(BIP352_INPUTS_TAG_HASH);
+    hasher.update(BIP352_INPUTS_TAG_HASH);
     hasher.update(msg);
     hasher.finalize().into()
 }
@@ -299,7 +301,7 @@ fn hash160_bytes(bytes: &[u8]) -> [u8; 20] {
     hash160::Hash::hash(bytes).to_byte_array()
 }
 
-fn parse_script_pushes(script: &[u8]) -> Vec<Vec<u8>> {
+fn parse_script_pushes(script: &[u8]) -> Vec<&[u8]> {
     let mut pushes = Vec::new();
     let mut i = 0usize;
 
@@ -341,7 +343,7 @@ fn parse_script_pushes(script: &[u8]) -> Vec<Vec<u8>> {
         if i + len > script.len() {
             break;
         }
-        pushes.push(script[i..i + len].to_vec());
+        pushes.push(&script[i..i + len]);
         i += len;
     }
 
@@ -371,6 +373,20 @@ mod tests {
         }
     }
 
+    fn tx_input(
+        n: u8,
+        script_sig: Vec<u8>,
+        witness: Vec<Vec<u8>>,
+        prevout: Option<PrevoutInfo>,
+    ) -> TxInputContext {
+        TxInputContext {
+            previous_output: outpoint(n),
+            script_sig,
+            witness,
+            prevout,
+        }
+    }
+
     #[test]
     fn empty_prevouts_are_ineligible() {
         assert_eq!(
@@ -383,28 +399,22 @@ mod tests {
 
     #[test]
     fn missing_prevout_blocks_partial_computation() {
-        let status = compute_tx_scan_point(&[TxInputContext {
-            previous_output: outpoint(1),
-            script_sig: Vec::new(),
-            witness: Vec::new(),
-            prevout: None,
-        }])
-        .unwrap();
+        let status = compute_tx_scan_point(&[tx_input(1, Vec::new(), Vec::new(), None)]).unwrap();
         assert_eq!(status, ScanPointStatus::MissingPrevout { missing_count: 1 });
     }
 
     #[test]
     fn p2tr_prevout_with_witness_computes_scan_point() {
-        let status = compute_tx_scan_point(&[TxInputContext {
-            previous_output: outpoint(1),
-            script_sig: Vec::new(),
-            witness: vec![vec![1; 64]],
-            prevout: Some(PrevoutInfo {
+        let status = compute_tx_scan_point(&[tx_input(
+            1,
+            Vec::new(),
+            vec![vec![1; 64]],
+            Some(PrevoutInfo {
                 script: PrevoutScript::P2tr {
                     xonly_key: XOnlyPublicKey::from_slice(&GENERATOR_XONLY).unwrap(),
                 },
             }),
-        }])
+        )])
         .unwrap();
 
         match status {
@@ -415,16 +425,16 @@ mod tests {
 
     #[test]
     fn p2wpkh_prevout_computes_scan_point_from_witness_pubkey() {
-        let status = compute_tx_scan_point(&[TxInputContext {
-            previous_output: outpoint(2),
-            script_sig: Vec::new(),
-            witness: vec![vec![1; 64], GENERATOR_COMPRESSED.to_vec()],
-            prevout: Some(PrevoutInfo {
+        let status = compute_tx_scan_point(&[tx_input(
+            2,
+            Vec::new(),
+            vec![vec![1; 64], GENERATOR_COMPRESSED.to_vec()],
+            Some(PrevoutInfo {
                 script: PrevoutScript::P2wpkh {
                     hash160: hash160_bytes(&GENERATOR_COMPRESSED),
                 },
             }),
-        }])
+        )])
         .unwrap();
 
         assert!(matches!(status, ScanPointStatus::Computed(_)));
@@ -432,14 +442,14 @@ mod tests {
 
     #[test]
     fn segwit_version_greater_than_one_makes_transaction_ineligible() {
-        let status = compute_tx_scan_point(&[TxInputContext {
-            previous_output: outpoint(3),
-            script_sig: Vec::new(),
-            witness: Vec::new(),
-            prevout: Some(PrevoutInfo {
+        let status = compute_tx_scan_point(&[tx_input(
+            3,
+            Vec::new(),
+            Vec::new(),
+            Some(PrevoutInfo {
                 script: PrevoutScript::WitnessUnknown { version: 2 },
             }),
-        }])
+        )])
         .unwrap();
 
         assert_eq!(
@@ -458,24 +468,24 @@ mod tests {
         // stored, read back as `None`, and wrongly reported MissingPrevout,
         // dropping the tweak for the whole transaction.
         let status = compute_tx_scan_point(&[
-            TxInputContext {
-                previous_output: outpoint(4),
-                script_sig: Vec::new(),
-                witness: vec![vec![1; 64], GENERATOR_COMPRESSED.to_vec()],
-                prevout: Some(PrevoutInfo {
+            tx_input(
+                4,
+                Vec::new(),
+                vec![vec![1; 64], GENERATOR_COMPRESSED.to_vec()],
+                Some(PrevoutInfo {
                     script: PrevoutScript::P2wpkh {
                         hash160: hash160_bytes(&GENERATOR_COMPRESSED),
                     },
                 }),
-            },
-            TxInputContext {
-                previous_output: outpoint(5),
-                script_sig: Vec::new(),
-                witness: Vec::new(),
-                prevout: Some(PrevoutInfo {
+            ),
+            tx_input(
+                5,
+                Vec::new(),
+                Vec::new(),
+                Some(PrevoutInfo {
                     script: PrevoutScript::Other,
                 }),
-            },
+            ),
         ])
         .unwrap();
 

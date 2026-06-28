@@ -3,6 +3,8 @@ use crate::index::{
     stored_light_block_to_filtered_response_bytes, stored_light_block_to_response_bytes,
     to_packed_bytes, StoredBlockResponseFilter,
 };
+use crate::storage::backend::ServedBlock;
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -12,9 +14,6 @@ use std::path::{Path, PathBuf};
 pub struct FileArchive {
     root: PathBuf,
 }
-
-/// Backwards-compatible alias for older fixture/indexer code.
-pub type LightArchive = FileArchive;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainTip {
@@ -62,47 +61,26 @@ impl FileArchive {
         Ok(fs::read(self.block_path(height))?)
     }
 
-    pub fn read_block(&self, height: u64) -> anyhow::Result<Vec<u8>> {
+    pub fn read_block_with_hash(&self, height: u64) -> anyhow::Result<ServedBlock> {
         let stored = self.read_stored_block(height)?;
-        let (response, _block_hash) = stored_light_block_to_response_bytes(&stored)?;
-        Ok(response)
-    }
-
-    pub fn read_block_with_hash(&self, height: u64) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
-        let stored = self.read_stored_block(height)?;
-        let (response, block_hash) = stored_light_block_to_response_bytes(&stored)?;
-        Ok((response, block_hash.as_bytes().to_vec()))
+        let (payload, block_hash) = stored_light_block_to_response_bytes(&stored)?;
+        Ok(ServedBlock {
+            payload,
+            block_hash,
+        })
     }
 
     pub fn read_block_filtered_with_hash(
         &self,
         height: u64,
         filter: StoredBlockResponseFilter,
-    ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    ) -> anyhow::Result<ServedBlock> {
         let stored = self.read_stored_block(height)?;
-        let (response, block_hash) =
-            stored_light_block_to_filtered_response_bytes(&stored, filter)?;
-        Ok((response, block_hash.as_bytes().to_vec()))
-    }
-
-    pub fn read_blocks(&self, start: u64, count: u32) -> anyhow::Result<Vec<Vec<u8>>> {
-        (0..count)
-            .map(|i| self.read_block(start + u64::from(i)))
-            .collect()
-    }
-
-    pub fn read_blocks_filtered(
-        &self,
-        start: u64,
-        count: u32,
-        filter: StoredBlockResponseFilter,
-    ) -> anyhow::Result<Vec<Vec<u8>>> {
-        (0..count)
-            .map(|i| {
-                self.read_block_filtered_with_hash(start + u64::from(i), filter)
-                    .map(|(payload, _hash)| payload)
-            })
-            .collect()
+        let (payload, block_hash) = stored_light_block_to_filtered_response_bytes(&stored, filter)?;
+        Ok(ServedBlock {
+            payload,
+            block_hash,
+        })
     }
 
     pub fn write_block_bytes(&self, height: u64, bytes: &[u8]) -> anyhow::Result<PathBuf> {
@@ -137,8 +115,10 @@ impl FileArchive {
                 continue;
             }
 
-            let stored_bytes = fs::read(&path)?;
-            let mut stored = decode_stored_light_block(&stored_bytes)?;
+            let stored_bytes = fs::read(&path)
+                .with_context(|| format!("failed to read stored block {}", path.display()))?;
+            let mut stored = decode_stored_light_block(&stored_bytes)
+                .with_context(|| format!("failed to decode stored block {}", path.display()))?;
             for (output_index, spent_height) in spends {
                 let output = stored.outputs.get_mut(usize::try_from(output_index)?).ok_or_else(|| {
                     anyhow::anyhow!(
@@ -152,8 +132,10 @@ impl FileArchive {
                 }
             }
 
-            let bytes = to_packed_bytes(&encode_stored_light_block(&stored)?)?;
-            self.write_block_bytes(creation_height, &bytes)?;
+            let bytes = to_packed_bytes(&encode_stored_light_block(&stored)?)
+                .with_context(|| format!("failed to re-encode stored block {}", path.display()))?;
+            self.write_block_bytes(creation_height, &bytes)
+                .with_context(|| format!("failed to rewrite stored block {}", path.display()))?;
         }
         Ok(updated)
     }
@@ -212,10 +194,10 @@ impl crate::storage::ArchiveBackend for FileArchive {
     }
 
     async fn tip(&self) -> anyhow::Result<Option<ChainTip>> {
-        self.tip()
+        FileArchive::tip(self)
     }
 
-    async fn read_block(&self, height: u64) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    async fn read_block(&self, height: u64) -> anyhow::Result<ServedBlock> {
         self.read_block_with_hash(height)
     }
 
@@ -223,20 +205,7 @@ impl crate::storage::ArchiveBackend for FileArchive {
         &self,
         height: u64,
         filter: StoredBlockResponseFilter,
-    ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    ) -> anyhow::Result<ServedBlock> {
         self.read_block_filtered_with_hash(height, filter)
-    }
-
-    async fn read_blocks(&self, start: u64, count: u32) -> anyhow::Result<Vec<Vec<u8>>> {
-        self.read_blocks(start, count)
-    }
-
-    async fn read_blocks_filtered(
-        &self,
-        start: u64,
-        count: u32,
-        filter: StoredBlockResponseFilter,
-    ) -> anyhow::Result<Vec<Vec<u8>>> {
-        self.read_blocks_filtered(start, count, filter)
     }
 }

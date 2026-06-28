@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
 
+const MAINNET_TAPROOT_ACTIVATION_HEIGHT: u64 = 709_632;
+const TESTNET_TAPROOT_ACTIVATION_HEIGHT: u64 = 2_011_968;
+
 /// Bitcoin network used to choose archive defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -28,8 +31,8 @@ impl ArchiveNetwork {
     /// default scan starts at Taproot activation.
     pub fn default_start_height(self) -> u64 {
         match self {
-            Self::Mainnet => 709_632,
-            Self::Testnet => 2_011_968,
+            Self::Mainnet => MAINNET_TAPROOT_ACTIVATION_HEIGHT,
+            Self::Testnet => TESTNET_TAPROOT_ACTIVATION_HEIGHT,
             Self::Signet | Self::Regtest | Self::Fixture => 0,
         }
     }
@@ -39,13 +42,13 @@ impl FromStr for ArchiveNetwork {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
+        match s.to_ascii_lowercase().as_str() {
             "mainnet" | "bitcoin" => Ok(Self::Mainnet),
             "testnet" | "test" => Ok(Self::Testnet),
             "signet" => Ok(Self::Signet),
             "regtest" => Ok(Self::Regtest),
             "fixture" => Ok(Self::Fixture),
-            other => anyhow::bail!("unknown archive network: {other}"),
+            _ => anyhow::bail!("unknown archive network: {s}"),
         }
     }
 }
@@ -62,12 +65,18 @@ mod tests {
 
     #[test]
     fn p2tr_archive_defaults_to_taproot_activation_on_mainnet() {
-        assert_eq!(ArchiveNetwork::Mainnet.default_start_height(), 709_632);
+        assert_eq!(
+            ArchiveNetwork::Mainnet.default_start_height(),
+            MAINNET_TAPROOT_ACTIVATION_HEIGHT
+        );
     }
 
     #[test]
     fn p2tr_archive_defaults_to_taproot_activation_on_testnet() {
-        assert_eq!(ArchiveNetwork::Testnet.default_start_height(), 2_011_968);
+        assert_eq!(
+            ArchiveNetwork::Testnet.default_start_height(),
+            TESTNET_TAPROOT_ACTIVATION_HEIGHT
+        );
     }
 
     #[test]

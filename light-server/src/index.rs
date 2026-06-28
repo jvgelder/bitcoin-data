@@ -1,17 +1,15 @@
+use crate::helper::{read_32, read_u16_list};
 use crate::light_capnp::{light_block, stored_light_block};
 use crate::types::{BlockHashBytes, TxTweak};
 use crate::WIRE_VERSION;
 use capnp::message::{Builder, HeapAllocator, ReaderOptions};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::io::Cursor;
-use sha2::{Digest, Sha256};
 
 pub const MAX_U16_SECTION_COUNT: usize = u16::MAX as usize;
 pub const STORAGE_OUTPUT_FLAG_REUSED: u8 = 1 << 0;
 pub const STORAGE_SPENT_HEIGHT_UNSPENT: u32 = u32::MAX;
-
-/// Compatibility alias for code that still uses the old name internally.
-pub const OUTPUT_FLAG_REUSED: u8 = STORAGE_OUTPUT_FLAG_REUSED;
 
 #[derive(Debug, Clone)]
 pub struct TweakEntryInput {
@@ -22,14 +20,7 @@ pub struct TweakEntryInput {
     pub tweak: TxTweak,
 }
 
-#[derive(Debug, Clone)]
-pub struct StoredTweakEntryInput {
-    /// Number of stored dense outputs associated with this tweak entry.
-    pub output_count: u16,
-    /// Compressed 33-byte scan/tweak point. Storage stores the 32-byte
-    /// x-coordinate on disk.
-    pub tweak: TxTweak,
-}
+pub type StoredTweakEntryInput = TweakEntryInput;
 
 #[derive(Debug, Clone)]
 pub struct SpendEntryInput {
@@ -116,14 +107,14 @@ impl StoredLightBlockInput {
             .expect("stored block should have valid default response fingerprints")
     }
 
-    pub fn to_response_input_for_labels(&self, labels: Option<u16>) -> anyhow::Result<LightBlockInput> {
+    pub fn to_response_input_for_labels(
+        &self,
+        labels: Option<u16>,
+    ) -> anyhow::Result<LightBlockInput> {
         let label_budget = response_label_budget(labels);
         let output_count = self.outputs.len();
-        let output_fingerprint_bits = choose_output_fingerprint_bits(
-            output_count,
-            self.raw_block_bytes,
-            label_budget,
-        );
+        let output_fingerprint_bits =
+            choose_output_fingerprint_bits(output_count, self.raw_block_bytes, label_budget);
         let output_fingerprints = match label_budget {
             RESPONSE_LABEL_BUDGET_TWO => self.output_fingerprints_for_two_labels.clone(),
             RESPONSE_LABEL_BUDGET_HUNDRED => self.output_fingerprints_for_hundred_labels.clone(),
@@ -136,14 +127,7 @@ impl StoredLightBlockInput {
             previous_block_hash: self.previous_block_hash,
             first_uid: self.first_uid,
             skipped_txs_for_tweaks: self.skipped_txs_for_tweaks.clone(),
-            tweaks: self
-                .tweaks
-                .iter()
-                .map(|entry| TweakEntryInput {
-                    output_count: entry.output_count,
-                    tweak: entry.tweak,
-                })
-                .collect(),
+            tweaks: self.tweaks.clone(),
             output_fingerprint_bits,
             output_fingerprints,
             spends: self
@@ -339,7 +323,7 @@ pub fn encode_light_block(input: &LightBlockInput) -> anyhow::Result<Builder<Hea
         for (i, entry) in input.tweaks.iter().enumerate() {
             let mut t = tweaks.reborrow().get(i as u32);
             t.set_output_count(entry.output_count);
-            t.set_tweak(tx_tweak_payload_bytes(&entry.tweak)?);
+            t.set_tweak(tx_tweak_payload_bytes(&entry.tweak));
         }
 
         b.set_output_fingerprint_bits(input.output_fingerprint_bits);
@@ -380,7 +364,7 @@ pub fn encode_stored_light_block(
         for (i, entry) in input.tweaks.iter().enumerate() {
             let mut t = tweaks.reborrow().get(i as u32);
             t.set_output_count(entry.output_count);
-            t.set_tweak(tx_tweak_payload_bytes(&entry.tweak)?);
+            t.set_tweak(tx_tweak_payload_bytes(&entry.tweak));
         }
 
         let mut skipped_outputs = b
@@ -412,10 +396,65 @@ pub fn encode_stored_light_block(
     Ok(msg)
 }
 
+pub fn decode_light_block(bytes: &[u8]) -> anyhow::Result<LightBlockInput> {
+    let mut cursor = Cursor::new(bytes);
+    let message = capnp::serialize_packed::read_message(&mut cursor, ReaderOptions::new())?;
+    let block = message.get_root::<light_block::Reader>()?;
+
+    anyhow::ensure!(
+        block.get_version() == WIRE_VERSION,
+        "unsupported light block version {}",
+        block.get_version()
+    );
+
+    let tweak_reader = block.get_tweaks()?;
+    let mut tweaks = Vec::with_capacity(tweak_reader.len() as usize);
+    for i in 0..tweak_reader.len() {
+        let entry = tweak_reader.get(i);
+        let tweak = entry.get_tweak()?;
+        anyhow::ensure!(tweak.len() == 32, "tweak entry {i} is not 32 bytes");
+        tweaks.push(TweakEntryInput {
+            output_count: entry.get_output_count(),
+            tweak: tx_tweak_from_payload_bytes(tweak)?,
+        });
+    }
+
+    let spend_reader = block.get_spends()?;
+    let mut spends = Vec::with_capacity(spend_reader.len() as usize);
+    for i in 0..spend_reader.len() {
+        spends.push(SpendEntryInput {
+            spent_uid: spend_reader.get(i).get_spent_uid(),
+        });
+    }
+
+    let input = LightBlockInput {
+        height: block.get_height(),
+        block_hash: BlockHashBytes::from(read_32(block.get_block_hash()?, "block hash")?),
+        previous_block_hash: BlockHashBytes::from(read_32(
+            block.get_previous_block_hash()?,
+            "previous block hash",
+        )?),
+        first_uid: block.get_first_uid(),
+        skipped_txs_for_tweaks: read_u16_list(block.get_skipped_txs_for_tweaks()?),
+        tweaks,
+        output_fingerprint_bits: block.get_output_fingerprint_bits(),
+        output_fingerprints: block.get_output_fingerprints()?.to_vec(),
+        spends,
+    };
+    validate_light_block_input(&input)?;
+    Ok(input)
+}
+
 pub fn decode_stored_light_block(bytes: &[u8]) -> anyhow::Result<StoredLightBlockInput> {
     let mut cursor = Cursor::new(bytes);
     let message = capnp::serialize_packed::read_message(&mut cursor, ReaderOptions::new())?;
     let block = message.get_root::<stored_light_block::Reader>()?;
+
+    anyhow::ensure!(
+        block.get_version() == WIRE_VERSION,
+        "unsupported stored light block version {}",
+        block.get_version()
+    );
 
     let skipped_txs_for_tweaks = read_u16_list(block.get_skipped_txs_for_tweaks()?);
     let skipped_outputs = read_u16_list(block.get_skipped_outputs()?);
@@ -425,7 +464,7 @@ pub fn decode_stored_light_block(bytes: &[u8]) -> anyhow::Result<StoredLightBloc
         let entry = tweak_reader.get(i);
         let tweak = entry.get_tweak()?;
         anyhow::ensure!(tweak.len() == 32, "stored tweak entry {i} is not 32 bytes");
-        tweaks.push(StoredTweakEntryInput {
+        tweaks.push(TweakEntryInput {
             output_count: entry.get_output_count(),
             tweak: tx_tweak_from_payload_bytes(tweak)?,
         });
@@ -471,8 +510,12 @@ pub fn decode_stored_light_block(bytes: &[u8]) -> anyhow::Result<StoredLightBloc
         outputs,
         spends,
         raw_block_bytes: block.get_raw_block_bytes(),
-        output_fingerprints_for_two_labels: block.get_output_fingerprints_for_two_labels()?.to_vec(),
-        output_fingerprints_for_hundred_labels: block.get_output_fingerprints_for_hundred_labels()?.to_vec(),
+        output_fingerprints_for_two_labels: block
+            .get_output_fingerprints_for_two_labels()?
+            .to_vec(),
+        output_fingerprints_for_hundred_labels: block
+            .get_output_fingerprints_for_hundred_labels()?
+            .to_vec(),
     };
     validate_stored_light_block_input(&input)?;
     Ok(input)
@@ -526,7 +569,7 @@ pub fn validate_light_block_input(input: &LightBlockInput) -> anyhow::Result<()>
 
     for entry in &input.tweaks {
         anyhow::ensure!(
-            tx_tweak_payload_bytes(&entry.tweak)?.len() == 32,
+            tx_tweak_payload_bytes(&entry.tweak).len() == 32,
             "tweak payload must be 32 bytes"
         );
     }
@@ -557,7 +600,7 @@ pub fn validate_stored_light_block_input(input: &StoredLightBlockInput) -> anyho
 
     validate_stored_output_fingerprints(input)?;
 
-    let response = input.to_response_input();
+    let response = input.to_response_input_for_labels(None)?;
     validate_light_block_input(&response)?;
 
     for spend in &input.spends {
@@ -619,7 +662,7 @@ const OUTPUT_FINGERPRINT_TAG_HASH: [u8; 32] = [
 
 pub fn response_label_budget(labels: Option<u16>) -> u16 {
     match labels {
-        Some(1 | 2) => RESPONSE_LABEL_BUDGET_TWO,
+        Some(labels) if labels <= RESPONSE_LABEL_BUDGET_TWO => RESPONSE_LABEL_BUDGET_TWO,
         _ => RESPONSE_LABEL_BUDGET_HUNDRED,
     }
 }
@@ -660,24 +703,15 @@ pub fn packed_fingerprint_len(output_count: usize, bits: u8) -> anyhow::Result<u
     Ok(total_bits.div_ceil(8))
 }
 
-pub fn pack_output_fingerprints_from_stored_outputs(
-    block_hash: BlockHashBytes,
-    outputs: &[StoredOutputEntryInput],
-    bits: u8,
-) -> anyhow::Result<Vec<u8>> {
-    pack_output_fingerprints_from_keys(block_hash, outputs.iter().map(|entry| &entry.key), bits)
-}
-
 pub fn pack_output_fingerprints_from_keys<'a>(
     block_hash: BlockHashBytes,
-    keys: impl IntoIterator<Item = &'a [u8; 32]>,
+    keys: impl ExactSizeIterator<Item = &'a [u8; 32]>,
     bits: u8,
 ) -> anyhow::Result<Vec<u8>> {
     if bits == 0 {
         return Ok(Vec::new());
     }
 
-    let keys = keys.into_iter().collect::<Vec<_>>();
     let mut out = vec![0u8; packed_fingerprint_len(keys.len(), bits)?];
     let mut out_bit = 0usize;
     let base_hasher = output_fingerprint_base_hasher(block_hash);
@@ -696,11 +730,6 @@ pub fn pack_output_fingerprints_from_keys<'a>(
     }
 
     Ok(out)
-}
-
-fn output_fingerprint_digest(block_hash: BlockHashBytes, key: &[u8; 32]) -> [u8; 32] {
-    let base_hasher = output_fingerprint_base_hasher(block_hash);
-    output_fingerprint_digest_from_base(&base_hasher, key)
 }
 
 fn output_fingerprint_digest_from_base(base_hasher: &Sha256, key: &[u8; 32]) -> [u8; 32] {
@@ -724,48 +753,43 @@ pub fn build_stored_output_fingerprints(
     label_budget: u16,
 ) -> anyhow::Result<Vec<u8>> {
     let bits = choose_output_fingerprint_bits(outputs.len(), raw_block_bytes, label_budget);
-    pack_output_fingerprints_from_stored_outputs(block_hash, outputs, bits)
+    pack_output_fingerprints_from_keys(block_hash, outputs.iter().map(|entry| &entry.key), bits)
 }
 
 fn validate_stored_output_fingerprints(input: &StoredLightBlockInput) -> anyhow::Result<()> {
-    let bits_two = choose_output_fingerprint_bits(
-        input.outputs.len(),
-        input.raw_block_bytes,
-        RESPONSE_LABEL_BUDGET_TWO,
-    );
-    let expected_two = packed_fingerprint_len(input.outputs.len(), bits_two)?;
-    anyhow::ensure!(
-        input.output_fingerprints_for_two_labels.len() == expected_two,
-        "stored two-label output fingerprint byte length {} does not match expected {}",
-        input.output_fingerprints_for_two_labels.len(),
-        expected_two
-    );
-
-    let bits_hundred = choose_output_fingerprint_bits(
-        input.outputs.len(),
-        input.raw_block_bytes,
-        RESPONSE_LABEL_BUDGET_HUNDRED,
-    );
-    let expected_hundred = packed_fingerprint_len(input.outputs.len(), bits_hundred)?;
-    anyhow::ensure!(
-        input.output_fingerprints_for_hundred_labels.len() == expected_hundred,
-        "stored hundred-label output fingerprint byte length {} does not match expected {}",
-        input.output_fingerprints_for_hundred_labels.len(),
-        expected_hundred
-    );
+    for (label, label_budget, fingerprints) in [
+        (
+            "two-label",
+            RESPONSE_LABEL_BUDGET_TWO,
+            &input.output_fingerprints_for_two_labels,
+        ),
+        (
+            "hundred-label",
+            RESPONSE_LABEL_BUDGET_HUNDRED,
+            &input.output_fingerprints_for_hundred_labels,
+        ),
+    ] {
+        let bits = choose_output_fingerprint_bits(
+            input.outputs.len(),
+            input.raw_block_bytes,
+            label_budget,
+        );
+        let expected = packed_fingerprint_len(input.outputs.len(), bits)?;
+        anyhow::ensure!(
+            fingerprints.len() == expected,
+            "stored {label} output fingerprint byte length {} does not match expected {}",
+            fingerprints.len(),
+            expected
+        );
+    }
 
     Ok(())
 }
 
 /// The indexer stores a compressed 33-byte tweak point internally. The served
 /// light block carries only the 32-byte x-coordinate.
-fn tx_tweak_payload_bytes(tweak: &TxTweak) -> anyhow::Result<&[u8]> {
-    let bytes = tweak.as_ref();
-    match bytes.len() {
-        32 => Ok(bytes),
-        33 => Ok(&bytes[1..33]),
-        len => anyhow::bail!("unexpected tweak length {len}"),
-    }
+fn tx_tweak_payload_bytes(tweak: &TxTweak) -> &[u8] {
+    &tweak.as_bytes()[1..]
 }
 
 fn tx_tweak_from_payload_bytes(bytes: &[u8]) -> anyhow::Result<TxTweak> {
@@ -776,21 +800,6 @@ fn tx_tweak_from_payload_bytes(bytes: &[u8]) -> anyhow::Result<TxTweak> {
     tweak[0] = 0x02;
     tweak[1..].copy_from_slice(bytes);
     Ok(TxTweak::from(tweak))
-}
-
-fn read_u16_list(list: capnp::primitive_list::Reader<'_, u16>) -> Vec<u16> {
-    let mut out = Vec::with_capacity(list.len() as usize);
-    for i in 0..list.len() {
-        out.push(list.get(i));
-    }
-    out
-}
-
-fn read_32(bytes: &[u8], label: &str) -> anyhow::Result<[u8; 32]> {
-    anyhow::ensure!(bytes.len() == 32, "invalid {label} length {}", bytes.len());
-    let mut out = [0u8; 32];
-    out.copy_from_slice(bytes);
-    Ok(out)
 }
 
 pub fn to_packed_bytes(msg: &Builder<HeapAllocator>) -> anyhow::Result<Vec<u8>> {
@@ -816,7 +825,7 @@ mod tests {
             previous_block_hash: BlockHashBytes::from([2u8; 32]),
             first_uid: 42,
             skipped_txs_for_tweaks: vec![0, 3],
-            tweaks: vec![StoredTweakEntryInput {
+            tweaks: vec![TweakEntryInput {
                 output_count: 1,
                 tweak: TxTweak::from([9u8; 33]),
             }],
@@ -867,7 +876,10 @@ mod tests {
         reference.update(&key);
         let expected: [u8; 32] = reference.finalize().into();
 
-        assert_eq!(output_fingerprint_digest(block_hash, &key), expected);
+        assert_eq!(
+            output_fingerprint_digest_from_base(&output_fingerprint_base_hasher(block_hash), &key),
+            expected
+        );
     }
 
     #[test]
@@ -940,7 +952,7 @@ mod tests {
             previous_block_hash: BlockHashBytes::from([2u8; 32]),
             first_uid: 10,
             skipped_txs_for_tweaks: vec![0],
-            tweaks: vec![StoredTweakEntryInput {
+            tweaks: vec![TweakEntryInput {
                 output_count: 2,
                 tweak: TxTweak::from([9u8; 33]),
             }],
