@@ -119,8 +119,8 @@ struct LightBlock {
   skippedTxsForTweaks @5 :List(UInt16);
   tweaks @6 :List(TweakEntry);
 
-  outputFingerprintBits @7 :UInt8;
-  outputFingerprints @8 :Data; # packed dense output fingerprints
+  truncatedOutputHashBits @7 :UInt8;
+  truncatedOutputHash @8 :Data; # packed dense truncated output hashes
 
   spends @9 :List(SpendEntry);
 }
@@ -135,20 +135,20 @@ struct SpendEntry {
 }
 ```
 
-The response has a dense packed output-fingerprint stream. It is a candidate-scanning format, not a full reconstruction of every native P2TR output slot.
+The response has a dense packed truncated output hash stream. It is a candidate-scanning format, not a full reconstruction of every native P2TR output slot.
 
-`TweakEntry.outputCount` always maps to consecutive fingerprint entries after all static and dynamic filtering:
+`TweakEntry.outputCount` always maps to consecutive truncated output hash entries after all static and dynamic filtering:
 
 ```text
-tweak A outputCount = 3 -> fingerprints[0..3]
-tweak B outputCount = 2 -> fingerprints[3..5]
-tweak C outputCount = 5 -> fingerprints[5..10]
+tweak A outputCount = 3 -> truncatedOutputHashes[0..3]
+tweak B outputCount = 2 -> truncatedOutputHashes[3..5]
+tweak C outputCount = 5 -> truncatedOutputHashes[5..10]
 ```
 
 Required invariant:
 
 ```text
-ceil(sum(tweaks.outputCount) * outputFingerprintBits / 8) == outputFingerprints.len()
+ceil(sum(tweaks.outputCount) * truncatedOutputHashBits / 8) == truncatedOutputHash.len()
 ```
 
 The indexer may represent a scan point internally as a 33-byte compressed public key. The served `TweakEntry.tweak` stores the 32-byte x-coordinate.
@@ -176,8 +176,8 @@ struct StoredLightBlock {
   spends @9 :List(StoredSpendEntry);
 
   rawBlockBytes @10 :UInt32;
-  outputFingerprintsForTwoLabels @11 :Data;
-  outputFingerprintsForHundredLabels @12 :Data;
+  truncatedOutputHashForTwoLabels @11 :Data;
+  truncatedOutputHashForHundredLabels @12 :Data;
 }
 
 struct StoredTweakEntry {
@@ -202,9 +202,9 @@ such as NUMS outputs or P2TR outputs from transactions without a usable Silent P
 It is useful for statistics and implementation checks, but clients do not receive it and do not need it for UID recovery.
 
 Dynamic response filters do not mutate storage. When `cutthrough` or `filter_reuse` is requested, the server derives a 
-response by omitting filtered stored outputs, recomputing every `TweakEntry.outputCount`, and rebuilding the packed fingerprint stream so the response still maps cleanly to the dense fingerprint order.
+response by omitting filtered stored outputs, recomputing every `TweakEntry.outputCount`, and rebuilding the packed truncated output hash stream so the response still maps cleanly to the dense truncated output hash order.
 
-Output fingerprints are selected by the requested label budget. `labels <= 2` serves `outputFingerprintsForTwoLabels`; larger values and omitted `labels` serve `outputFingerprintsForHundredLabels`. The fingerprint bit width is derived from the raw block size and the normalized label budget.
+truncated output hashes are selected by the requested label budget. `labels <= 2` serves `truncatedOutputHashForTwoLabels`; larger values and omitted `labels` serve `truncatedOutputHashForHundredLabels`. The truncated output hash bit width is derived from the raw block size and the normalized label budget.
 
 ## UID semantics
 
@@ -308,27 +308,27 @@ For each response block:
 ```text
 1. Keep firstUid, height, blockHash, previousBlockHash.
 2. Walk tweaks in order.
-3. For each tweak, take the next outputCount entries from the dense fingerprint stream.
-4. For each wallet scan key and each fingerprint in that range, derive the expected output key for that tweak and compute its fingerprint.
-5. Compare the derived fingerprint with the response fingerprint.
+3. For each tweak, take the next outputCount entries from the dense truncated output hash stream.
+4. For each wallet scan key and each truncated output hash in that range, derive the expected output key for that tweak and compute its truncated output hash.
+5. Compare the derived truncated output hash with the response truncated output hash.
 6. Treat a match as a candidate and download the full Bitcoin block for confirmation.
 ```
 
 Pseudocode:
 
 ```text
-fingerprints = unpack_fixed_width_bits(block.outputFingerprints, block.outputFingerprintBits)
+truncatedOutputHashes = unpack_fixed_width_bits(block.truncatedOutputHash, block.truncatedOutputHashBits)
 output_index = 0
 
 for tweak in block.tweaks:
   range_start = output_index
   range_end = output_index + tweak.outputCount
 
-  for fingerprint in fingerprints[range_start..range_end]:
+  for truncatedOutputHash in truncatedOutputHashes[range_start..range_end]:
     for scan_key in wallet.scan_keys:
       candidate_key = derive_silent_payment_output_key(scan_key, tweak.tweak)
-      candidate_fingerprint = fingerprint(candidate_key, block.blockHash, block.outputFingerprintBits)
-      if candidate_fingerprint == fingerprint:
+      candidate_truncated_output_hash = truncatedOutputHash(candidate_key, block.blockHash, block.truncatedOutputHashBits)
+      if candidate_truncated_output_hash == truncated_output_hash:
         mark_candidate(block.height, block.blockHash, tweak, candidate_key)
 
   output_index = range_end
@@ -506,7 +506,7 @@ count                 requested block count, capped by server max_range_count
 cutthrough=true       use start as the cut-through boundary
 cutthrough_start=H    explicit cut-through boundary; preferred for resumed sync
 filter_reuse=true     omit outputs marked reused in storage
-labels=N              labels <= 2 returns the two-label fingerprint stream; omitted/larger uses hundred-label
+labels=N              labels <= 2 returns the two-label truncated_output_hash stream; omitted/larger uses hundred-label
 max_bytes=N           per-request response byte cap, capped by server max_response_bytes
 ```
 
@@ -579,8 +579,8 @@ These invariants should hold for every encoded response block:
 blockHash.len() == 32
 previousBlockHash.len() == 32
 all TweakEntry.tweak values are 32 bytes
-outputFingerprintBits == 0 when sum(tweaks.outputCount) == 0
-ceil(sum(tweaks.outputCount) * outputFingerprintBits / 8) == outputFingerprints.len()
+truncatedOutputHashBits == 0 when sum(tweaks.outputCount) == 0
+ceil(sum(tweaks.outputCount) * truncatedOutputHashBits / 8) == truncatedOutputHash.len()
 skippedTxsForTweaks is sorted and unique
 ```
 
@@ -592,8 +592,8 @@ previousBlockHash.len() == 32
 all StoredOutputEntry.key values are 32 bytes
 all StoredTweakEntry.tweak values are 32 bytes
 sum(tweaks.outputCount) == outputs.len()
-rawBlockBytes is set for fingerprint bit selection
-stored two-label and hundred-label fingerprint streams have expected packed lengths
+rawBlockBytes is set for truncated output hash bit selection
+stored two-label and hundred-label truncated output hash streams have expected packed lengths
 skippedTxsForTweaks is sorted and unique
 skippedOutputs is sorted and unique
 stored P2TR output domain size = outputs.len() + skippedOutputs.len()

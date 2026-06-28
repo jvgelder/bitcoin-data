@@ -6,6 +6,7 @@ use capnp::message::{Builder, HeapAllocator, ReaderOptions};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::io::Cursor;
+use std::sync::OnceLock;
 
 pub const MAX_U16_SECTION_COUNT: usize = u16::MAX as usize;
 pub const STORAGE_OUTPUT_FLAG_REUSED: u8 = 1 << 0;
@@ -39,10 +40,10 @@ pub struct LightBlockInput {
     pub skipped_txs_for_tweaks: Vec<u16>,
     /// One typed entry per dense tweak.
     pub tweaks: Vec<TweakEntryInput>,
-    /// Number of bits in every packed output fingerprint.
-    pub output_fingerprint_bits: u8,
-    /// Packed output fingerprints in dense output order.
-    pub output_fingerprints: Vec<u8>,
+    /// Number of bits in every packed truncated output hash.
+    pub truncated_output_hash_bits: u8,
+    /// Packed truncated output hashes in dense output order.
+    pub truncated_output_hashes: Vec<u8>,
     /// One spent UID per spent indexed output in this block.
     pub spends: Vec<SpendEntryInput>,
 }
@@ -78,10 +79,10 @@ pub struct StoredLightBlockInput {
     pub spends: Vec<StoredSpendEntryInput>,
     /// Raw serialized Bitcoin block size, excluding undo/spenttxouts data.
     pub raw_block_bytes: u32,
-    /// Packed fingerprints for clients with up to two labels.
-    pub output_fingerprints_for_two_labels: Vec<u8>,
-    /// Packed fingerprints for clients with more than two labels.
-    pub output_fingerprints_for_hundred_labels: Vec<u8>,
+    /// Packed truncated output hash for clients with up to two labels.
+    pub truncated_output_hash_for_two_labels: Vec<u8>,
+    /// Packed truncated output hash for clients with more than two labels.
+    pub truncated_output_hash_for_hundred_labels: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -97,14 +98,14 @@ pub struct StoredBlockResponseFilter {
     /// Omit outputs marked with STORAGE_OUTPUT_FLAG_REUSED.
     pub filter_reuse: bool,
     /// Optional requested wallet label budget. `<= 2` serves the two-label
-    /// fingerprint stream; larger or omitted serves the hundred-label stream.
+    /// truncated output hash stream; larger or omitted serves the hundred-label stream.
     pub labels: Option<u16>,
 }
 
 impl StoredLightBlockInput {
     pub fn to_response_input(&self) -> LightBlockInput {
         self.to_response_input_for_labels(None)
-            .expect("stored block should have valid default response fingerprints")
+            .expect("stored block should have valid default response truncated output hash")
     }
 
     pub fn to_response_input_for_labels(
@@ -113,11 +114,11 @@ impl StoredLightBlockInput {
     ) -> anyhow::Result<LightBlockInput> {
         let label_budget = response_label_budget(labels);
         let output_count = self.outputs.len();
-        let output_fingerprint_bits =
-            choose_output_fingerprint_bits(output_count, self.raw_block_bytes, label_budget);
-        let output_fingerprints = match label_budget {
-            RESPONSE_LABEL_BUDGET_TWO => self.output_fingerprints_for_two_labels.clone(),
-            RESPONSE_LABEL_BUDGET_HUNDRED => self.output_fingerprints_for_hundred_labels.clone(),
+        let truncated_output_hash_bits =
+            choose_truncated_output_hash_bits(output_count, self.raw_block_bytes, label_budget);
+        let trunacted_output_hashes = match label_budget {
+            RESPONSE_LABEL_BUDGET_TWO => self.truncated_output_hash_for_two_labels.clone(),
+            RESPONSE_LABEL_BUDGET_HUNDRED => self.truncated_output_hash_for_hundred_labels.clone(),
             _ => unreachable!("label budget is normalized"),
         };
 
@@ -128,8 +129,8 @@ impl StoredLightBlockInput {
             first_uid: self.first_uid,
             skipped_txs_for_tweaks: self.skipped_txs_for_tweaks.clone(),
             tweaks: self.tweaks.clone(),
-            output_fingerprint_bits,
-            output_fingerprints,
+            truncated_output_hash_bits: truncated_output_hash_bits,
+            truncated_output_hashes: trunacted_output_hashes,
             spends: self
                 .spends
                 .iter()
@@ -215,13 +216,13 @@ impl StoredLightBlockInput {
             .collect();
 
         let label_budget = response_label_budget(filter.labels);
-        let output_fingerprint_bits =
-            choose_output_fingerprint_bits(output_keys.len(), self.raw_block_bytes, label_budget);
-        let output_fingerprints = pack_output_fingerprints_from_keys(
-            self.block_hash,
-            output_keys.iter(),
-            output_fingerprint_bits,
-        )?;
+        let truncated_output_hash_bits = choose_truncated_output_hash_bits(
+            output_keys.len(),
+            self.raw_block_bytes,
+            label_budget,
+        );
+        let truncated_output_hashes =
+            pack_truncated_output_hash_from_keys(output_keys.iter(), truncated_output_hash_bits)?;
 
         let response = LightBlockInput {
             height: self.height,
@@ -230,8 +231,8 @@ impl StoredLightBlockInput {
             first_uid: self.first_uid,
             skipped_txs_for_tweaks: skipped_txs_for_tweaks.into_iter().collect(),
             tweaks,
-            output_fingerprint_bits,
-            output_fingerprints,
+            truncated_output_hash_bits,
+            truncated_output_hashes,
             spends,
         };
         validate_light_block_input(&response)?;
@@ -326,8 +327,8 @@ pub fn encode_light_block(input: &LightBlockInput) -> anyhow::Result<Builder<Hea
             t.set_tweak(tx_tweak_payload_bytes(&entry.tweak));
         }
 
-        b.set_output_fingerprint_bits(input.output_fingerprint_bits);
-        b.set_output_fingerprints(&input.output_fingerprints);
+        b.set_truncated_output_hash_bits(input.truncated_output_hash_bits);
+        b.set_truncated_output_hashes(&input.truncated_output_hashes);
 
         let mut spends = b.reborrow().init_spends(input.spends.len() as u32);
         for (i, entry) in input.spends.iter().enumerate() {
@@ -390,8 +391,10 @@ pub fn encode_stored_light_block(
         }
 
         b.set_raw_block_bytes(input.raw_block_bytes);
-        b.set_output_fingerprints_for_two_labels(&input.output_fingerprints_for_two_labels);
-        b.set_output_fingerprints_for_hundred_labels(&input.output_fingerprints_for_hundred_labels);
+        b.set_truncated_output_hash_for_two_labels(&input.truncated_output_hash_for_two_labels);
+        b.set_truncated_output_hash_for_hundred_labels(
+            &input.truncated_output_hash_for_hundred_labels,
+        );
     }
     Ok(msg)
 }
@@ -437,8 +440,8 @@ pub fn decode_light_block(bytes: &[u8]) -> anyhow::Result<LightBlockInput> {
         first_uid: block.get_first_uid(),
         skipped_txs_for_tweaks: read_u16_list(block.get_skipped_txs_for_tweaks()?),
         tweaks,
-        output_fingerprint_bits: block.get_output_fingerprint_bits(),
-        output_fingerprints: block.get_output_fingerprints()?.to_vec(),
+        truncated_output_hash_bits: block.get_truncated_output_hash_bits(),
+        truncated_output_hashes: block.get_truncated_output_hashes()?.to_vec(),
         spends,
     };
     validate_light_block_input(&input)?;
@@ -510,11 +513,11 @@ pub fn decode_stored_light_block(bytes: &[u8]) -> anyhow::Result<StoredLightBloc
         outputs,
         spends,
         raw_block_bytes: block.get_raw_block_bytes(),
-        output_fingerprints_for_two_labels: block
-            .get_output_fingerprints_for_two_labels()?
+        truncated_output_hash_for_two_labels: block
+            .get_truncated_output_hash_for_two_labels()?
             .to_vec(),
-        output_fingerprints_for_hundred_labels: block
-            .get_output_fingerprints_for_hundred_labels()?
+        truncated_output_hash_for_hundred_labels: block
+            .get_truncated_output_hash_for_hundred_labels()?
             .to_vec(),
     };
     validate_stored_light_block_input(&input)?;
@@ -544,26 +547,26 @@ pub fn validate_light_block_input(input: &LightBlockInput) -> anyhow::Result<()>
     validate_sorted_unique_u16(&input.skipped_txs_for_tweaks, "skipped txs for tweaks")?;
 
     let declared_outputs = light_block_output_count(input)?;
-    let expected_fingerprint_len =
-        packed_fingerprint_len(declared_outputs, input.output_fingerprint_bits)?;
+    let expected_truncated_output_hash_len =
+        packed_truncated_output_hash_len(declared_outputs, input.truncated_output_hash_bits)?;
     anyhow::ensure!(
-        expected_fingerprint_len == input.output_fingerprints.len(),
-        "output fingerprint byte length {} does not match expected {} for {} outputs at {} bits",
-        input.output_fingerprints.len(),
-        expected_fingerprint_len,
+        expected_truncated_output_hash_len == input.truncated_output_hashes.len(),
+        "truncated output hash byte length {} does not match expected {} for {} outputs at {} bits",
+        input.truncated_output_hashes.len(),
+        expected_truncated_output_hash_len,
         declared_outputs,
-        input.output_fingerprint_bits
+        input.truncated_output_hash_bits
     );
 
     if declared_outputs == 0 {
         anyhow::ensure!(
-            input.output_fingerprint_bits == 0,
-            "empty output fingerprint stream must use 0 bits"
+            input.truncated_output_hash_bits == 0,
+            "empty truncated output hash stream must use 0 bits"
         );
     } else {
         anyhow::ensure!(
-            input.output_fingerprint_bits > 0,
-            "non-empty output fingerprint stream must use a positive bit width"
+            input.truncated_output_hash_bits > 0,
+            "non-empty truncated output hash stream must use a positive bit width"
         );
     }
 
@@ -598,7 +601,7 @@ pub fn validate_stored_light_block_input(input: &StoredLightBlockInput) -> anyho
     validate_sorted_unique_u16(&input.skipped_outputs, "stored skipped outputs")?;
     validate_stored_p2tr_uid_domain(input.outputs.len(), &input.skipped_outputs)?;
 
-    validate_stored_output_fingerprints(input)?;
+    validate_stored_truncated_output_hashes(input)?;
 
     let response = input.to_response_input_for_labels(None)?;
     validate_light_block_input(&response)?;
@@ -654,8 +657,8 @@ fn validate_stored_p2tr_uid_domain(
 
 pub const RESPONSE_LABEL_BUDGET_TWO: u16 = 2;
 pub const RESPONSE_LABEL_BUDGET_HUNDRED: u16 = 100;
-// "bitcoindata/light-output-fingerprint/v1";
-const OUTPUT_FINGERPRINT_TAG_HASH: [u8; 32] = [
+// "bitcoindata/light-truncated-output-hash/v1";
+const TRUNCATED_OUTPUT_HASH_TAG_HASH: [u8; 32] = [
     0xa0, 0x38, 0xb9, 0x9b, 0xe2, 0x7a, 0x13, 0x6e, 0xa7, 0xbb, 0x51, 0xc9, 0xec, 0x88, 0x71, 0x92,
     0x62, 0x4a, 0x04, 0xe2, 0x41, 0xae, 0x15, 0x2c, 0x20, 0xc7, 0xf2, 0xe6, 0x45, 0x94, 0xcc, 0x5f,
 ];
@@ -673,7 +676,7 @@ pub fn response_label_budget(labels: Option<u16>) -> u16 {
 ///
 /// The factor 4 is the one-more-bit marginal break-even approximation for
 /// packed bits vs expected false full-block download bytes.
-pub fn choose_output_fingerprint_bits(
+pub fn choose_truncated_output_hash_bits(
     output_count: usize,
     raw_block_bytes: u32,
     label_budget: u16,
@@ -693,18 +696,17 @@ pub fn light_block_output_count(input: &LightBlockInput) -> anyhow::Result<usize
     })
 }
 
-pub fn packed_fingerprint_len(output_count: usize, bits: u8) -> anyhow::Result<usize> {
+pub fn packed_truncated_output_hash_len(output_count: usize, bits: u8) -> anyhow::Result<usize> {
     if output_count == 0 || bits == 0 {
         return Ok(0);
     }
     let total_bits = output_count
         .checked_mul(usize::from(bits))
-        .ok_or_else(|| anyhow::anyhow!("output fingerprint bit length overflow"))?;
+        .ok_or_else(|| anyhow::anyhow!("truncated output hash bit length overflow"))?;
     Ok(total_bits.div_ceil(8))
 }
 
-pub fn pack_output_fingerprints_from_keys<'a>(
-    block_hash: BlockHashBytes,
+pub fn pack_truncated_output_hash_from_keys<'a>(
     keys: impl ExactSizeIterator<Item = &'a [u8; 32]>,
     bits: u8,
 ) -> anyhow::Result<Vec<u8>> {
@@ -712,12 +714,12 @@ pub fn pack_output_fingerprints_from_keys<'a>(
         return Ok(Vec::new());
     }
 
-    let mut out = vec![0u8; packed_fingerprint_len(keys.len(), bits)?];
+    let mut out = vec![0u8; packed_truncated_output_hash_len(keys.len(), bits)?];
     let mut out_bit = 0usize;
-    let base_hasher = output_fingerprint_base_hasher(block_hash);
+    let base_hasher = truncated_output_base_hasher();
 
     for key in keys {
-        let digest = output_fingerprint_digest_from_base(&base_hasher, key);
+        let digest = truncated_output_hash_digest_from_base(&base_hasher, key);
         for bit in 0..usize::from(bits) {
             let src = (digest[bit / 8] >> (7 - (bit % 8))) & 1;
             if src != 0 {
@@ -732,53 +734,54 @@ pub fn pack_output_fingerprints_from_keys<'a>(
     Ok(out)
 }
 
-fn output_fingerprint_digest_from_base(base_hasher: &Sha256, key: &[u8; 32]) -> [u8; 32] {
+fn truncated_output_hash_digest_from_base(base_hasher: &Sha256, key: &[u8; 32]) -> [u8; 32] {
     let mut hasher = base_hasher.clone();
     hasher.update(key);
     hasher.finalize().into()
 }
 
-fn output_fingerprint_base_hasher(block_hash: BlockHashBytes) -> Sha256 {
-    let mut hasher = Sha256::new();
-    hasher.update(OUTPUT_FINGERPRINT_TAG_HASH);
-    hasher.update(OUTPUT_FINGERPRINT_TAG_HASH);
-    hasher.update(block_hash.as_bytes());
-    hasher
+fn truncated_output_base_hasher() -> &'static Sha256 {
+    static BASE_HASHER: OnceLock<Sha256> = OnceLock::new();
+    BASE_HASHER.get_or_init(|| {
+        let mut hasher = Sha256::new();
+        hasher.update(TRUNCATED_OUTPUT_HASH_TAG_HASH);
+        hasher.update(TRUNCATED_OUTPUT_HASH_TAG_HASH);
+        hasher
+    })
 }
 
-pub fn build_stored_output_fingerprints(
-    block_hash: BlockHashBytes,
+pub fn build_stored_truncated_output_hashes(
     raw_block_bytes: u32,
     outputs: &[StoredOutputEntryInput],
     label_budget: u16,
 ) -> anyhow::Result<Vec<u8>> {
-    let bits = choose_output_fingerprint_bits(outputs.len(), raw_block_bytes, label_budget);
-    pack_output_fingerprints_from_keys(block_hash, outputs.iter().map(|entry| &entry.key), bits)
+    let bits = choose_truncated_output_hash_bits(outputs.len(), raw_block_bytes, label_budget);
+    pack_truncated_output_hash_from_keys(outputs.iter().map(|entry| &entry.key), bits)
 }
 
-fn validate_stored_output_fingerprints(input: &StoredLightBlockInput) -> anyhow::Result<()> {
-    for (label, label_budget, fingerprints) in [
+fn validate_stored_truncated_output_hashes(input: &StoredLightBlockInput) -> anyhow::Result<()> {
+    for (label, label_budget, truncated_output_hashes) in [
         (
             "two-label",
             RESPONSE_LABEL_BUDGET_TWO,
-            &input.output_fingerprints_for_two_labels,
+            &input.truncated_output_hash_for_two_labels,
         ),
         (
             "hundred-label",
             RESPONSE_LABEL_BUDGET_HUNDRED,
-            &input.output_fingerprints_for_hundred_labels,
+            &input.truncated_output_hash_for_hundred_labels,
         ),
     ] {
-        let bits = choose_output_fingerprint_bits(
+        let bits = choose_truncated_output_hash_bits(
             input.outputs.len(),
             input.raw_block_bytes,
             label_budget,
         );
-        let expected = packed_fingerprint_len(input.outputs.len(), bits)?;
+        let expected = packed_truncated_output_hash_len(input.outputs.len(), bits)?;
         anyhow::ensure!(
-            fingerprints.len() == expected,
-            "stored {label} output fingerprint byte length {} does not match expected {}",
-            fingerprints.len(),
+            truncated_output_hashes.len() == expected,
+            "stored {label} truncated output hash byte length {} does not match expected {}",
+            truncated_output_hashes.len(),
             expected
         );
     }
@@ -840,18 +843,16 @@ mod tests {
                 creation_height: 99,
             }],
             raw_block_bytes: 2_500_000,
-            output_fingerprints_for_two_labels: Vec::new(),
-            output_fingerprints_for_hundred_labels: Vec::new(),
+            truncated_output_hash_for_two_labels: Vec::new(),
+            truncated_output_hash_for_hundred_labels: Vec::new(),
         };
-        stored.output_fingerprints_for_two_labels = build_stored_output_fingerprints(
-            stored.block_hash,
+        stored.truncated_output_hash_for_two_labels = build_stored_truncated_output_hashes(
             stored.raw_block_bytes,
             &stored.outputs,
             RESPONSE_LABEL_BUDGET_TWO,
         )
         .unwrap();
-        stored.output_fingerprints_for_hundred_labels = build_stored_output_fingerprints(
-            stored.block_hash,
+        stored.truncated_output_hash_for_hundred_labels = build_stored_truncated_output_hashes(
             stored.raw_block_bytes,
             &stored.outputs,
             RESPONSE_LABEL_BUDGET_HUNDRED,
@@ -861,13 +862,13 @@ mod tests {
     }
 
     #[test]
-    fn output_fingerprint_uses_bip340_tagged_hash() {
+    fn truncated_output_hash_uses_bip340_tagged_hash() {
         let block_hash = BlockHashBytes::from([1u8; 32]);
         let key = [3u8; 32];
-        const OUTPUT_FINGERPRINT_DOMAIN: &str = "bitcoindata/light-output-fingerprint/v1";
+        const TRUNCATED_OUTPUT_HASH_DOMAIN: &str = "bitcoindata/light-truncated-output-hash/v1";
 
-        let tag_hash: [u8; 32] = Sha256::digest(OUTPUT_FINGERPRINT_DOMAIN.as_bytes()).into();
-        assert_eq!(OUTPUT_FINGERPRINT_TAG_HASH, tag_hash);
+        let tag_hash: [u8; 32] = Sha256::digest(TRUNCATED_OUTPUT_HASH_DOMAIN.as_bytes()).into();
+        assert_eq!(TRUNCATED_OUTPUT_HASH_TAG_HASH, tag_hash);
 
         let mut reference = Sha256::new();
         reference.update(tag_hash);
@@ -877,7 +878,7 @@ mod tests {
         let expected: [u8; 32] = reference.finalize().into();
 
         assert_eq!(
-            output_fingerprint_digest_from_base(&output_fingerprint_base_hasher(block_hash), &key),
+            truncated_output_hash_digest_from_base(&truncated_output_base_hasher(), &key),
             expected
         );
     }
@@ -894,8 +895,8 @@ mod tests {
                 output_count: 1,
                 tweak: TxTweak::from([9u8; 33]),
             }],
-            output_fingerprint_bits: 8,
-            output_fingerprints: vec![3],
+            truncated_output_hash_bits: 8,
+            truncated_output_hashes: vec![3],
             spends: vec![SpendEntryInput { spent_uid: 41 }],
         };
         let msg = encode_light_block(&input).unwrap();
@@ -926,7 +927,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_tweak_output_counts_match_fingerprint_stream() {
+    fn validates_tweak_output_counts_match_truncated_output_hash_stream() {
         let input = LightBlockInput {
             height: 100,
             block_hash: BlockHashBytes::from([1u8; 32]),
@@ -937,8 +938,8 @@ mod tests {
                 output_count: 2,
                 tweak: TxTweak::from([9u8; 33]),
             }],
-            output_fingerprint_bits: 8,
-            output_fingerprints: vec![3],
+            truncated_output_hash_bits: 8,
+            truncated_output_hashes: vec![3],
             spends: vec![],
         };
         assert!(validate_light_block_input(&input).is_err());
@@ -971,18 +972,16 @@ mod tests {
             ],
             spends: vec![],
             raw_block_bytes: 2_500_000,
-            output_fingerprints_for_two_labels: Vec::new(),
-            output_fingerprints_for_hundred_labels: Vec::new(),
+            truncated_output_hash_for_two_labels: Vec::new(),
+            truncated_output_hash_for_hundred_labels: Vec::new(),
         };
-        stored.output_fingerprints_for_two_labels = build_stored_output_fingerprints(
-            stored.block_hash,
+        stored.truncated_output_hash_for_two_labels = build_stored_truncated_output_hashes(
             stored.raw_block_bytes,
             &stored.outputs,
             RESPONSE_LABEL_BUDGET_TWO,
         )
         .unwrap();
-        stored.output_fingerprints_for_hundred_labels = build_stored_output_fingerprints(
-            stored.block_hash,
+        stored.truncated_output_hash_for_hundred_labels = build_stored_truncated_output_hashes(
             stored.raw_block_bytes,
             &stored.outputs,
             RESPONSE_LABEL_BUDGET_HUNDRED,

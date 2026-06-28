@@ -14,12 +14,12 @@ struct LightBlock {
   skippedTxsForTweaks @5 :List(UInt16);
   tweaks @6 :List(TweakEntry);
 
-  # Number of bits in each packed output fingerprint. The server chooses this
+  # Number of bits in each packed truncated output hash. The server chooses this
   # from the stored raw block size and the requested label budget.
-  outputFingerprintBits @7 :UInt8;
-  # Packed output fingerprints in dense output order.
-  # len = ceil(sum(tweak.outputCount) * outputFingerprintBits / 8)
-  outputFingerprints @8 :Data;
+  truncatedOutputHashBits @7 :UInt8;
+  # Packed truncated output hashes in dense output order.
+  # len = ceil(sum(tweak.outputCount) * truncatedOutputHashBits / 8)
+  truncatedOutputHashes @8 :Data;
 
   spends @9 :List(SpendEntry);
 }
@@ -55,10 +55,10 @@ struct StoredLightBlock {
   # Raw serialized Bitcoin block size, excluding undo/spenttxouts data.
   rawBlockBytes @10 :UInt32;
 
-  # Storage-side precomputed response fingerprints for the two public label
+  # Storage-side precomputed response truncated output hashes for the two public label
   # budgets. Full 32-byte keys remain in outputs so this can be regenerated.
-  outputFingerprintsForTwoLabels @11 :Data;
-  outputFingerprintsForHundredLabels @12 :Data;
+  truncatedOutputHashForTwoLabels @11 :Data;
+  truncatedOutputHashForHundredLabels @12 :Data;
 }
 
 struct StoredTweakEntry {

@@ -178,7 +178,7 @@ fn block_stats_row(
     let response_output_count = light_block_output_count(&response)?;
     let estimated_response_full_key_bytes = response_100_bytes
         .len()
-        .saturating_sub(response.output_fingerprints.len())
+        .saturating_sub(response.truncated_output_hashes.len())
         .saturating_add(response_output_count.saturating_mul(32));
 
     let stored_p2tr_output_count = stored.outputs.len() + stored.skipped_outputs.len();
