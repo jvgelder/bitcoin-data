@@ -94,6 +94,10 @@ struct SyncRangeQuery {
     cutthrough: bool,
     /// Explicit cut-through boundary. Takes precedence over `cutthrough=true`.
     cutthrough_start: Option<u64>,
+    /// Explicit cut-through tip. If omitted, the served tip is used and the
+    /// response is not immutable-cacheable because the same URL changes as the
+    /// archive tip advances.
+    cutthrough_tip: Option<u64>,
     /// Omit outputs marked reused in the storage block.
     #[serde(default)]
     filter_reuse: bool,
@@ -228,18 +232,36 @@ async fn block_range(
     let cutthrough_start = q
         .cutthrough_start
         .or_else(|| q.cutthrough.then_some(q.start));
-    if let Some(cutthrough_start) = cutthrough_start {
-        if cutthrough_start > tip.height {
-            return Err(ApiError::bad_request(format!(
-                "cutthrough_start {} is above served tip {}",
-                cutthrough_start, tip.height
-            )));
+    let cutthrough_tip = match cutthrough_start {
+        Some(cutthrough_start) => {
+            if cutthrough_start > tip.height {
+                return Err(ApiError::bad_request(format!(
+                    "cutthrough_start {} is above served tip {}",
+                    cutthrough_start, tip.height
+                )));
+            }
+
+            let cutthrough_tip = q.cutthrough_tip.unwrap_or(tip.height);
+            if cutthrough_tip < cutthrough_start {
+                return Err(ApiError::bad_request(format!(
+                    "cutthrough_tip {} is below cutthrough_start {}",
+                    cutthrough_tip, cutthrough_start
+                )));
+            }
+            if cutthrough_tip > tip.height {
+                return Err(ApiError::bad_request(format!(
+                    "cutthrough_tip {} is above served tip {}",
+                    cutthrough_tip, tip.height
+                )));
+            }
+            Some(cutthrough_tip)
         }
-    }
+        None => None,
+    };
 
     let filter = StoredBlockResponseFilter {
         cutthrough_start,
-        cutthrough_tip: cutthrough_start.map(|_| tip.height),
+        cutthrough_tip,
         filter_reuse: q.filter_reuse,
         labels: q.labels,
     };
@@ -279,7 +301,11 @@ async fn block_range(
     let end = q.start + u64::from(count) - 1;
     let complete = end >= requested_end;
     let next_start = (!complete).then_some(end + 1);
-    let cache_control = cache_control(&manifest, &tip, end);
+    let cache_control = if cutthrough_start.is_some() && q.cutthrough_tip.is_none() {
+        "no-cache"
+    } else {
+        cache_control(&manifest, &tip, end)
+    };
 
     let mut response = match format {
         ResponseFormat::Capnp => {
