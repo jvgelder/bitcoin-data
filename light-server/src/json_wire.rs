@@ -3,7 +3,9 @@
 //! The binary Cap'n Proto payload remains canonical. These helpers decode it
 //! into stable human-readable JSON for debugging only.
 
-use crate::index::{decode_light_block, LightBlockInput};
+use crate::index::{
+    decode_light_block, decode_light_block_spent_ids, LightBlockInput, SpentIdCodec,
+};
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -18,6 +20,10 @@ pub struct JsonLightBlock {
     pub truncated_output_hash_bits: u8,
     pub truncated_output_hash_bytes: usize,
     pub truncated_output_hashes: String,
+    pub spent_id_codec: &'static str,
+    pub spent_count: u32,
+    pub spent_id_bytes: usize,
+    pub spent_ids: String,
     pub spends: Vec<JsonSpendEntry>,
 }
 
@@ -38,6 +44,8 @@ pub fn light_block_to_json(bytes: &[u8]) -> anyhow::Result<JsonLightBlock> {
 
 fn light_block_input_to_json(input: LightBlockInput) -> anyhow::Result<JsonLightBlock> {
     let truncated_output_hash_bytes = input.truncated_output_hashes.len();
+    let spent_id_bytes = input.spent_ids.len();
+    let decoded_spends = decode_light_block_spent_ids(&input)?;
     Ok(JsonLightBlock {
         version: crate::WIRE_VERSION,
         height: input.height,
@@ -56,12 +64,19 @@ fn light_block_input_to_json(input: LightBlockInput) -> anyhow::Result<JsonLight
         truncated_output_hash_bits: input.truncated_output_hash_bits,
         truncated_output_hash_bytes,
         truncated_output_hashes: hex::encode(input.truncated_output_hashes),
-        spends: input
-            .spends
+        spent_id_codec: spent_id_codec_name(input.spent_id_codec),
+        spent_count: input.spent_count,
+        spent_id_bytes,
+        spent_ids: hex::encode(input.spent_ids),
+        spends: decoded_spends
             .into_iter()
-            .map(|entry| JsonSpendEntry {
-                spent_uid: entry.spent_uid,
-            })
+            .map(|spent_uid| JsonSpendEntry { spent_uid })
             .collect(),
     })
+}
+
+fn spent_id_codec_name(codec: SpentIdCodec) -> &'static str {
+    match codec {
+        SpentIdCodec::EliasDeltaAscendingAbsolute => "eliasDeltaAscendingAbsolute",
+    }
 }
