@@ -15,9 +15,9 @@ pub struct JsonLightBlock {
     pub first_uid: u64,
     pub skipped_txs_for_tweaks: Vec<u16>,
     pub tweaks: Vec<JsonTweakEntry>,
-    pub output_fingerprint_bits: u8,
-    pub output_fingerprint_bytes: usize,
-    pub output_fingerprints: String,
+    pub truncated_output_hash_bits: u8,
+    pub truncated_output_hash_bytes: usize,
+    pub truncated_output_hashes: String,
     pub spends: Vec<JsonSpendEntry>,
 }
 
@@ -37,7 +37,7 @@ pub fn light_block_to_json(bytes: &[u8]) -> anyhow::Result<JsonLightBlock> {
 }
 
 fn light_block_input_to_json(input: LightBlockInput) -> anyhow::Result<JsonLightBlock> {
-    let output_fingerprint_bytes = input.output_fingerprints.len();
+    let truncated_output_hash_bytes = input.truncated_output_hashes.len();
     Ok(JsonLightBlock {
         version: crate::WIRE_VERSION,
         height: input.height,
@@ -53,9 +53,9 @@ fn light_block_input_to_json(input: LightBlockInput) -> anyhow::Result<JsonLight
                 tweak: hex::encode(&entry.tweak.as_bytes()[1..]),
             })
             .collect(),
-        output_fingerprint_bits: input.output_fingerprint_bits,
-        output_fingerprint_bytes,
-        output_fingerprints: hex::encode(input.output_fingerprints),
+        truncated_output_hash_bits: input.truncated_output_hash_bits,
+        truncated_output_hash_bytes,
+        truncated_output_hashes: hex::encode(input.truncated_output_hashes),
         spends: input
             .spends
             .into_iter()

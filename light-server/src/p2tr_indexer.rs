@@ -6,7 +6,7 @@
 //! NUMS is handled on input-side BIP352 spend eligibility, not output creation.
 
 use crate::index::{
-    build_stored_output_fingerprints, LightBlockInput, StoredLightBlockInput,
+    build_stored_truncated_output_hashes, LightBlockInput, StoredLightBlockInput,
     StoredOutputEntryInput, StoredSpendEntryInput, StoredTweakEntryInput, TweakEntryInput,
     RESPONSE_LABEL_BUDGET_HUNDRED, RESPONSE_LABEL_BUDGET_TWO, STORAGE_OUTPUT_FLAG_REUSED,
     STORAGE_SPENT_HEIGHT_UNSPENT,
@@ -475,14 +475,12 @@ impl P2trIndexerState {
                 .ok_or_else(|| anyhow::anyhow!("scoped UID overflow"))?;
         }
 
-        let output_fingerprints_for_two_labels = build_stored_output_fingerprints(
-            block.block_hash,
+        let truncated_output_hashes_for_two_labels = build_stored_truncated_output_hashes(
             block.raw_block_bytes,
             &storage_output_entries,
             RESPONSE_LABEL_BUDGET_TWO,
         )?;
-        let output_fingerprints_for_hundred_labels = build_stored_output_fingerprints(
-            block.block_hash,
+        let truncated_output_hashes_for_hundred_labels = build_stored_truncated_output_hashes(
             block.raw_block_bytes,
             &storage_output_entries,
             RESPONSE_LABEL_BUDGET_HUNDRED,
@@ -498,8 +496,8 @@ impl P2trIndexerState {
             outputs: storage_output_entries,
             spends: storage_spends,
             raw_block_bytes: block.raw_block_bytes,
-            output_fingerprints_for_two_labels,
-            output_fingerprints_for_hundred_labels,
+            truncated_output_hash_for_two_labels: truncated_output_hashes_for_two_labels,
+            truncated_output_hash_for_hundred_labels: truncated_output_hashes_for_hundred_labels,
         };
         let light_block = storage_block.to_response_input_for_labels(None)?;
 

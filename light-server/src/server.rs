@@ -97,7 +97,7 @@ struct SyncRangeQuery {
     /// Omit outputs marked reused in the storage block.
     #[serde(default)]
     filter_reuse: bool,
-    /// Requested label budget. `labels <= 2` serves the two-label fingerprint stream;
+    /// Requested label budget. `labels <= 2` serves the two-label truncated output hash stream;
     /// any larger value or omission serves the hundred-label stream.
     labels: Option<u16>,
     /// Optional per-request response byte cap. Must not exceed the server cap.
@@ -106,7 +106,7 @@ struct SyncRangeQuery {
 
 #[derive(Debug, Default, Deserialize)]
 struct SingleBlockQuery {
-    /// Requested label budget. `labels <= 2` serves the two-label fingerprint stream;
+    /// Requested label budget. `labels <= 2` serves the two-label truncated output hash stream;
     /// any larger value or omission serves the hundred-label stream.
     labels: Option<u16>,
 }
