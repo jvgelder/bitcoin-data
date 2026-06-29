@@ -12,24 +12,39 @@ use std::path::{Path, PathBuf};
 
 const CSV_HEADER: &[&str] = &[
     "height",
-    "stored_bytes",
-    "response_bytes_labels100",
-    "response_bytes_labels2",
-    "estimated_response_full_key_bytes",
-    "stored_minus_response100_bytes",
-    "stored_skipped_txs_for_tweaks",
-    "stored_skipped_outputs",
-    "stored_p2tr_output_count",
-    "stored_outputs",
-    "stored_tweaks",
-    "response_outputs",
-    "response_tweaks",
-    "spent_count",
-    "spent_id_list_bytes",
+    "stored_block_capnp_bytes",
+    "response_block_capnp_bytes_labels100",
+    "response_block_capnp_bytes_labels2",
+    "estimated_response_block_bytes_with_full_output_keys_labels100",
+    "stored_block_minus_response_labels100_bytes",
+    "cutthrough_start",
+    "cutthrough_tip",
+    "filter_reuse",
+    "stored_skipped_tx_count_for_tweaks",
+    "response_skipped_tx_count_for_tweaks",
+    "stored_static_skipped_p2tr_output_slots",
+    "stored_total_p2tr_output_slot_count",
+    "stored_indexed_output_count",
+    "response_candidate_output_count",
+    "filtered_omitted_output_count",
+    "stored_tweak_entry_count",
+    "response_tweak_entry_count",
+    "filtered_omitted_tweak_entry_count",
+    "stored_spend_entry_count",
+    "response_spent_id_count",
+    "filtered_omitted_spent_id_count",
+    "response_truncated_output_hash_bits_per_output",
+    "response_truncated_output_hash_data_bytes",
+    "spent_id_codec",
+    "response_spent_ids_data_bytes",
+    "response_spent_ids_naive_u64_list_bytes",
+    "response_spent_ids_naive_u32_list_bytes",
     "spent_id_elias_delta_ascending_absolute_bytes",
-    "spent_id_elias_delta_ascending_absolute_savings_bytes",
+    "spent_id_elias_delta_ascending_absolute_savings_vs_u64_bytes",
+    "spent_id_elias_delta_ascending_absolute_savings_vs_u32_bytes",
     "spent_id_elias_delta_descending_absolute_bytes",
-    "spent_id_elias_delta_descending_absolute_savings_bytes",
+    "spent_id_elias_delta_descending_absolute_savings_vs_u64_bytes",
+    "spent_id_elias_delta_descending_absolute_savings_vs_u32_bytes",
     "spent_id_current_uid_anchor",
     "spent_id_elias_delta_descending_current_anchor_bytes",
     "spent_id_elias_delta_descending_current_anchor_free_savings_bytes",
@@ -209,7 +224,22 @@ fn block_stats_row(
 
     let stored_p2tr_output_count = stored.outputs.len() + stored.skipped_outputs.len();
     let spent_ids = decode_light_block_spent_ids(&response)?;
-    let spent_id_list_bytes = spent_ids.len() * std::mem::size_of::<u64>();
+    anyhow::ensure!(
+        usize::try_from(response.spent_count)? == spent_ids.len(),
+        "response spent_count {} does not match decoded spent IDs {} at block {}",
+        response.spent_count,
+        spent_ids.len(),
+        height
+    );
+
+    let stored_outputs = stored.outputs.len();
+    let response_outputs = response_output_count;
+    let stored_tweaks = stored.tweaks.len();
+    let response_tweaks = response.tweaks.len();
+    let stored_spends = stored.spends.len();
+    let response_spends = spent_ids.len();
+    let spent_id_list_bytes = response_spends * std::mem::size_of::<u64>();
+    let spent_id_list_u32_bytes = response_spends * std::mem::size_of::<u32>();
     let current_uid_anchor = block_current_uid_anchor(stored.first_uid, stored_p2tr_output_count)?;
     let spent_id_stats =
         spent_id_encoding_stats(&spent_ids, current_uid_anchor, cutthrough_uid_anchor)?;
@@ -221,35 +251,54 @@ fn block_stats_row(
         response_2_bytes_len.to_string(),
         estimated_response_full_key_bytes.to_string(),
         (stored_bytes.len() as i64 - response_100_bytes.len() as i64).to_string(),
+        optional_u64(filter.cutthrough_start),
+        optional_u64(filter.cutthrough_tip),
+        filter.filter_reuse.to_string(),
         stored.skipped_txs_for_tweaks.len().to_string(),
+        response.skipped_txs_for_tweaks.len().to_string(),
         stored.skipped_outputs.len().to_string(),
         stored_p2tr_output_count.to_string(),
-        stored.outputs.len().to_string(),
-        stored.tweaks.len().to_string(),
-        response_output_count.to_string(),
-        response.tweaks.len().to_string(),
-        spent_ids.len().to_string(),
+        stored_outputs.to_string(),
+        response_outputs.to_string(),
+        stored_outputs.saturating_sub(response_outputs).to_string(),
+        stored_tweaks.to_string(),
+        response_tweaks.to_string(),
+        stored_tweaks.saturating_sub(response_tweaks).to_string(),
+        stored_spends.to_string(),
+        response_spends.to_string(),
+        stored_spends.saturating_sub(response_spends).to_string(),
+        response.truncated_output_hash_bits.to_string(),
+        response.truncated_output_hashes.len().to_string(),
+        "elias_delta_ascending_absolute".to_string(),
+        response.spent_ids.len().to_string(),
         spent_id_list_bytes.to_string(),
+        spent_id_list_u32_bytes.to_string(),
         spent_id_stats.ascending_absolute_bytes.to_string(),
         byte_savings(spent_id_list_bytes, spent_id_stats.ascending_absolute_bytes).to_string(),
+        byte_savings(spent_id_list_u32_bytes, spent_id_stats.ascending_absolute_bytes).to_string(),
         spent_id_stats.descending_absolute_bytes.to_string(),
         byte_savings(
             spent_id_list_bytes,
             spent_id_stats.descending_absolute_bytes,
         )
-        .to_string(),
+            .to_string(),
+        byte_savings(
+            spent_id_list_u32_bytes,
+            spent_id_stats.descending_absolute_bytes,
+        )
+            .to_string(),
         current_uid_anchor.to_string(),
         spent_id_stats.descending_current_anchor_bytes.to_string(),
         byte_savings(
             spent_id_stats.descending_absolute_bytes,
             spent_id_stats.descending_current_anchor_bytes,
         )
-        .to_string(),
+            .to_string(),
         byte_savings_with_u64_anchor(
             spent_id_stats.descending_absolute_bytes,
             spent_id_stats.descending_current_anchor_bytes,
         )
-        .to_string(),
+            .to_string(),
         optional_u64(spent_id_stats.cutthrough_anchor),
         optional_usize(spent_id_stats.descending_cutthrough_anchor_bytes),
         optional_i64(
