@@ -4,8 +4,8 @@
 
 The current implementation is intentionally small:
 
-- `light-indexer` reads finalized Bitcoin blocks, fetches undo/spent-prevout data when needed, derives Silent Payments 
-scan points, assigns global UIDs in the native-P2TR output domain, writes per-block Cap'n Proto storage payloads, and keeps only indexer working state in RocksDB.
+- `light-indexer` reads finalized Bitcoin blocks, fetches undo/spent-prevout data when needed, derives Silent Payments
+  scan points, assigns global UIDs in the native-P2TR output domain, writes per-block Cap'n Proto storage payloads, and keeps only indexer working state in RocksDB.
 - `light-server` reads the storage payloads, derives compact client response blocks, and serves them over HTTP.
 - `light-archive-stats` walks stored Cap'n Proto blocks, derives response blocks, and appends per-block size/count statistics to a CSV file.
 
@@ -60,7 +60,7 @@ seen key counts:
   P2TR x-only output key -> count
 ```
 
-The outpoint lookup lets the indexer convert a later input prevout into a `spentUid` without keeping a full in-memory UTXO set. 
+The outpoint lookup lets the indexer convert a later input prevout into a `spentUid` without keeping a full in-memory UTXO set.
 The dense stored output index lets the indexer update `spentHeight` for the stored output when the output is spent.
 
 The current internal RocksDB encoding is not part of the client wire protocol. It uses prefixed keys and big-endian numeric fields for stable RocksDB ordering:
@@ -121,9 +121,11 @@ struct LightBlock {
   tweaks @6 :List(TweakEntry);
 
   truncatedOutputHashBits @7 :UInt8;
-  truncatedOutputHash @8 :Data; # packed dense truncated output hashes
+  truncatedOutputHashes @8 :Data; # packed dense truncated output hashes
 
-  spends @9 :List(SpendEntry);
+  spentIdCodec @9 :SpentIdCodec;
+  spentCount @10 :UInt32;
+  spentIds @11 :Data;
 }
 
 struct TweakEntry {
@@ -149,7 +151,7 @@ tweak C outputCount = 5 -> truncatedOutputHashes[5..10]
 Required invariants:
 
 ```text
-ceil(sum(tweaks.outputCount) * truncatedOutputHashBits / 8) == truncatedOutputHash.len()
+ceil(sum(tweaks.outputCount) * truncatedOutputHashBits / 8) == truncatedOutputHashes.len()
 spentIds decodes exactly spentCount UIDs according to spentIdCodec
 ```
 
@@ -159,6 +161,8 @@ spentIds decodes exactly spentCount UIDs according to spentIdCodec
 EliasDelta(first_spent_uid + 1)
 EliasDelta(spent_uid[i] - spent_uid[i - 1])
 ```
+
+Stats over the current archive sample show Elias-delta `spentIds` around 0.74 bytes per spend, versus 8 bytes/spend for a naive `u64` list and 4 bytes/spend for a naive `u32` list. The v1 codec is ascending absolute Elias-delta without an anchor field.
 
 The indexer may represent a scan point internally as a 33-byte compressed public key. The served `TweakEntry.tweak` stores the 32-byte x-coordinate.
 
@@ -206,14 +210,22 @@ struct StoredSpendEntry {
 }
 ```
 
-`StoredLightBlock.skippedOutputs` is storage-only diagnostic metadata. It records native-P2TR output slots omitted at index time, 
-such as NUMS outputs or P2TR outputs from transactions without a usable Silent Payments tweak. 
+`StoredLightBlock.skippedOutputs` is storage-only diagnostic metadata. It records native-P2TR output slots omitted at index time,
+such as NUMS outputs or P2TR outputs from transactions without a usable Silent Payments tweak.
 It is useful for statistics and implementation checks, but clients do not receive it and do not need it for UID recovery.
 
-Dynamic response filters do not mutate storage. When `cutthrough` or `filter_reuse` is requested, the server derives a 
-response by omitting filtered stored outputs, recomputing every `TweakEntry.outputCount`, dropping tweak entries whose filtered output count becomes zero, adding those transaction indexes to `skippedTxsForTweaks`, rebuilding the packed fingerprint stream, and re-encoding retained spent IDs into `spentIds`.
+Dynamic response filters do not mutate storage. When `cutthrough` or `filter_reuse` is requested, the server derives a
+response by omitting filtered stored outputs, recomputing every `TweakEntry.outputCount`, dropping tweak entries whose filtered output count becomes zero, adding those transaction indexes to `skippedTxsForTweaks`, rebuilding the packed truncated output hash stream, and re-encoding retained spent IDs into `spentIds`.
 
-truncated output hashes are selected by the requested label budget. `labels <= 2` serves `truncatedOutputHashForTwoLabels`; larger values and omitted `labels` serve `truncatedOutputHashForHundredLabels`. The truncated output hash bit width is derived from the raw block size and the normalized label budget.
+Truncated output hashes are selected by the requested label budget. `labels <= 2` serves `truncatedOutputHashForTwoLabels`; larger values and omitted `labels` serve `truncatedOutputHashForHundredLabels`. Filtered responses recompute the hash stream from retained output keys.
+
+The bit width is a bandwidth break-even rule rather than an almost-never-collide rule:
+
+```text
+bits = ceil(log2(4 * label_budget * raw_block_bytes))
+```
+
+The factor 4 comes from the one-more-bit marginal trade-off: one more bit costs one bit per candidate output, and saves roughly half of the expected false full-block download cost. A candidate hit already requires a full-block fetch and verification, so the protocol optimizes for expected bandwidth rather than a near-zero collision probability.
 
 ## UID semantics
 
@@ -256,7 +268,7 @@ Missing prevout context
 Eligible input public-key sum is infinity
 ```
 
-Normal no-eligible-input cases are expected and should be logged at debug level. Missing prevouts and infinity sums are 
+Normal no-eligible-input cases are expected and should be logged at debug level. Missing prevouts and infinity sums are
 warnings because they may indicate source or data issues worth investigating.
 
 `StoredLightBlock.skippedOutputs` contains storage-only native-P2TR slot indexes for statically omitted outputs. It is not in the response and should not be used for client UID recovery.
@@ -305,8 +317,8 @@ if x-bitcoindata-range-complete: false
 
 The client repeats until `x-bitcoindata-range-complete: true`. After that it can continue normal incremental sync from the next height above the served tip or the next archive tip it observes.
 
-If a wallet starts after an interrupted sync, it should resume from the last fully processed block height plus one. 
-For birthday cut-through, it should keep using the original `cutthrough_start` until the cut-through catch-up range is complete. 
+If a wallet starts after an interrupted sync, it should resume from the last fully processed block height plus one.
+For birthday cut-through, it should keep using the original `cutthrough_start` until the cut-through catch-up range is complete.
 This prevents a restart from changing which already-spent outputs were removed from earlier responses.
 
 Cut-through and reuse filtering are opt-in. A plain range request returns the unfiltered dense response derived from storage:
@@ -333,7 +345,7 @@ For each response block:
 Pseudocode:
 
 ```text
-truncatedOutputHashes = unpack_fixed_width_bits(block.truncatedOutputHash, block.truncatedOutputHashBits)
+truncatedOutputHashes = unpack_fixed_width_bits(block.truncatedOutputHashes, block.truncatedOutputHashBits)
 output_index = 0
 
 for tweak in block.tweaks:
@@ -343,7 +355,7 @@ for tweak in block.tweaks:
   for truncatedOutputHash in truncatedOutputHashes[range_start..range_end]:
     for scan_key in wallet.scan_keys:
       candidate_key = derive_silent_payment_output_key(scan_key, tweak.tweak)
-      candidate_truncated_output_hash = truncatedOutputHash(candidate_key, block.blockHash, block.truncatedOutputHashBits)
+      candidate_truncated_output_hash = truncatedOutputHash(candidate_key, block.truncatedOutputHashBits)
       if candidate_truncated_output_hash == truncated_output_hash:
         mark_candidate(block.height, block.blockHash, tweak, candidate_key)
 
@@ -511,17 +523,35 @@ curl -H 'Accept: application/octet-stream' \
   'http://127.0.0.1:3000/blocks/light?start=871932&count=1000&cutthrough_start=871932'
 ```
 
-Optional query parameters for `/blocks/light`:
+Optional query parameters for `/blocks/light` and `/blocks/{height}/light` except where noted:
 
 ```text
-start                 required first block height
-count                 requested block count, capped by server max_range_count
-cutthrough=true       use start as the cut-through boundary
+start                 required first block height for /blocks/light
+count                 requested block count for /blocks/light, capped by server max_range_count
+cutthrough=true       use range start as the cut-through boundary; for single-block requests use that block height
 cutthrough_start=H    explicit cut-through boundary; preferred for resumed sync
 cutthrough_tip=H      explicit cut-through tip; omit for current served tip
 filter_reuse=true     omit outputs marked reused in storage
 labels=N              labels <= 2 returns the two-label truncated_output_hash stream; omitted/larger uses hundred-label
-max_bytes=N           per-request response byte cap, capped by server max_response_bytes
+max_bytes=N           per-request range response byte cap, capped by server max_response_bytes; /blocks/light only
+```
+
+The same filter parameters are accepted on `/blocks/{height}/light` for debugging and one-off block inspection:
+
+```bash
+curl -H 'Accept: application/octet-stream' \
+  -o block.capnp \
+  'http://127.0.0.1:3000/blocks/871932/light?cutthrough_start=871932&cutthrough_tip=900000&labels=2'
+```
+
+Cache behavior:
+
+```text
+No cut-through, or cut-through with explicit cutthrough_tip:
+  historical blocks older than finality_depth can be cached immutable
+
+cutthrough_start without explicit cutthrough_tip:
+  response depends on current served tip and uses no-cache
 ```
 
 The current API does not expose `scope`, `profile`, or checkpoint endpoints.
@@ -595,7 +625,7 @@ blockHash.len() == 32
 previousBlockHash.len() == 32
 all TweakEntry.tweak values are 32 bytes
 truncatedOutputHashBits == 0 when sum(tweaks.outputCount) == 0
-ceil(sum(tweaks.outputCount) * truncatedOutputHashBits / 8) == truncatedOutputHash.len()
+ceil(sum(tweaks.outputCount) * truncatedOutputHashBits / 8) == truncatedOutputHashes.len()
 skippedTxsForTweaks is sorted and unique
 ```
 

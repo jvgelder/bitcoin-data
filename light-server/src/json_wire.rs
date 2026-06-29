@@ -24,18 +24,13 @@ pub struct JsonLightBlock {
     pub spent_count: u32,
     pub spent_id_bytes: usize,
     pub spent_ids: String,
-    pub spends: Vec<JsonSpendEntry>,
+    pub decoded_spent_ids: Vec<u64>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct JsonTweakEntry {
     pub output_count: u16,
     pub tweak: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct JsonSpendEntry {
-    pub spent_uid: u64,
 }
 
 pub fn light_block_to_json(bytes: &[u8]) -> anyhow::Result<JsonLightBlock> {
@@ -68,10 +63,7 @@ fn light_block_input_to_json(input: LightBlockInput) -> anyhow::Result<JsonLight
         spent_count: input.spent_count,
         spent_id_bytes,
         spent_ids: hex::encode(input.spent_ids),
-        spends: decoded_spends
-            .into_iter()
-            .map(|spent_uid| JsonSpendEntry { spent_uid })
-            .collect(),
+        decoded_spent_ids: decoded_spends,
     })
 }
 

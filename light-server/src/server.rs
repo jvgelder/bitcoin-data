@@ -110,6 +110,18 @@ struct SyncRangeQuery {
 
 #[derive(Debug, Default, Deserialize)]
 struct SingleBlockQuery {
+    /// Enable cut-through using this block height as the cut-through boundary.
+    #[serde(default)]
+    cutthrough: bool,
+    /// Explicit cut-through boundary. Takes precedence over `cutthrough=true`.
+    cutthrough_start: Option<u64>,
+    /// Explicit cut-through tip. If omitted, the served tip is used and the
+    /// response is not immutable-cacheable because the same URL changes as the
+    /// archive tip advances.
+    cutthrough_tip: Option<u64>,
+    /// Omit outputs marked reused in the storage block.
+    #[serde(default)]
+    filter_reuse: bool,
     /// Requested label budget. `labels <= 2` serves the two-label truncated output hash stream;
     /// any larger value or omission serves the hundred-label stream.
     labels: Option<u16>,
@@ -167,17 +179,21 @@ async fn single_block(
     ensure_height_served(height, &tip)?;
     let manifest = state.archive.manifest().await?;
 
-    let served = state
-        .archive
-        .read_block_filtered(
-            height,
-            StoredBlockResponseFilter {
-                labels: q.labels,
-                ..StoredBlockResponseFilter::default()
-            },
-        )
-        .await?;
-    let cache_control = cache_control(&manifest, &tip, height);
+    let cutthrough_start = q
+        .cutthrough_start
+        .or_else(|| q.cutthrough.then_some(height));
+    let cutthrough_tip = resolve_cutthrough_tip(cutthrough_start, q.cutthrough_tip, &tip)?;
+    ensure_cutthrough_tip_covers_height(cutthrough_tip, height)?;
+    let filter = StoredBlockResponseFilter {
+        cutthrough_start,
+        cutthrough_tip,
+        filter_reuse: q.filter_reuse,
+        labels: q.labels,
+    };
+
+    let served = state.archive.read_block_filtered(height, filter).await?;
+    let cache_control =
+        filtered_cache_control(&manifest, &tip, height, cutthrough_start, q.cutthrough_tip);
     let mut response = match format {
         ResponseFormat::Capnp => binary_response(served.payload, cache_control),
         ResponseFormat::Json => json_response(
@@ -232,32 +248,8 @@ async fn block_range(
     let cutthrough_start = q
         .cutthrough_start
         .or_else(|| q.cutthrough.then_some(q.start));
-    let cutthrough_tip = match cutthrough_start {
-        Some(cutthrough_start) => {
-            if cutthrough_start > tip.height {
-                return Err(ApiError::bad_request(format!(
-                    "cutthrough_start {} is above served tip {}",
-                    cutthrough_start, tip.height
-                )));
-            }
-
-            let cutthrough_tip = q.cutthrough_tip.unwrap_or(tip.height);
-            if cutthrough_tip < cutthrough_start {
-                return Err(ApiError::bad_request(format!(
-                    "cutthrough_tip {} is below cutthrough_start {}",
-                    cutthrough_tip, cutthrough_start
-                )));
-            }
-            if cutthrough_tip > tip.height {
-                return Err(ApiError::bad_request(format!(
-                    "cutthrough_tip {} is above served tip {}",
-                    cutthrough_tip, tip.height
-                )));
-            }
-            Some(cutthrough_tip)
-        }
-        None => None,
-    };
+    let cutthrough_tip = resolve_cutthrough_tip(cutthrough_start, q.cutthrough_tip, &tip)?;
+    ensure_cutthrough_tip_covers_height(cutthrough_tip, requested_end)?;
 
     let filter = StoredBlockResponseFilter {
         cutthrough_start,
@@ -301,11 +293,8 @@ async fn block_range(
     let end = q.start + u64::from(count) - 1;
     let complete = end >= requested_end;
     let next_start = (!complete).then_some(end + 1);
-    let cache_control = if cutthrough_start.is_some() && q.cutthrough_tip.is_none() {
-        "no-cache"
-    } else {
-        cache_control(&manifest, &tip, end)
-    };
+    let cache_control =
+        filtered_cache_control(&manifest, &tip, end, cutthrough_start, q.cutthrough_tip);
 
     let mut response = match format {
         ResponseFormat::Capnp => {
@@ -367,6 +356,68 @@ fn ensure_height_served(height: u64, tip: &ChainTip) -> anyhow::Result<()> {
         tip.height
     );
     Ok(())
+}
+
+fn resolve_cutthrough_tip(
+    cutthrough_start: Option<u64>,
+    cutthrough_tip: Option<u64>,
+    tip: &ChainTip,
+) -> ApiResult<Option<u64>> {
+    let Some(cutthrough_start) = cutthrough_start else {
+        return Ok(None);
+    };
+
+    if cutthrough_start > tip.height {
+        return Err(ApiError::bad_request(format!(
+            "cutthrough_start {} is above served tip {}",
+            cutthrough_start, tip.height
+        )));
+    }
+
+    let cutthrough_tip = cutthrough_tip.unwrap_or(tip.height);
+    if cutthrough_tip < cutthrough_start {
+        return Err(ApiError::bad_request(format!(
+            "cutthrough_tip {} is below cutthrough_start {}",
+            cutthrough_tip, cutthrough_start
+        )));
+    }
+    if cutthrough_tip > tip.height {
+        return Err(ApiError::bad_request(format!(
+            "cutthrough_tip {} is above served tip {}",
+            cutthrough_tip, tip.height
+        )));
+    }
+
+    Ok(Some(cutthrough_tip))
+}
+
+fn ensure_cutthrough_tip_covers_height(
+    cutthrough_tip: Option<u64>,
+    required_height: u64,
+) -> ApiResult<()> {
+    if let Some(cutthrough_tip) = cutthrough_tip {
+        if cutthrough_tip < required_height {
+            return Err(ApiError::bad_request(format!(
+                "cutthrough_tip {} is below required response height {}",
+                cutthrough_tip, required_height
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn filtered_cache_control(
+    manifest: &Manifest,
+    tip: &ChainTip,
+    height: u64,
+    cutthrough_start: Option<u64>,
+    requested_cutthrough_tip: Option<u64>,
+) -> &'static str {
+    if cutthrough_start.is_some() && requested_cutthrough_tip.is_none() {
+        "no-cache"
+    } else {
+        cache_control(manifest, tip, height)
+    }
 }
 
 fn cache_control(manifest: &Manifest, tip: &ChainTip, height: u64) -> &'static str {
@@ -489,4 +540,75 @@ fn add_range_headers(response: &mut Response, info: RangeHeaderInfo) -> anyhow::
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tip(height: u64) -> ChainTip {
+        ChainTip {
+            height,
+            block_hash: hex::encode([0u8; 32]),
+        }
+    }
+
+    fn manifest(tip_height: u64) -> Manifest {
+        Manifest {
+            version: WIRE_VERSION,
+            network: "regtest".to_string(),
+            genesis_hash: None,
+            finality_depth: 6,
+            suggested_reorg_cache_depth: 100,
+            max_range_count: 1000,
+            tip: Some(tip(tip_height)),
+        }
+    }
+
+    #[test]
+    fn resolves_cutthrough_tip_with_explicit_value() {
+        let resolved = resolve_cutthrough_tip(Some(100), Some(150), &tip(200)).unwrap();
+        assert_eq!(resolved, Some(150));
+    }
+
+    #[test]
+    fn rejects_cutthrough_tip_below_start() {
+        let err = resolve_cutthrough_tip(Some(100), Some(99), &tip(200)).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn rejects_cutthrough_tip_above_served_tip() {
+        let err = resolve_cutthrough_tip(Some(100), Some(201), &tip(200)).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn rejects_cutthrough_tip_below_required_response_height() {
+        let err = ensure_cutthrough_tip_covers_height(Some(150), 151).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn accepts_cutthrough_tip_at_required_response_height() {
+        ensure_cutthrough_tip_covers_height(Some(151), 151).unwrap();
+    }
+
+    #[test]
+    fn implicit_cutthrough_tip_is_dynamic_cache() {
+        let manifest = manifest(200);
+        assert_eq!(
+            filtered_cache_control(&manifest, &tip(200), 100, Some(50), None),
+            "no-cache"
+        );
+    }
+
+    #[test]
+    fn explicit_cutthrough_tip_uses_normal_cache_rules() {
+        let manifest = manifest(200);
+        assert_eq!(
+            filtered_cache_control(&manifest, &tip(200), 100, Some(50), Some(200)),
+            "public, max-age=31536000, immutable"
+        );
+    }
 }
