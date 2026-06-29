@@ -42,17 +42,6 @@ const CSV_HEADER: &[&str] = &[
     "spent_id_elias_delta_ascending_absolute_bytes",
     "spent_id_elias_delta_ascending_absolute_savings_vs_u64_bytes",
     "spent_id_elias_delta_ascending_absolute_savings_vs_u32_bytes",
-    "spent_id_elias_delta_descending_absolute_bytes",
-    "spent_id_elias_delta_descending_absolute_savings_vs_u64_bytes",
-    "spent_id_elias_delta_descending_absolute_savings_vs_u32_bytes",
-    "spent_id_current_uid_anchor",
-    "spent_id_elias_delta_descending_current_anchor_bytes",
-    "spent_id_elias_delta_descending_current_anchor_free_savings_bytes",
-    "spent_id_elias_delta_descending_current_anchor_with_u64_savings_bytes",
-    "spent_id_cutthrough_uid_anchor",
-    "spent_id_elias_delta_descending_cutthrough_anchor_bytes",
-    "spent_id_elias_delta_descending_cutthrough_anchor_free_savings_bytes",
-    "spent_id_elias_delta_descending_cutthrough_anchor_with_u64_savings_bytes",
 ];
 
 #[derive(Debug, Parser)]
@@ -125,27 +114,11 @@ fn main() -> anyhow::Result<()> {
         filter_reuse: args.filter_reuse,
         labels: None,
     };
-    let cutthrough_uid_anchor = match args.cutthrough_start {
-        Some(cutthrough_start) => {
-            let path = blocks_dir.join(format!("{cutthrough_start:010}.capnp"));
-            let stored_bytes = fs::read(&path).with_context(|| {
-                format!(
-                    "failed to read cut-through start block {} at {}",
-                    cutthrough_start,
-                    path.display()
-                )
-            })?;
-            let stored = decode_stored_light_block(&stored_bytes)?;
-            Some(stored.first_uid.saturating_sub(1))
-        }
-        None => None,
-    };
-
     let mut csv = open_csv(&args.csv, args.truncate)?;
     let mut rows = 0usize;
     for height in heights {
         let path = blocks_dir.join(format!("{height:010}.capnp"));
-        let row = block_stats_row(height, &path, filter, cutthrough_uid_anchor)
+        let row = block_stats_row(height, &path, filter)
             .with_context(|| format!("failed to process block {} at {}", height, path.display()))?;
         writeln!(csv, "{row}")?;
         rows += 1;
@@ -200,7 +173,6 @@ fn block_stats_row(
     height: u64,
     path: &Path,
     filter: StoredBlockResponseFilter,
-    cutthrough_uid_anchor: Option<u64>,
 ) -> anyhow::Result<String> {
     let stored_bytes = fs::read(path)?;
     let stored = decode_stored_light_block(&stored_bytes)?;
@@ -240,9 +212,7 @@ fn block_stats_row(
     let response_spends = spent_ids.len();
     let spent_id_list_bytes = response_spends * std::mem::size_of::<u64>();
     let spent_id_list_u32_bytes = response_spends * std::mem::size_of::<u32>();
-    let current_uid_anchor = block_current_uid_anchor(stored.first_uid, stored_p2tr_output_count)?;
-    let spent_id_stats =
-        spent_id_encoding_stats(&spent_ids, current_uid_anchor, cutthrough_uid_anchor)?;
+    let spent_id_stats = spent_id_encoding_stats(&spent_ids)?;
 
     let row = [
         height.to_string(),
@@ -275,44 +245,11 @@ fn block_stats_row(
         spent_id_list_u32_bytes.to_string(),
         spent_id_stats.ascending_absolute_bytes.to_string(),
         byte_savings(spent_id_list_bytes, spent_id_stats.ascending_absolute_bytes).to_string(),
-        byte_savings(spent_id_list_u32_bytes, spent_id_stats.ascending_absolute_bytes).to_string(),
-        spent_id_stats.descending_absolute_bytes.to_string(),
-        byte_savings(
-            spent_id_list_bytes,
-            spent_id_stats.descending_absolute_bytes,
-        )
-            .to_string(),
         byte_savings(
             spent_id_list_u32_bytes,
-            spent_id_stats.descending_absolute_bytes,
+            spent_id_stats.ascending_absolute_bytes,
         )
-            .to_string(),
-        current_uid_anchor.to_string(),
-        spent_id_stats.descending_current_anchor_bytes.to_string(),
-        byte_savings(
-            spent_id_stats.descending_absolute_bytes,
-            spent_id_stats.descending_current_anchor_bytes,
-        )
-            .to_string(),
-        byte_savings_with_u64_anchor(
-            spent_id_stats.descending_absolute_bytes,
-            spent_id_stats.descending_current_anchor_bytes,
-        )
-            .to_string(),
-        optional_u64(spent_id_stats.cutthrough_anchor),
-        optional_usize(spent_id_stats.descending_cutthrough_anchor_bytes),
-        optional_i64(
-            spent_id_stats
-                .descending_cutthrough_anchor_bytes
-                .map(|bytes| byte_savings(spent_id_stats.descending_absolute_bytes, bytes)),
-        ),
-        optional_i64(
-            spent_id_stats
-                .descending_cutthrough_anchor_bytes
-                .map(|bytes| {
-                    byte_savings_with_u64_anchor(spent_id_stats.descending_absolute_bytes, bytes)
-                }),
-        ),
+        .to_string(),
     ];
     Ok(row.join(","))
 }
@@ -328,30 +265,11 @@ fn packed_response_bytes(response: &LightBlockInput) -> anyhow::Result<Vec<u8>> 
 #[derive(Debug, Default)]
 struct SpentIdEncodingStats {
     ascending_absolute_bytes: usize,
-    descending_absolute_bytes: usize,
-    descending_current_anchor_bytes: usize,
-    cutthrough_anchor: Option<u64>,
-    descending_cutthrough_anchor_bytes: Option<usize>,
 }
 
-fn spent_id_encoding_stats(
-    spent_ids: &[u64],
-    current_uid_anchor: u64,
-    cutthrough_uid_anchor: Option<u64>,
-) -> anyhow::Result<SpentIdEncodingStats> {
-    let descending_cutthrough_anchor_bytes = cutthrough_uid_anchor
-        .map(|anchor| spent_id_elias_delta_descending_anchor_bytes(spent_ids, anchor))
-        .transpose()?;
-
+fn spent_id_encoding_stats(spent_ids: &[u64]) -> anyhow::Result<SpentIdEncodingStats> {
     Ok(SpentIdEncodingStats {
         ascending_absolute_bytes: spent_id_elias_delta_ascending_absolute_bytes(spent_ids)?,
-        descending_absolute_bytes: spent_id_elias_delta_descending_absolute_bytes(spent_ids)?,
-        descending_current_anchor_bytes: spent_id_elias_delta_descending_anchor_bytes(
-            spent_ids,
-            current_uid_anchor,
-        )?,
-        cutthrough_anchor: cutthrough_uid_anchor,
-        descending_cutthrough_anchor_bytes,
     })
 }
 
@@ -385,101 +303,10 @@ fn spent_id_elias_delta_ascending_absolute_bytes(spent_ids: &[u64]) -> anyhow::R
     Ok(encode_elias_delta_values(&encoded_values)?.len())
 }
 
-fn spent_id_elias_delta_descending_absolute_bytes(spent_ids: &[u64]) -> anyhow::Result<usize> {
-    if spent_ids.is_empty() {
-        return Ok(0);
-    }
-
-    let mut ids = spent_ids.to_vec();
-    ids.sort_unstable_by(|a, b| b.cmp(a));
-
-    let mut encoded_values = Vec::with_capacity(ids.len());
-    let mut prev: Option<u64> = None;
-    for uid in ids {
-        let value = match prev {
-            None => uid
-                .checked_add(1)
-                .context("spent uid overflow while Elias-delta encoding first value")?,
-            Some(prev_uid) => prev_uid
-                .checked_sub(uid)
-                .context("spent ids not sorted while descending delta encoding")?,
-        };
-        anyhow::ensure!(
-            value > 0,
-            "duplicate spent uid {uid} cannot be Elias-delta encoded as a positive delta"
-        );
-        encoded_values.push(value);
-        prev = Some(uid);
-    }
-
-    Ok(encode_elias_delta_values(&encoded_values)?.len())
-}
-
-fn spent_id_elias_delta_descending_anchor_bytes(
-    spent_ids: &[u64],
-    anchor: u64,
-) -> anyhow::Result<usize> {
-    if spent_ids.is_empty() {
-        return Ok(0);
-    }
-
-    let mut ids = spent_ids.to_vec();
-    ids.sort_unstable_by(|a, b| b.cmp(a));
-
-    let mut encoded_values = Vec::with_capacity(ids.len());
-    let mut prev: Option<u64> = None;
-    for uid in ids {
-        let value = match prev {
-            None => anchor
-                .checked_sub(uid)
-                .and_then(|offset| offset.checked_add(1))
-                .with_context(|| {
-                    format!("spent uid {uid} exceeds anchor {anchor} while Elias-delta encoding")
-                })?,
-            Some(prev_uid) => prev_uid
-                .checked_sub(uid)
-                .context("spent ids not sorted while descending anchor delta encoding")?,
-        };
-        anyhow::ensure!(
-            value > 0,
-            "duplicate spent uid {uid} cannot be Elias-delta encoded as a positive delta"
-        );
-        encoded_values.push(value);
-        prev = Some(uid);
-    }
-
-    Ok(encode_elias_delta_values(&encoded_values)?.len())
-}
-
-fn block_current_uid_anchor(first_uid: u64, p2tr_output_count: usize) -> anyhow::Result<u64> {
-    if p2tr_output_count == 0 {
-        return first_uid
-            .checked_sub(1)
-            .context("first uid must be positive when deriving empty-block UID anchor");
-    }
-
-    first_uid
-        .checked_add(u64::try_from(p2tr_output_count)?)
-        .and_then(|next_uid| next_uid.checked_sub(1))
-        .context("block current UID anchor overflow")
-}
-
 fn byte_savings(before: usize, after: usize) -> i64 {
     before as i64 - after as i64
 }
 
-fn byte_savings_with_u64_anchor(before: usize, after: usize) -> i64 {
-    before as i64 - after as i64 - std::mem::size_of::<u64>() as i64
-}
-
 fn optional_u64(value: Option<u64>) -> String {
-    value.map(|value| value.to_string()).unwrap_or_default()
-}
-
-fn optional_usize(value: Option<usize>) -> String {
-    value.map(|value| value.to_string()).unwrap_or_default()
-}
-
-fn optional_i64(value: Option<i64>) -> String {
     value.map(|value| value.to_string()).unwrap_or_default()
 }

@@ -215,7 +215,7 @@ impl StoredLightBlockInput {
         let (spent_count, spent_ids) = encode_spent_ids_elias_delta_ascending_absolute(
             self.spends
                 .iter()
-                .filter(|spend| !should_omit_stored_spend(spend, filter))
+                .filter(|spend| !should_omit_stored_spend(self.height, spend, filter))
                 .map(|spend| spend.spent_uid),
         )?;
 
@@ -298,12 +298,16 @@ fn should_omit_stored_output(
 }
 
 fn should_omit_stored_spend(
+    block_height: u64,
     spend: &StoredSpendEntryInput,
     filter: StoredBlockResponseFilter,
 ) -> bool {
-    filter
-        .cutthrough_start
-        .is_some_and(|start| u64::from(spend.creation_height) >= start)
+    let Some(cutthrough_start) = filter.cutthrough_start else {
+        return false;
+    };
+    let cutthrough_tip = filter.cutthrough_tip.unwrap_or(u64::MAX);
+
+    block_height <= cutthrough_tip && u64::from(spend.creation_height) >= cutthrough_start
 }
 
 pub fn encode_light_block(input: &LightBlockInput) -> anyhow::Result<Builder<HeapAllocator>> {
@@ -813,7 +817,7 @@ pub fn pack_truncated_output_hash_from_keys<'a>(
 
     let mut out = vec![0u8; packed_truncated_output_hash_len(keys.len(), bits)?];
     let mut out_bit = 0usize;
-    let tagged_hasher = truncated_output_hash_base_hasher();
+    let tagged_hasher = truncated_output_hash_hasher();
 
     for key in keys {
         let digest = tagged_hasher.digest_32(key);
@@ -832,7 +836,7 @@ pub fn pack_truncated_output_hash_from_keys<'a>(
     Ok(out)
 }
 
-fn truncated_output_hash_base_hasher() -> &'static TaggedSha256 {
+fn truncated_output_hash_hasher() -> &'static TaggedSha256 {
     static HASHER: OnceLock<TaggedSha256> = OnceLock::new();
     HASHER.get_or_init(|| TaggedSha256::from_tag_hash(TRUNCATED_OUTPUT_HASH_TAG_HASH))
 }
@@ -961,13 +965,10 @@ mod tests {
         let mut reference = Sha256::new();
         reference.update(tag_hash);
         reference.update(tag_hash);
-        reference.update(&key);
+        reference.update(key);
         let expected: [u8; 32] = reference.finalize().into();
 
-        assert_eq!(
-            truncated_output_hash_base_hasher().digest_32(&key),
-            expected
-        );
+        assert_eq!(truncated_output_hash_hasher().digest_32(key), expected);
     }
 
     #[test]
@@ -1098,5 +1099,160 @@ mod tests {
             .unwrap();
         assert_eq!(light_block_output_count(&response).unwrap(), 1);
         assert_eq!(response.tweaks[0].output_count, 1);
+    }
+
+    #[test]
+    fn cutthrough_filters_outputs_tweaks_skipped_txs_and_spent_ids() {
+        let mut stored = StoredLightBlockInput {
+            height: 200,
+            block_hash: BlockHashBytes::from([1u8; 32]),
+            previous_block_hash: BlockHashBytes::from([2u8; 32]),
+            first_uid: 1000,
+            skipped_txs_for_tweaks: vec![0],
+            tweaks: vec![
+                TweakEntryInput {
+                    output_count: 2,
+                    tweak: TxTweak::from([9u8; 33]),
+                },
+                TweakEntryInput {
+                    output_count: 1,
+                    tweak: TxTweak::from([8u8; 33]),
+                },
+            ],
+            skipped_outputs: vec![],
+            outputs: vec![
+                StoredOutputEntryInput {
+                    key: [3u8; 32],
+                    spent_height: STORAGE_SPENT_HEIGHT_UNSPENT,
+                    flags: 0,
+                },
+                StoredOutputEntryInput {
+                    key: [4u8; 32],
+                    spent_height: 250,
+                    flags: 0,
+                },
+                StoredOutputEntryInput {
+                    key: [5u8; 32],
+                    spent_height: 210,
+                    flags: 0,
+                },
+            ],
+            spends: vec![
+                StoredSpendEntryInput {
+                    spent_uid: 100,
+                    creation_height: 149,
+                },
+                StoredSpendEntryInput {
+                    spent_uid: 101,
+                    creation_height: 150,
+                },
+            ],
+            raw_block_bytes: 2_500_000,
+            truncated_output_hash_for_two_labels: Vec::new(),
+            truncated_output_hash_for_hundred_labels: Vec::new(),
+        };
+        stored.truncated_output_hash_for_two_labels = build_stored_truncated_output_hashes(
+            stored.raw_block_bytes,
+            &stored.outputs,
+            RESPONSE_LABEL_BUDGET_TWO,
+        )
+        .unwrap();
+        stored.truncated_output_hash_for_hundred_labels = build_stored_truncated_output_hashes(
+            stored.raw_block_bytes,
+            &stored.outputs,
+            RESPONSE_LABEL_BUDGET_HUNDRED,
+        )
+        .unwrap();
+
+        let response = stored
+            .to_filtered_response_input(StoredBlockResponseFilter {
+                cutthrough_start: Some(150),
+                cutthrough_tip: Some(300),
+                labels: Some(RESPONSE_LABEL_BUDGET_TWO),
+                ..StoredBlockResponseFilter::default()
+            })
+            .unwrap();
+
+        assert_eq!(light_block_output_count(&response).unwrap(), 1);
+        assert_eq!(response.tweaks.len(), 1);
+        assert_eq!(response.tweaks[0].output_count, 1);
+        assert_eq!(response.tweaks[0].tweak.as_bytes(), &[9u8; 33]);
+        assert_eq!(response.skipped_txs_for_tweaks, vec![0, 2]);
+        assert_eq!(decode_light_block_spent_ids(&response).unwrap(), vec![100]);
+
+        let expected_bits =
+            choose_truncated_output_hash_bits(1, stored.raw_block_bytes, RESPONSE_LABEL_BUDGET_TWO);
+        let expected_hashes = pack_truncated_output_hash_from_keys(
+            [&stored.outputs[0].key].into_iter(),
+            expected_bits,
+        )
+        .unwrap();
+        assert_eq!(response.truncated_output_hash_bits, expected_bits);
+        assert_eq!(response.truncated_output_hashes, expected_hashes);
+    }
+
+    #[test]
+    fn filtered_response_omits_zero_output_reused_tweak_and_adds_skipped_tx() {
+        let mut stored = StoredLightBlockInput {
+            height: 100,
+            block_hash: BlockHashBytes::from([1u8; 32]),
+            previous_block_hash: BlockHashBytes::from([2u8; 32]),
+            first_uid: 10,
+            skipped_txs_for_tweaks: vec![],
+            tweaks: vec![TweakEntryInput {
+                output_count: 1,
+                tweak: TxTweak::from([9u8; 33]),
+            }],
+            skipped_outputs: vec![],
+            outputs: vec![StoredOutputEntryInput {
+                key: [4u8; 32],
+                spent_height: STORAGE_SPENT_HEIGHT_UNSPENT,
+                flags: STORAGE_OUTPUT_FLAG_REUSED,
+            }],
+            spends: vec![],
+            raw_block_bytes: 2_500_000,
+            truncated_output_hash_for_two_labels: Vec::new(),
+            truncated_output_hash_for_hundred_labels: Vec::new(),
+        };
+        stored.truncated_output_hash_for_two_labels = build_stored_truncated_output_hashes(
+            stored.raw_block_bytes,
+            &stored.outputs,
+            RESPONSE_LABEL_BUDGET_TWO,
+        )
+        .unwrap();
+        stored.truncated_output_hash_for_hundred_labels = build_stored_truncated_output_hashes(
+            stored.raw_block_bytes,
+            &stored.outputs,
+            RESPONSE_LABEL_BUDGET_HUNDRED,
+        )
+        .unwrap();
+
+        let response = stored
+            .to_filtered_response_input(StoredBlockResponseFilter {
+                filter_reuse: true,
+                ..StoredBlockResponseFilter::default()
+            })
+            .unwrap();
+
+        assert_eq!(light_block_output_count(&response).unwrap(), 0);
+        assert!(response.tweaks.is_empty());
+        assert_eq!(response.skipped_txs_for_tweaks, vec![0]);
+        assert_eq!(response.truncated_output_hash_bits, 0);
+        assert!(response.truncated_output_hashes.is_empty());
+    }
+
+    #[test]
+    fn unfiltered_response_uses_precomputed_hashes_and_encoded_spent_ids() {
+        let stored = stored_block_for_test();
+        let response = stored
+            .to_response_input_for_labels(Some(RESPONSE_LABEL_BUDGET_TWO))
+            .unwrap();
+
+        assert_eq!(
+            response.truncated_output_hashes,
+            stored.truncated_output_hash_for_two_labels
+        );
+        assert_eq!(response.spent_count, 1);
+        assert_eq!(decode_light_block_spent_ids(&response).unwrap(), vec![41]);
     }
 }

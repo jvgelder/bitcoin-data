@@ -527,6 +527,7 @@ fn p2tr_output_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::{decode_light_block_spent_ids, light_block_output_count};
 
     fn txid(n: u8) -> TxidBytes {
         [n; 32].into()
@@ -656,14 +657,7 @@ mod tests {
             }],
         };
         let light2 = state.apply_block(block2).unwrap();
-        assert_eq!(
-            light2
-                .spends
-                .iter()
-                .map(|s| s.spent_uid)
-                .collect::<Vec<_>>(),
-            vec![1]
-        );
+        assert_eq!(decode_light_block_spent_ids(&light2).unwrap(), vec![1]);
         assert_eq!(light2.first_uid, 2);
         assert_eq!(state.live_uids_sorted(), vec![2]);
     }

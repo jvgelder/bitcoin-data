@@ -209,3 +209,97 @@ impl crate::storage::ArchiveBackend for FileArchive {
         self.read_block_filtered_with_hash(height, filter)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::{
+        build_stored_truncated_output_hashes, decode_stored_light_block, encode_stored_light_block,
+        to_packed_bytes, StoredLightBlockInput, StoredOutputEntryInput, StoredSpendEntryInput,
+        TweakEntryInput, RESPONSE_LABEL_BUDGET_HUNDRED, RESPONSE_LABEL_BUDGET_TWO,
+        STORAGE_SPENT_HEIGHT_UNSPENT,
+    };
+    use crate::types::{BlockHashBytes, TxTweak};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_archive() -> anyhow::Result<(FileArchive, PathBuf)> {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!("btc-data-light-archive-test-{unique}"));
+        fs::create_dir_all(&root)?;
+        Ok((FileArchive::new(&root), root))
+    }
+
+    fn stored_block(height: u64) -> StoredLightBlockInput {
+        let mut stored = StoredLightBlockInput {
+            height,
+            block_hash: BlockHashBytes::from([1u8; 32]),
+            previous_block_hash: BlockHashBytes::from([2u8; 32]),
+            first_uid: 10,
+            skipped_txs_for_tweaks: vec![],
+            tweaks: vec![TweakEntryInput {
+                output_count: 2,
+                tweak: TxTweak::from([9u8; 33]),
+            }],
+            skipped_outputs: vec![],
+            outputs: vec![
+                StoredOutputEntryInput {
+                    key: [3u8; 32],
+                    spent_height: STORAGE_SPENT_HEIGHT_UNSPENT,
+                    flags: 0,
+                },
+                StoredOutputEntryInput {
+                    key: [4u8; 32],
+                    spent_height: STORAGE_SPENT_HEIGHT_UNSPENT,
+                    flags: 0,
+                },
+            ],
+            spends: vec![StoredSpendEntryInput {
+                spent_uid: 10,
+                creation_height: height as u32,
+            }],
+            raw_block_bytes: 2_500_000,
+            truncated_output_hash_for_two_labels: Vec::new(),
+            truncated_output_hash_for_hundred_labels: Vec::new(),
+        };
+        stored.truncated_output_hash_for_two_labels = build_stored_truncated_output_hashes(
+            stored.raw_block_bytes,
+            &stored.outputs,
+            RESPONSE_LABEL_BUDGET_TWO,
+        )
+        .unwrap();
+        stored.truncated_output_hash_for_hundred_labels = build_stored_truncated_output_hashes(
+            stored.raw_block_bytes,
+            &stored.outputs,
+            RESPONSE_LABEL_BUDGET_HUNDRED,
+        )
+        .unwrap();
+        stored
+    }
+
+    #[test]
+    fn mark_spent_outputs_updates_creation_block_once_per_call() -> anyhow::Result<()> {
+        let (archive, root) = temp_archive()?;
+        let stored = stored_block(100);
+        let bytes = to_packed_bytes(&encode_stored_light_block(&stored)?)?;
+        archive.write_block_bytes(100, &bytes)?;
+
+        let updated = archive.mark_spent_outputs([(100, 1, 250)])?;
+        assert_eq!(updated, 1);
+
+        let stored = decode_stored_light_block(&archive.read_stored_block(100)?)?;
+        assert_eq!(stored.outputs[0].spent_height, STORAGE_SPENT_HEIGHT_UNSPENT);
+        assert_eq!(stored.outputs[1].spent_height, 250);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mark_spent_outputs_skips_missing_creation_blocks() -> anyhow::Result<()> {
+        let (archive, root) = temp_archive()?;
+        let updated = archive.mark_spent_outputs([(999, 0, 250)])?;
+        assert_eq!(updated, 0);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+}

@@ -52,7 +52,7 @@ core/             # shared BlockSource, TipWatcher, block frames, pipeline helpe
 encoding/
   capnp/          # canonical wire format; schema lives here
   raw/            # LEB128 / Elias gamma / CompactSize byte-level primitives
-light-server/     # Silent payment light client server
+light-server/     # Silent Payments light-data indexer/server; see light-server/README.md
 sources/          # JSON-RPC, REST, Esplora, IPC, MultiSource implementations
 stats/            # Bitcoin Stats companion scanner; see stats/README.md
 ```
@@ -144,4 +144,5 @@ See crate-specific READMEs for running binaries and choosing source settings:
 ```text
 sources/Readme.md       source behavior and configuration concepts
 stats/Readme.md         Bitcoin Stats scanner usage
+light-server/README.md  Silent Payments light-data indexer/server protocol and API
 ```
