@@ -12,23 +12,24 @@ struct LightBlock {
   firstUid @4 :UInt64;
 
   skippedTxsForTweaks @5 :List(UInt16);
-  tweaks @6 :List(TweakEntry);
+
+  # Flat tweak stream. The first tweakCount UInt16 values are packed little-endian
+  # in tweakOutputCounts, and txTweaks contains tweakCount consecutive 32-byte
+  # x-coordinate tweak payloads.
+  tweakCount @6 :UInt32;
+  tweakOutputCounts @12 :Data;  # tweakCount * 2 bytes, little-endian UInt16
+  txTweaks @13 :Data;           # tweakCount * 32 bytes
 
   # Number of bits in each packed truncated output hash. The server chooses this
   # from the stored raw block size and the requested label budget.
   truncatedOutputHashBits @7 :UInt8;
   # Packed truncated output hashes in dense output order.
-  # len = ceil(sum(tweak.outputCount) * truncatedOutputHashBits / 8)
+  # len = ceil(sum(tweakOutputCounts) * truncatedOutputHashBits / 8)
   truncatedOutputHashes @8 :Data;
 
   spentIdCodec @9 :SpentIdCodec;
   spentCount @10 :UInt32;
   spentIds @11 :Data;      # Elias-delta encoded spent UIDs.
-}
-
-struct TweakEntry {
-  outputCount @0 :UInt16;
-  tweak @1 :Data;              # 32 bytes
 }
 
 enum SpentIdCodec {

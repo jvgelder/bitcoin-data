@@ -118,7 +118,11 @@ struct LightBlock {
   firstUid @4 :UInt64;
 
   skippedTxsForTweaks @5 :List(UInt16);
-  tweaks @6 :List(TweakEntry);
+
+  # Flat tweak stream.
+  tweakCount @6 :UInt32;
+  tweakOutputCounts @12 :Data; # tweakCount * 2 bytes, little-endian UInt16
+  txTweaks @13 :Data;          # tweakCount * 32 bytes, x-only tweak payloads
 
   truncatedOutputHashBits @7 :UInt8;
   truncatedOutputHashes @8 :Data; # packed dense truncated output hashes
@@ -128,11 +132,6 @@ struct LightBlock {
   spentIds @11 :Data;
 }
 
-struct TweakEntry {
-  outputCount @0 :UInt16;
-  tweak @1 :Data;              # 32-byte x-coordinate of the scan point
-}
-
 enum SpentIdCodec {
   eliasDeltaAscendingAbsolute @0;
 }
@@ -140,18 +139,20 @@ enum SpentIdCodec {
 
 The response has a dense packed truncated output hash stream. It is a candidate-scanning format, not a full reconstruction of every native P2TR output slot.
 
-`TweakEntry.outputCount` always maps to consecutive truncated output hash entries after all static and dynamic filtering:
+Each little-endian `UInt16` value in `tweakOutputCounts` maps the corresponding 32-byte entry in `txTweaks` to consecutive truncated output hash entries after all static and dynamic filtering:
 
 ```text
-tweak A outputCount = 3 -> truncatedOutputHashes[0..3]
-tweak B outputCount = 2 -> truncatedOutputHashes[3..5]
-tweak C outputCount = 5 -> truncatedOutputHashes[5..10]
+txTweaks[0] outputCount = 3 -> truncatedOutputHashes[0..3]
+txTweaks[1] outputCount = 2 -> truncatedOutputHashes[3..5]
+txTweaks[2] outputCount = 5 -> truncatedOutputHashes[5..10]
 ```
 
 Required invariants:
 
 ```text
-ceil(sum(tweaks.outputCount) * truncatedOutputHashBits / 8) == truncatedOutputHashes.len()
+tweakOutputCounts.len() == tweakCount * 2
+txTweaks.len() == tweakCount * 32
+ceil(sum(tweakOutputCounts) * truncatedOutputHashBits / 8) == truncatedOutputHashes.len()
 spentIds decodes exactly spentCount UIDs according to spentIdCodec
 ```
 
@@ -164,7 +165,7 @@ EliasDelta(spent_uid[i] - spent_uid[i - 1])
 
 Stats over the current archive sample show Elias-delta `spentIds` around 0.74 bytes per spend, versus 8 bytes/spend for a naive `u64` list and 4 bytes/spend for a naive `u32` list. The v1 codec is ascending absolute Elias-delta without an anchor field.
 
-The indexer may represent a scan point internally as a 33-byte compressed public key. The served `TweakEntry.tweak` stores the 32-byte x-coordinate.
+The indexer may represent a scan point internally as a 33-byte compressed public key. The served `txTweaks` blob stores only the 32-byte x-coordinate for each tweak. The response uses flat tweak blobs rather than a repeated `TweakEntry` object so the wire format does not pay a per-tweak pointer/alignment cost.
 
 ## Storage format
 
@@ -215,7 +216,7 @@ such as NUMS outputs or P2TR outputs from transactions without a usable Silent P
 It is useful for statistics and implementation checks, but clients do not receive it and do not need it for UID recovery.
 
 Dynamic response filters do not mutate storage. When `cutthrough` or `filter_reuse` is requested, the server derives a
-response by omitting filtered stored outputs, recomputing every `TweakEntry.outputCount`, dropping tweak entries whose filtered output count becomes zero, adding those transaction indexes to `skippedTxsForTweaks`, rebuilding the packed truncated output hash stream, and re-encoding retained spent IDs into `spentIds`.
+response by omitting filtered stored outputs, recomputing every served tweak output count, dropping tweak entries whose filtered output count becomes zero, adding those transaction indexes to `skippedTxsForTweaks`, rebuilding the packed truncated output hash stream, flattening retained tweaks into `tweakOutputCounts`/`txTweaks`, and re-encoding retained spent IDs into `spentIds`.
 
 Truncated output hashes are selected by the requested label budget. `labels <= 2` serves `truncatedOutputHashForTwoLabels`; larger values and omitted `labels` serve `truncatedOutputHashForHundredLabels`. Filtered responses recompute the hash stream from retained output keys.
 
@@ -336,7 +337,7 @@ For each response block:
 ```text
 1. Keep firstUid, height, blockHash, previousBlockHash.
 2. Walk tweaks in order.
-3. For each tweak, take the next outputCount entries from the dense truncated output hash stream.
+3. For each tweak, take the next output count from `tweakOutputCounts` and then consume that many entries from the dense truncated output hash stream.
 4. For each wallet scan key and each truncated output hash in that range, derive the expected output key for that tweak and compute its truncated output hash.
 5. Compare the derived truncated output hash with the response truncated output hash.
 6. Treat a match as a candidate and download the full Bitcoin block for confirmation.
@@ -348,13 +349,13 @@ Pseudocode:
 truncatedOutputHashes = unpack_fixed_width_bits(block.truncatedOutputHashes, block.truncatedOutputHashBits)
 output_index = 0
 
-for tweak in block.tweaks:
+for i in 0..block.tweakCount:
   range_start = output_index
-  range_end = output_index + tweak.outputCount
+  range_end = output_index + block.tweakOutputCounts[i]
 
   for truncatedOutputHash in truncatedOutputHashes[range_start..range_end]:
     for scan_key in wallet.scan_keys:
-      candidate_key = derive_silent_payment_output_key(scan_key, tweak.tweak)
+      candidate_key = derive_silent_payment_output_key(scan_key, block.txTweaks[i])
       candidate_truncated_output_hash = truncatedOutputHash(candidate_key, block.truncatedOutputHashBits)
       if candidate_truncated_output_hash == truncated_output_hash:
         mark_candidate(block.height, block.blockHash, tweak, candidate_key)
@@ -623,9 +624,10 @@ These invariants should hold for every encoded response block:
 ```text
 blockHash.len() == 32
 previousBlockHash.len() == 32
-all TweakEntry.tweak values are 32 bytes
-truncatedOutputHashBits == 0 when sum(tweaks.outputCount) == 0
-ceil(sum(tweaks.outputCount) * truncatedOutputHashBits / 8) == truncatedOutputHashes.len()
+truncatedOutputHashBits == 0 when sum(tweakOutputCounts) == 0
+tweakOutputCounts.len() == tweakCount * 2
+txTweaks.len() == tweakCount * 32
+ceil(sum(tweakOutputCounts) * truncatedOutputHashBits / 8) == truncatedOutputHashes.len()
 skippedTxsForTweaks is sorted and unique
 ```
 

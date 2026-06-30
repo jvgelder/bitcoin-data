@@ -17,8 +17,8 @@ pub const STORAGE_SPENT_HEIGHT_UNSPENT: u32 = u32::MAX;
 pub struct TweakEntryInput {
     /// Number of dense outputs associated with this tweak entry.
     pub output_count: u16,
-    /// Compressed 33-byte scan/tweak point. The served payload stores the
-    /// 32-byte x-coordinate in `TweakEntry.tweak`.
+    /// Compressed 33-byte scan/tweak point. The served response stores the
+    /// 32-byte x-coordinate in the flat `txTweaks` blob.
     pub tweak: TxTweak,
 }
 
@@ -330,12 +330,10 @@ pub fn encode_light_block(input: &LightBlockInput) -> anyhow::Result<Builder<Hea
             skipped_txs.set(i as u32, tx_index);
         }
 
-        let mut tweaks = b.reborrow().init_tweaks(input.tweaks.len() as u32);
-        for (i, entry) in input.tweaks.iter().enumerate() {
-            let mut t = tweaks.reborrow().get(i as u32);
-            t.set_output_count(entry.output_count);
-            t.set_tweak(tx_tweak_payload_bytes(&entry.tweak));
-        }
+        let (tweak_output_counts, tx_tweaks) = encode_flat_tweaks(&input.tweaks);
+        b.set_tweak_count(input.tweaks.len() as u32);
+        b.set_tweak_output_counts(&tweak_output_counts);
+        b.set_tx_tweaks(&tx_tweaks);
 
         b.set_truncated_output_hash_bits(input.truncated_output_hash_bits);
         b.set_truncated_output_hashes(&input.truncated_output_hashes);
@@ -417,17 +415,11 @@ pub fn decode_light_block(bytes: &[u8]) -> anyhow::Result<LightBlockInput> {
         block.get_version()
     );
 
-    let tweak_reader = block.get_tweaks()?;
-    let mut tweaks = Vec::with_capacity(tweak_reader.len() as usize);
-    for i in 0..tweak_reader.len() {
-        let entry = tweak_reader.get(i);
-        let tweak = entry.get_tweak()?;
-        anyhow::ensure!(tweak.len() == 32, "tweak entry {i} is not 32 bytes");
-        tweaks.push(TweakEntryInput {
-            output_count: entry.get_output_count(),
-            tweak: tx_tweak_from_payload_bytes(tweak)?,
-        });
-    }
+    let tweaks = decode_flat_tweaks(
+        block.get_tweak_count(),
+        block.get_tweak_output_counts()?,
+        block.get_tx_tweaks()?,
+    )?;
 
     let spent_id_codec = spent_id_codec_from_capnp(
         block
@@ -880,6 +872,62 @@ fn validate_stored_truncated_output_hashes(input: &StoredLightBlockInput) -> any
     Ok(())
 }
 
+fn encode_flat_tweaks(tweaks: &[TweakEntryInput]) -> (Vec<u8>, Vec<u8>) {
+    let mut output_counts = Vec::with_capacity(tweaks.len() * 2);
+    let mut tx_tweaks = Vec::with_capacity(tweaks.len() * 32);
+
+    for entry in tweaks {
+        output_counts.extend_from_slice(&entry.output_count.to_le_bytes());
+        tx_tweaks.extend_from_slice(tx_tweak_payload_bytes(&entry.tweak));
+    }
+
+    (output_counts, tx_tweaks)
+}
+
+fn decode_flat_tweaks(
+    tweak_count: u32,
+    output_counts: &[u8],
+    tx_tweaks: &[u8],
+) -> anyhow::Result<Vec<TweakEntryInput>> {
+    let tweak_count = usize::try_from(tweak_count)?;
+    let expected_output_count_bytes = tweak_count
+        .checked_mul(2)
+        .ok_or_else(|| anyhow::anyhow!("flat tweak output-count byte length overflow"))?;
+    let expected_tweak_bytes = tweak_count
+        .checked_mul(32)
+        .ok_or_else(|| anyhow::anyhow!("flat tweak payload byte length overflow"))?;
+
+    anyhow::ensure!(
+        output_counts.len() == expected_output_count_bytes,
+        "flat tweak output-count bytes length {} does not match expected {} for {} tweaks",
+        output_counts.len(),
+        expected_output_count_bytes,
+        tweak_count
+    );
+    anyhow::ensure!(
+        tx_tweaks.len() == expected_tweak_bytes,
+        "flat tweak payload bytes length {} does not match expected {} for {} tweaks",
+        tx_tweaks.len(),
+        expected_tweak_bytes,
+        tweak_count
+    );
+
+    let mut tweaks = Vec::with_capacity(tweak_count);
+    for i in 0..tweak_count {
+        let count_offset = i * 2;
+        let output_count =
+            u16::from_le_bytes([output_counts[count_offset], output_counts[count_offset + 1]]);
+        let tweak_offset = i * 32;
+        let tweak = tx_tweak_from_payload_bytes(&tx_tweaks[tweak_offset..tweak_offset + 32])?;
+        tweaks.push(TweakEntryInput {
+            output_count,
+            tweak,
+        });
+    }
+
+    Ok(tweaks)
+}
+
 /// The indexer stores a compressed 33-byte tweak point internally. The served
 /// light block carries only the 32-byte x-coordinate.
 fn tx_tweak_payload_bytes(tweak: &TxTweak) -> &[u8] {
@@ -981,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn encodes_typed_light_block() {
+    fn encodes_typed_light_block_with_flat_tweaks() {
         let input = LightBlockInput {
             height: 100,
             block_hash: BlockHashBytes::from([1u8; 32]),
@@ -1003,6 +1051,27 @@ mod tests {
         let msg = encode_light_block(&input).unwrap();
         let bytes = to_packed_bytes(&msg).unwrap();
         assert!(!bytes.is_empty());
+
+        let mut cursor = Cursor::new(&bytes);
+        let message =
+            capnp::serialize_packed::read_message(&mut cursor, ReaderOptions::new()).unwrap();
+        let block = message.get_root::<light_block::Reader>().unwrap();
+        assert_eq!(block.get_tweak_count(), 1);
+        assert_eq!(block.get_tweak_output_counts().unwrap(), &[1, 0]);
+        assert_eq!(block.get_tx_tweaks().unwrap(), &[9u8; 32]);
+
+        let decoded = decode_light_block(&bytes).unwrap();
+        assert_eq!(decoded.tweaks.len(), 1);
+        assert_eq!(decoded.tweaks[0].output_count, 1);
+        let mut expected_tweak = [9u8; 33];
+        expected_tweak[0] = 0x02;
+        assert_eq!(decoded.tweaks[0].tweak.as_bytes(), &expected_tweak);
+    }
+
+    #[test]
+    fn rejects_malformed_flat_tweak_lengths() {
+        assert!(decode_flat_tweaks(1, &[1], &[9u8; 32]).is_err());
+        assert!(decode_flat_tweaks(1, &[1, 0], &[9u8; 31]).is_err());
     }
 
     #[test]
