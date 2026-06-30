@@ -117,7 +117,8 @@ struct LightBlock {
 
   firstUid @4 :UInt64;
 
-  skippedTxsForTweaks @5 :List(UInt16);
+  txCount @14 :UInt16;
+  skippedTxsForTweaks @5 :Data; # one LSB-first bit per tx; 1 = skipped
 
   # Flat tweak stream.
   tweakCount @6 :UInt32;
@@ -150,6 +151,9 @@ txTweaks[2] outputCount = 5 -> truncatedOutputHashes[5..10]
 Required invariants:
 
 ```text
+skippedTxsForTweaks.len() == ceil(txCount / 8)
+non-zero padding bits after txCount are invalid
+zero bits in skippedTxsForTweaks == tweakCount
 tweakOutputCounts.len() == tweakCount * 2
 txTweaks.len() == tweakCount * 32
 ceil(sum(tweakOutputCounts) * truncatedOutputHashBits / 8) == truncatedOutputHashes.len()
@@ -181,7 +185,8 @@ struct StoredLightBlock {
 
   firstUid @4 :UInt64;
 
-  skippedTxsForTweaks @5 :List(UInt16);
+  txCount @13 :UInt16;
+  skippedTxsForTweaks @5 :Data; # one LSB-first bit per tx; 1 = skipped
   tweaks @6 :List(StoredTweakEntry);
 
   skippedOutputs @7 :List(UInt16); # storage-only static omitted P2TR slots
@@ -216,7 +221,7 @@ such as NUMS outputs or P2TR outputs from transactions without a usable Silent P
 It is useful for statistics and implementation checks, but clients do not receive it and do not need it for UID recovery.
 
 Dynamic response filters do not mutate storage. When `cutthrough` or `filter_reuse` is requested, the server derives a
-response by omitting filtered stored outputs, recomputing every served tweak output count, dropping tweak entries whose filtered output count becomes zero, adding those transaction indexes to `skippedTxsForTweaks`, rebuilding the packed truncated output hash stream, flattening retained tweaks into `tweakOutputCounts`/`txTweaks`, and re-encoding retained spent IDs into `spentIds`.
+response by omitting filtered stored outputs, recomputing every served tweak output count, dropping tweak entries whose filtered output count becomes zero, setting those transaction bits in `skippedTxsForTweaks`, rebuilding the packed truncated output hash stream, flattening retained tweaks into `tweakOutputCounts`/`txTweaks`, and re-encoding retained spent IDs into `spentIds`.
 
 Truncated output hashes are selected by the requested label budget. `labels <= 2` serves `truncatedOutputHashForTwoLabels`; larger values and omitted `labels` serve `truncatedOutputHashForHundredLabels`. Filtered responses recompute the hash stream from retained output keys.
 
@@ -258,7 +263,7 @@ This keeps UID assignment independent of server-side eligibility decisions and d
 
 ## Skipped data
 
-`skippedTxsForTweaks` contains transaction indexes that have native P2TR outputs but no corresponding dense tweak entry.
+`skippedTxsForTweaks` is a bitmap with one bit per original transaction. A `1` bit means no tweak entry is present for that transaction; a `0` bit means the client consumes the next entry from `tweakOutputCounts` and `txTweaks`.
 
 Common skip reasons:
 
@@ -625,10 +630,13 @@ These invariants should hold for every encoded response block:
 blockHash.len() == 32
 previousBlockHash.len() == 32
 truncatedOutputHashBits == 0 when sum(tweakOutputCounts) == 0
+skippedTxsForTweaks.len() == ceil(txCount / 8)
+non-zero padding bits after txCount are invalid
+zero bits in skippedTxsForTweaks == tweakCount
 tweakOutputCounts.len() == tweakCount * 2
 txTweaks.len() == tweakCount * 32
 ceil(sum(tweakOutputCounts) * truncatedOutputHashBits / 8) == truncatedOutputHashes.len()
-skippedTxsForTweaks is sorted and unique
+skippedTxsForTweaks is a canonical LSB-first bitmap with zero padding
 ```
 
 These invariants should hold for every stored block:
@@ -641,7 +649,7 @@ all StoredTweakEntry.tweak values are 32 bytes
 sum(tweaks.outputCount) == outputs.len()
 rawBlockBytes is set for truncated output hash bit selection
 stored two-label and hundred-label truncated output hash streams have expected packed lengths
-skippedTxsForTweaks is sorted and unique
+skippedTxsForTweaks is a canonical LSB-first bitmap with zero padding
 skippedOutputs is sorted and unique
 stored P2TR output domain size = outputs.len() + skippedOutputs.len()
 ```

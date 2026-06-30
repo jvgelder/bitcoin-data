@@ -214,10 +214,10 @@ impl crate::storage::ArchiveBackend for FileArchive {
 mod tests {
     use super::*;
     use crate::index::{
-        build_stored_truncated_output_hashes, decode_stored_light_block, encode_stored_light_block,
-        to_packed_bytes, StoredLightBlockInput, StoredOutputEntryInput, StoredSpendEntryInput,
-        TweakEntryInput, RESPONSE_LABEL_BUDGET_HUNDRED, RESPONSE_LABEL_BUDGET_TWO,
-        STORAGE_SPENT_HEIGHT_UNSPENT,
+        build_stored_truncated_output_hashes, decode_stored_light_block,
+        empty_skipped_txs_for_tweaks_bitmap, encode_stored_light_block, to_packed_bytes,
+        StoredLightBlockInput, StoredOutputEntryInput, StoredSpendEntryInput, TweakEntryInput,
+        RESPONSE_LABEL_BUDGET_HUNDRED, RESPONSE_LABEL_BUDGET_TWO, STORAGE_SPENT_HEIGHT_UNSPENT,
     };
     use crate::types::{BlockHashBytes, TxTweak};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -235,7 +235,8 @@ mod tests {
             block_hash: BlockHashBytes::from([1u8; 32]),
             previous_block_hash: BlockHashBytes::from([2u8; 32]),
             first_uid: 10,
-            skipped_txs_for_tweaks: vec![],
+            tx_count: 1,
+            skipped_txs_for_tweaks: empty_skipped_txs_for_tweaks_bitmap(1).unwrap(),
             tweaks: vec![TweakEntryInput {
                 output_count: 2,
                 tweak: TxTweak::from([9u8; 33]),

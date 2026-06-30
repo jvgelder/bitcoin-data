@@ -11,7 +11,12 @@ struct LightBlock {
 
   firstUid @4 :UInt64;
 
-  skippedTxsForTweaks @5 :List(UInt16);
+  # Number of original transactions covered by skippedTxsForTweaks.
+  txCount @14 :UInt16;
+  # One bit per original transaction, packed LSB-first.
+  # 1 = no tweak entry is present for that tx.
+  # 0 = consume the next flat tweak entry.
+  skippedTxsForTweaks @5 :Data;
 
   # Flat tweak stream. The first tweakCount UInt16 values are packed little-endian
   # in tweakOutputCounts, and txTweaks contains tweakCount consecutive 32-byte
@@ -47,7 +52,12 @@ struct StoredLightBlock {
 
   firstUid @4 :UInt64;
 
-  skippedTxsForTweaks @5 :List(UInt16);
+  # Number of original transactions covered by skippedTxsForTweaks.
+  txCount @13 :UInt16;
+  # One bit per original transaction, packed LSB-first.
+  # 1 = no tweak entry is present for that tx.
+  # 0 = consume the next stored tweak entry.
+  skippedTxsForTweaks @5 :Data;
   tweaks @6 :List(StoredTweakEntry);
 
   skippedOutputs @7 :List(UInt16);

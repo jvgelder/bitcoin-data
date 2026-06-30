@@ -619,10 +619,11 @@ async fn catch_up_ranges(
     let total_elapsed = range_started.elapsed();
 
     let mut totals = BlockScopeStats::default();
+    let mut total_tx_count = 0u64;
     let mut payload_bytes = 0usize;
     for p in &pending {
         let s = &p.applied.stats;
-        totals.tx_count += s.tx_count;
+        total_tx_count += u64::from(s.tx_count);
         totals.output_count_total += s.output_count_total;
         totals.p2tr_output_count += s.p2tr_output_count;
         totals.p2tr_count += s.p2tr_count;
@@ -655,7 +656,7 @@ async fn catch_up_ranges(
         processed_raw_bytes = processed_raw_bytes_since_flush,
         live_raw_bytes = 0usize,
         payload_bytes,
-        txs = totals.tx_count,
+        txs = total_tx_count,
         outputs = totals.output_count_total,
         p2tr_outputs = totals.p2tr_output_count,
         indexed_created = totals.indexed_output_count,
@@ -863,7 +864,6 @@ fn decode_block_frame(
     let mut txs = Vec::with_capacity(block.txdata.len());
 
     for (tx_index, tx) in block.txdata.iter().enumerate() {
-        let tx_index = u32::try_from(tx_index)?;
         let txid = TxidBytes::from(tx.compute_txid().to_byte_array());
 
         let inputs = tx
@@ -903,10 +903,10 @@ fn decode_block_frame(
 
         let silent_payment_tweak =
             compute_sp_tweak_from_undo(tx_index, txid, &inputs, &outputs, spent_txouts)?;
-
+        let index: u16 = tx_index as u16;
         txs.push(TxScanInput {
             txid,
-            tx_index,
+            tx_index: index,
             inputs,
             outputs,
             // Filled directly from Bitcoin Core undo data. Missing undo data is
@@ -925,7 +925,7 @@ fn decode_block_frame(
 }
 
 fn compute_sp_tweak_from_undo(
-    tx_index: u32,
+    tx_index: usize,
     txid: TxidBytes,
     inputs: &[TxInputScan],
     outputs: &[TxOutputScan],
@@ -948,7 +948,7 @@ fn compute_sp_tweak_from_undo(
     // /rest/spenttxouts is emitted with a coinbase slot at index 0.
     // Coinbase has no spent prevouts, so non-coinbase tx_index maps directly
     // to the same index in spent_txouts.txs.
-    let undo_tx_index = usize::try_from(tx_index)?;
+    let undo_tx_index = tx_index;
     let undo_inputs = spent_txouts.txs.get(undo_tx_index).ok_or_else(|| {
         anyhow::anyhow!("spenttxouts missing undo tx entry for tx_index={tx_index}")
     })?;

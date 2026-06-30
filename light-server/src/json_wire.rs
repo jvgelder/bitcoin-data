@@ -15,7 +15,8 @@ pub struct JsonLightBlock {
     pub block_hash: String,
     pub previous_block_hash: String,
     pub first_uid: u64,
-    pub skipped_txs_for_tweaks: Vec<u16>,
+    pub tx_count: u16,
+    pub skipped_txs_for_tweaks_bitmap: String,
     pub tweaks: Vec<JsonTweakEntry>,
     pub truncated_output_hash_bits: u8,
     pub truncated_output_hash_bytes: usize,
@@ -47,7 +48,8 @@ fn light_block_input_to_json(input: LightBlockInput) -> anyhow::Result<JsonLight
         block_hash: hex::encode(input.block_hash.as_bytes()),
         previous_block_hash: hex::encode(input.previous_block_hash.as_bytes()),
         first_uid: input.first_uid,
-        skipped_txs_for_tweaks: input.skipped_txs_for_tweaks,
+        tx_count: input.tx_count,
+        skipped_txs_for_tweaks_bitmap: hex::encode(input.skipped_txs_for_tweaks),
         tweaks: input
             .tweaks
             .into_iter()
