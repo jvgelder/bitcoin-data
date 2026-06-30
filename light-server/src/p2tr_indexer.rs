@@ -6,10 +6,10 @@
 //! NUMS is handled on input-side BIP352 spend eligibility, not output creation.
 
 use crate::index::{
-    build_stored_truncated_output_hashes, LightBlockInput, StoredLightBlockInput,
-    StoredOutputEntryInput, StoredSpendEntryInput, StoredTweakEntryInput, TweakEntryInput,
-    RESPONSE_LABEL_BUDGET_HUNDRED, RESPONSE_LABEL_BUDGET_TWO, STORAGE_OUTPUT_FLAG_REUSED,
-    STORAGE_SPENT_HEIGHT_UNSPENT,
+    build_stored_truncated_output_hashes, empty_skipped_txs_for_tweaks_bitmap,
+    set_skipped_tx_in_bitmap, LightBlockInput, StoredLightBlockInput, StoredOutputEntryInput,
+    StoredSpendEntryInput, StoredTweakEntryInput, TweakEntryInput, RESPONSE_LABEL_BUDGET_HUNDRED,
+    RESPONSE_LABEL_BUDGET_TWO, STORAGE_OUTPUT_FLAG_REUSED, STORAGE_SPENT_HEIGHT_UNSPENT,
 };
 use crate::types::{BlockHashBytes, TxTweak, TxidBytes};
 use serde::{Deserialize, Serialize};
@@ -45,7 +45,7 @@ pub struct ScopedUtxoEntry {
     pub uid: u64,
     pub created_height: u64,
     pub created_block_hash: BlockHashBytes,
-    pub tx_index: u32,
+    pub tx_index: u16,
     /// Dense index in the stored output list for this creation block.
     pub output_index: u32,
     pub value_sat: u64,
@@ -75,7 +75,7 @@ pub struct SpentScopedUtxo {
     pub flags: u8,
     pub spent_height: u64,
     pub spent_block_hash: BlockHashBytes,
-    pub spend_tx_index: u32,
+    pub spend_tx_index: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -105,7 +105,7 @@ pub struct TxOutputScan {
 #[derive(Debug, Clone)]
 pub struct TxScanInput {
     pub txid: TxidBytes,
-    pub tx_index: u32,
+    pub tx_index: u16,
     pub inputs: Vec<TxInputScan>,
     pub outputs: Vec<TxOutputScan>,
     /// BIP352/Blindbit per-transaction tweak. The served block stores its 32-byte x-coordinate.
@@ -126,7 +126,7 @@ pub struct BlockScanInput {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BlockScopeStats {
-    pub tx_count: u32,
+    pub tx_count: u16,
     pub output_count_total: u32,
     pub p2tr_output_count: u32,
     pub p2tr_count: u32,
@@ -324,13 +324,14 @@ impl P2trIndexerState {
         block: BlockScanInput,
     ) -> anyhow::Result<AppliedBlock> {
         let block_first_uid = self.next_uid.saturating_add(1);
+        let tx_count = u16::try_from(block.txs.len())?;
         let mut storage_output_entries = Vec::<StoredOutputEntryInput>::new();
         let mut storage_spends = Vec::<StoredSpendEntryInput>::new();
-        let mut skipped_txs_for_tweaks = Vec::<u16>::new();
+        let mut skipped_txs_for_tweaks = empty_skipped_txs_for_tweaks_bitmap(tx_count)?;
         let mut storage_tx_tweaks = Vec::<StoredTweakEntryInput>::new();
         let mut storage_skipped_outputs = Vec::<u16>::new();
         let mut stats = BlockScopeStats {
-            tx_count: block.txs.len() as u32,
+            tx_count,
             ..Default::default()
         };
         let mut created_utxos = Vec::<CreatedScopedUtxo>::new();
@@ -463,8 +464,12 @@ impl P2trIndexerState {
                     });
                     stats.tweak_count += 1;
                 }
-            } else if tx_has_p2tr_output {
-                skipped_txs_for_tweaks.push(u16::try_from(tx.tx_index)?);
+            } else {
+                // The served response uses a skipped-tx bitmap with one bit per
+                // original transaction. Any transaction without a dense tweak
+                // entry must therefore be marked skipped, including transactions
+                // with no P2TR outputs.
+                set_skipped_tx_in_bitmap(tx_count, &mut skipped_txs_for_tweaks, tx.tx_index)?;
             }
         }
 
@@ -490,6 +495,7 @@ impl P2trIndexerState {
             block_hash: block.block_hash,
             previous_block_hash: block.previous_block_hash,
             first_uid: block_first_uid,
+            tx_count,
             skipped_txs_for_tweaks,
             tweaks: storage_tx_tweaks,
             skipped_outputs: storage_skipped_outputs,
@@ -514,7 +520,7 @@ impl P2trIndexerState {
 fn p2tr_output_identity(
     output: &TxOutputScan,
     height: u64,
-    tx_index: u32,
+    tx_index: u16,
 ) -> anyhow::Result<[u8; 32]> {
     output.p2tr_xonly_key.ok_or_else(|| {
         anyhow::anyhow!(

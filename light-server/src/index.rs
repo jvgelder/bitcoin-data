@@ -5,13 +5,13 @@ use crate::tagged_hash::{TaggedSha256, TRUNCATED_OUTPUT_HASH_TAG_HASH};
 use crate::types::{BlockHashBytes, TxTweak};
 use crate::WIRE_VERSION;
 use capnp::message::{Builder, HeapAllocator, ReaderOptions};
-use std::collections::BTreeSet;
 use std::io::Cursor;
 use std::sync::OnceLock;
 
 pub const MAX_U16_SECTION_COUNT: usize = u16::MAX as usize;
 pub const STORAGE_OUTPUT_FLAG_REUSED: u8 = 1 << 0;
 pub const STORAGE_SPENT_HEIGHT_UNSPENT: u32 = u32::MAX;
+pub const MAX_TX_COUNT_WITH_U16_INDEXES: usize = u16::MAX as usize;
 
 #[derive(Debug, Clone)]
 pub struct TweakEntryInput {
@@ -36,8 +36,11 @@ pub struct LightBlockInput {
     pub previous_block_hash: BlockHashBytes,
     /// First global UID assigned to this block's native-P2TR output domain.
     pub first_uid: u64,
-    /// Tx indexes without a corresponding dense tweak entry.
-    pub skipped_txs_for_tweaks: Vec<u16>,
+    /// Number of original transactions covered by `skipped_txs_for_tweaks`.
+    pub tx_count: u16,
+    /// LSB-first bitmap with one bit per original transaction.
+    /// A set bit means the transaction has no corresponding dense tweak entry.
+    pub skipped_txs_for_tweaks: Vec<u8>,
     /// One typed entry per dense tweak.
     pub tweaks: Vec<TweakEntryInput>,
     /// Number of bits in every packed truncated output hash.
@@ -76,7 +79,10 @@ pub struct StoredLightBlockInput {
     pub block_hash: BlockHashBytes,
     pub previous_block_hash: BlockHashBytes,
     pub first_uid: u64,
-    pub skipped_txs_for_tweaks: Vec<u16>,
+    pub tx_count: u16,
+    /// LSB-first bitmap with one bit per original transaction.
+    /// A set bit means the transaction has no corresponding stored tweak entry.
+    pub skipped_txs_for_tweaks: Vec<u8>,
     pub tweaks: Vec<StoredTweakEntryInput>,
     /// Storage-only static omitted P2TR slots for stats/debugging.
     pub skipped_outputs: Vec<u16>,
@@ -136,6 +142,7 @@ impl StoredLightBlockInput {
             block_hash: self.block_hash,
             previous_block_hash: self.previous_block_hash,
             first_uid: self.first_uid,
+            tx_count: self.tx_count,
             skipped_txs_for_tweaks: self.skipped_txs_for_tweaks.clone(),
             tweaks: self.tweaks.clone(),
             truncated_output_hash_bits,
@@ -157,17 +164,16 @@ impl StoredLightBlockInput {
             return self.to_response_input_for_labels(filter.labels);
         }
 
-        let mut skipped_txs_for_tweaks = self
-            .skipped_txs_for_tweaks
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>();
+        let mut skipped_txs_for_tweaks = self.skipped_txs_for_tweaks.clone();
 
         let mut output_keys = Vec::<[u8; 32]>::new();
         let mut tweaks = Vec::<TweakEntryInput>::new();
         let mut output_cursor = 0usize;
-        let tweak_tx_indexes =
-            derive_stored_tweak_tx_indexes(&self.skipped_txs_for_tweaks, self.tweaks.len())?;
+        let tweak_tx_indexes = derive_stored_tweak_tx_indexes(
+            self.tx_count,
+            &self.skipped_txs_for_tweaks,
+            self.tweaks.len(),
+        )?;
 
         for (tweak, tx_index) in self.tweaks.iter().zip(tweak_tx_indexes) {
             let group_count = usize::from(tweak.output_count);
@@ -202,7 +208,7 @@ impl StoredLightBlockInput {
                     tweak: tweak.tweak,
                 });
             } else {
-                skipped_txs_for_tweaks.insert(tx_index);
+                set_skipped_tx_in_bitmap(self.tx_count, &mut skipped_txs_for_tweaks, tx_index)?;
             }
         }
 
@@ -233,7 +239,8 @@ impl StoredLightBlockInput {
             block_hash: self.block_hash,
             previous_block_hash: self.previous_block_hash,
             first_uid: self.first_uid,
-            skipped_txs_for_tweaks: skipped_txs_for_tweaks.into_iter().collect(),
+            tx_count: self.tx_count,
+            skipped_txs_for_tweaks,
             tweaks,
             truncated_output_hash_bits,
             truncated_output_hashes,
@@ -247,31 +254,122 @@ impl StoredLightBlockInput {
 }
 
 fn derive_stored_tweak_tx_indexes(
-    skipped_txs_for_tweaks: &[u16],
+    tx_count: u16,
+    skipped_txs_for_tweaks: &[u8],
     tweak_count: usize,
 ) -> anyhow::Result<Vec<u16>> {
-    let skipped = skipped_txs_for_tweaks
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
+    validate_skipped_txs_for_tweaks(tx_count, skipped_txs_for_tweaks)?;
+
     let mut indexes = Vec::with_capacity(tweak_count);
-    let mut tx_index = 0u32;
+    let mut tx_index = 0u16;
 
-    while indexes.len() < tweak_count {
-        if tx_index > u32::from(u16::MAX) {
-            anyhow::bail!("stored tweak tx index overflow while deriving ordered tweak indexes");
-        }
-
-        let tx_index_u16 = tx_index as u16;
-        if !skipped.contains(&tx_index_u16) {
-            indexes.push(tx_index_u16);
+    while tx_index < tx_count && indexes.len() < tweak_count {
+        if !is_skipped_tx_in_bitmap(tx_count, skipped_txs_for_tweaks, tx_index)? {
+            indexes.push(tx_index);
         }
         tx_index = tx_index
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("stored tweak tx index overflow"))?;
     }
 
+    anyhow::ensure!(
+        indexes.len() == tweak_count,
+        "tx_count/skipped bitmap does not leave enough non-skipped transactions for stored tweaks"
+    );
+
     Ok(indexes)
+}
+
+fn skipped_tx_bitmap_len(tx_count: u16) -> anyhow::Result<usize> {
+    usize::from(tx_count)
+        .checked_add(7)
+        .map(|bits| bits / 8)
+        .ok_or_else(|| anyhow::anyhow!("skipped tx bitmap length overflow"))
+}
+
+pub fn empty_skipped_txs_for_tweaks_bitmap(tx_count: u16) -> anyhow::Result<Vec<u8>> {
+    Ok(vec![0u8; skipped_tx_bitmap_len(tx_count)?])
+}
+
+pub fn set_skipped_tx_in_bitmap(
+    tx_count: u16,
+    bitmap: &mut [u8],
+    tx_index: u16,
+) -> anyhow::Result<()> {
+    validate_skipped_txs_for_tweaks(tx_count, bitmap)?;
+    anyhow::ensure!(
+        tx_index < tx_count,
+        "skipped tx index {} is outside tx_count {}",
+        tx_index,
+        tx_count
+    );
+    let bit_pos = tx_index as usize;
+    let byte = bit_pos / 8;
+    let shift = bit_pos % 8;
+    bitmap[byte] |= 1 << shift;
+    Ok(())
+}
+
+fn is_skipped_tx_in_bitmap(tx_count: u16, bitmap: &[u8], tx_index: u16) -> anyhow::Result<bool> {
+    validate_skipped_txs_for_tweaks(tx_count, bitmap)?;
+    anyhow::ensure!(
+        tx_index < tx_count,
+        "skipped tx index {} is outside tx_count {}",
+        tx_index,
+        tx_count
+    );
+
+    let bit_pos = tx_index as usize;
+    let byte = bit_pos / 8;
+    let shift = bit_pos % 8;
+    Ok(((bitmap[byte] >> shift) & 1) != 0)
+}
+
+pub fn skipped_txs_for_tweaks_count(tx_count: u16, bitmap: &[u8]) -> anyhow::Result<u16> {
+    validate_skipped_txs_for_tweaks(tx_count, bitmap)?;
+    let mut count = 0u16;
+    for tx_index in 0..tx_count {
+        if is_skipped_tx_in_bitmap(tx_count, bitmap, tx_index)? {
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("skipped tx count overflow"))?;
+        }
+    }
+    Ok(count)
+}
+
+pub fn skipped_txs_for_tweaks_indexes(tx_count: u16, bitmap: &[u8]) -> anyhow::Result<Vec<u16>> {
+    validate_skipped_txs_for_tweaks(tx_count, bitmap)?;
+    let mut skipped = Vec::new();
+    for tx_index in 0..tx_count {
+        if is_skipped_tx_in_bitmap(tx_count, bitmap, tx_index)? {
+            skipped.push(tx_index);
+        }
+    }
+    Ok(skipped)
+}
+
+fn validate_skipped_txs_for_tweaks(tx_count: u16, bitmap: &[u8]) -> anyhow::Result<()> {
+    let expected_len = skipped_tx_bitmap_len(tx_count)?;
+    anyhow::ensure!(
+        bitmap.len() == expected_len,
+        "skipped tx bitmap byte length {} does not match expected {} for tx_count {}",
+        bitmap.len(),
+        expected_len,
+        tx_count
+    );
+
+    let used_bits = usize::from(tx_count) % 8;
+    if used_bits > 0 && !bitmap.is_empty() {
+        let used_mask = (1u8 << used_bits) - 1;
+        let padding_mask = !used_mask;
+        anyhow::ensure!(
+            bitmap[bitmap.len() - 1] & padding_mask == 0,
+            "skipped tx bitmap has non-zero padding bits"
+        );
+    }
+
+    Ok(())
 }
 
 fn should_omit_stored_output(
@@ -322,13 +420,8 @@ pub fn encode_light_block(input: &LightBlockInput) -> anyhow::Result<Builder<Hea
         b.set_block_hash(input.block_hash.as_bytes());
         b.set_previous_block_hash(input.previous_block_hash.as_bytes());
         b.set_first_uid(input.first_uid);
-
-        let mut skipped_txs = b
-            .reborrow()
-            .init_skipped_txs_for_tweaks(input.skipped_txs_for_tweaks.len() as u32);
-        for (i, tx_index) in input.skipped_txs_for_tweaks.iter().copied().enumerate() {
-            skipped_txs.set(i as u32, tx_index);
-        }
+        b.set_tx_count(input.tx_count);
+        b.set_skipped_txs_for_tweaks(&input.skipped_txs_for_tweaks);
 
         let (tweak_output_counts, tx_tweaks) = encode_flat_tweaks(&input.tweaks);
         b.set_tweak_count(input.tweaks.len() as u32);
@@ -358,13 +451,8 @@ pub fn encode_stored_light_block(
         b.set_block_hash(input.block_hash.as_bytes());
         b.set_previous_block_hash(input.previous_block_hash.as_bytes());
         b.set_first_uid(input.first_uid);
-
-        let mut skipped_txs = b
-            .reborrow()
-            .init_skipped_txs_for_tweaks(input.skipped_txs_for_tweaks.len() as u32);
-        for (i, tx_index) in input.skipped_txs_for_tweaks.iter().copied().enumerate() {
-            skipped_txs.set(i as u32, tx_index);
-        }
+        b.set_tx_count(input.tx_count);
+        b.set_skipped_txs_for_tweaks(&input.skipped_txs_for_tweaks);
 
         let mut tweaks = b.reborrow().init_tweaks(input.tweaks.len() as u32);
         for (i, entry) in input.tweaks.iter().enumerate() {
@@ -435,7 +523,8 @@ pub fn decode_light_block(bytes: &[u8]) -> anyhow::Result<LightBlockInput> {
             "previous block hash",
         )?),
         first_uid: block.get_first_uid(),
-        skipped_txs_for_tweaks: read_u16_list(block.get_skipped_txs_for_tweaks()?),
+        tx_count: block.get_tx_count(),
+        skipped_txs_for_tweaks: block.get_skipped_txs_for_tweaks()?.to_vec(),
         tweaks,
         truncated_output_hash_bits: block.get_truncated_output_hash_bits(),
         truncated_output_hashes: block.get_truncated_output_hashes()?.to_vec(),
@@ -458,7 +547,7 @@ pub fn decode_stored_light_block(bytes: &[u8]) -> anyhow::Result<StoredLightBloc
         block.get_version()
     );
 
-    let skipped_txs_for_tweaks = read_u16_list(block.get_skipped_txs_for_tweaks()?);
+    let skipped_txs_for_tweaks = block.get_skipped_txs_for_tweaks()?.to_vec();
     let skipped_outputs = read_u16_list(block.get_skipped_outputs()?);
     let tweak_reader = block.get_tweaks()?;
     let mut tweaks = Vec::with_capacity(tweak_reader.len() as usize);
@@ -506,6 +595,7 @@ pub fn decode_stored_light_block(bytes: &[u8]) -> anyhow::Result<StoredLightBloc
             "stored previous block hash",
         )?),
         first_uid: block.get_first_uid(),
+        tx_count: block.get_tx_count(),
         skipped_txs_for_tweaks,
         tweaks,
         skipped_outputs,
@@ -632,9 +722,17 @@ pub fn decode_light_block_spent_ids(input: &LightBlockInput) -> anyhow::Result<V
 }
 
 pub fn validate_light_block_input(input: &LightBlockInput) -> anyhow::Result<()> {
-    ensure_u16_len("skipped txs for tweaks", input.skipped_txs_for_tweaks.len())?;
+    validate_skipped_txs_for_tweaks(input.tx_count, &input.skipped_txs_for_tweaks)?;
+    let skipped_tx_count =
+        skipped_txs_for_tweaks_count(input.tx_count, &input.skipped_txs_for_tweaks)?;
     ensure_u16_len("tweaks", input.tweaks.len())?;
-    validate_sorted_unique_u16(&input.skipped_txs_for_tweaks, "skipped txs for tweaks")?;
+    anyhow::ensure!(
+        usize::from(input.tx_count) == usize::from(skipped_tx_count) + input.tweaks.len(),
+        "tx_count {} must equal skipped tx count {} plus tweak count {}",
+        input.tx_count,
+        skipped_tx_count,
+        input.tweaks.len()
+    );
 
     let declared_outputs = light_block_output_count(input)?;
     let expected_truncated_output_hash_len =
@@ -684,18 +782,20 @@ pub fn validate_stored_light_block_input(input: &StoredLightBlockInput) -> anyho
         "stored block height {} exceeds u32 range",
         input.height
     );
-    ensure_u16_len(
-        "stored skipped txs for tweaks",
-        input.skipped_txs_for_tweaks.len(),
-    )?;
+    validate_skipped_txs_for_tweaks(input.tx_count, &input.skipped_txs_for_tweaks)?;
+    let skipped_tx_count =
+        skipped_txs_for_tweaks_count(input.tx_count, &input.skipped_txs_for_tweaks)?;
     ensure_u16_len("stored tweaks", input.tweaks.len())?;
+    anyhow::ensure!(
+        usize::from(input.tx_count) == usize::from(skipped_tx_count) + input.tweaks.len(),
+        "stored tx_count {} must equal skipped tx count {} plus tweak count {}",
+        input.tx_count,
+        skipped_tx_count,
+        input.tweaks.len()
+    );
     ensure_u16_len("stored skipped outputs", input.skipped_outputs.len())?;
     ensure_u16_len("stored outputs", input.outputs.len())?;
 
-    validate_sorted_unique_u16(
-        &input.skipped_txs_for_tweaks,
-        "stored skipped txs for tweaks",
-    )?;
     validate_sorted_unique_u16(&input.skipped_outputs, "stored skipped outputs")?;
     validate_stored_p2tr_uid_domain(input.outputs.len(), &input.skipped_outputs)?;
 
@@ -962,13 +1062,25 @@ mod tests {
     use crate::tagged_hash::TRUNCATED_OUTPUT_HASH_TAG_HASH;
     use sha2::{Digest, Sha256};
 
+    fn skipped_txs_for_tweaks_bitmap_from_indexes(
+        tx_count: u16,
+        skipped_txs_for_tweaks: impl IntoIterator<Item = u16>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut bitmap = empty_skipped_txs_for_tweaks_bitmap(tx_count)?;
+        for tx_index in skipped_txs_for_tweaks {
+            set_skipped_tx_in_bitmap(tx_count, &mut bitmap, tx_index)?;
+        }
+        Ok(bitmap)
+    }
+
     fn stored_block_for_test() -> StoredLightBlockInput {
         let mut stored = StoredLightBlockInput {
             height: 100,
             block_hash: BlockHashBytes::from([1u8; 32]),
             previous_block_hash: BlockHashBytes::from([2u8; 32]),
             first_uid: 42,
-            skipped_txs_for_tweaks: vec![0, 3],
+            tx_count: 3,
+            skipped_txs_for_tweaks: skipped_txs_for_tweaks_bitmap_from_indexes(3, [0, 2]).unwrap(),
             tweaks: vec![TweakEntryInput {
                 output_count: 1,
                 tweak: TxTweak::from([9u8; 33]),
@@ -1013,10 +1125,10 @@ mod tests {
         let mut reference = Sha256::new();
         reference.update(tag_hash);
         reference.update(tag_hash);
-        reference.update(key);
+        reference.update(&key);
         let expected: [u8; 32] = reference.finalize().into();
 
-        assert_eq!(truncated_output_hash_hasher().digest_32(key), expected);
+        assert_eq!(truncated_output_hash_hasher().digest_32(&key), expected);
     }
 
     #[test]
@@ -1035,7 +1147,8 @@ mod tests {
             block_hash: BlockHashBytes::from([1u8; 32]),
             previous_block_hash: BlockHashBytes::from([2u8; 32]),
             first_uid: 42,
-            skipped_txs_for_tweaks: vec![0, 3],
+            tx_count: 3,
+            skipped_txs_for_tweaks: skipped_txs_for_tweaks_bitmap_from_indexes(3, [0, 2]).unwrap(),
             tweaks: vec![TweakEntryInput {
                 output_count: 1,
                 tweak: TxTweak::from([9u8; 33]),
@@ -1056,11 +1169,15 @@ mod tests {
         let message =
             capnp::serialize_packed::read_message(&mut cursor, ReaderOptions::new()).unwrap();
         let block = message.get_root::<light_block::Reader>().unwrap();
+        assert_eq!(block.get_tx_count(), 3);
+        assert_eq!(block.get_skipped_txs_for_tweaks().unwrap(), &[0b0000_0101]);
         assert_eq!(block.get_tweak_count(), 1);
         assert_eq!(block.get_tweak_output_counts().unwrap(), &[1, 0]);
         assert_eq!(block.get_tx_tweaks().unwrap(), &[9u8; 32]);
 
         let decoded = decode_light_block(&bytes).unwrap();
+        assert_eq!(decoded.tx_count, 3);
+        assert_eq!(decoded.skipped_txs_for_tweaks, vec![0b0000_0101]);
         assert_eq!(decoded.tweaks.len(), 1);
         assert_eq!(decoded.tweaks[0].output_count, 1);
         let mut expected_tweak = [9u8; 33];
@@ -1072,6 +1189,19 @@ mod tests {
     fn rejects_malformed_flat_tweak_lengths() {
         assert!(decode_flat_tweaks(1, &[1], &[9u8; 32]).is_err());
         assert!(decode_flat_tweaks(1, &[1, 0], &[9u8; 31]).is_err());
+    }
+
+    #[test]
+    fn skipped_txs_for_tweaks_bitmap_roundtrip_and_padding_validation() {
+        let bitmap = skipped_txs_for_tweaks_bitmap_from_indexes(10, [0, 3, 9]).unwrap();
+        assert_eq!(bitmap, vec![0b0000_1001, 0b0000_0010]);
+        assert_eq!(
+            skipped_txs_for_tweaks_indexes(10, &bitmap).unwrap(),
+            vec![0, 3, 9]
+        );
+        assert_eq!(skipped_txs_for_tweaks_count(10, &bitmap).unwrap(), 3);
+
+        assert!(validate_skipped_txs_for_tweaks(10, &[0b0000_1001, 0b1000_0010]).is_err());
     }
 
     #[test]
@@ -1103,7 +1233,8 @@ mod tests {
             block_hash: BlockHashBytes::from([1u8; 32]),
             previous_block_hash: BlockHashBytes::from([2u8; 32]),
             first_uid: 42,
-            skipped_txs_for_tweaks: vec![],
+            tx_count: 1,
+            skipped_txs_for_tweaks: empty_skipped_txs_for_tweaks_bitmap(1).unwrap(),
             tweaks: vec![TweakEntryInput {
                 output_count: 2,
                 tweak: TxTweak::from([9u8; 33]),
@@ -1124,7 +1255,8 @@ mod tests {
             block_hash: BlockHashBytes::from([1u8; 32]),
             previous_block_hash: BlockHashBytes::from([2u8; 32]),
             first_uid: 10,
-            skipped_txs_for_tweaks: vec![0],
+            tx_count: 2,
+            skipped_txs_for_tweaks: skipped_txs_for_tweaks_bitmap_from_indexes(2, [0]).unwrap(),
             tweaks: vec![TweakEntryInput {
                 output_count: 2,
                 tweak: TxTweak::from([9u8; 33]),
@@ -1177,7 +1309,8 @@ mod tests {
             block_hash: BlockHashBytes::from([1u8; 32]),
             previous_block_hash: BlockHashBytes::from([2u8; 32]),
             first_uid: 1000,
-            skipped_txs_for_tweaks: vec![0],
+            tx_count: 3,
+            skipped_txs_for_tweaks: skipped_txs_for_tweaks_bitmap_from_indexes(3, [0]).unwrap(),
             tweaks: vec![
                 TweakEntryInput {
                     output_count: 2,
@@ -1246,7 +1379,7 @@ mod tests {
         assert_eq!(response.tweaks.len(), 1);
         assert_eq!(response.tweaks[0].output_count, 1);
         assert_eq!(response.tweaks[0].tweak.as_bytes(), &[9u8; 33]);
-        assert_eq!(response.skipped_txs_for_tweaks, vec![0, 2]);
+        assert_eq!(response.skipped_txs_for_tweaks, vec![0b0000_0101]);
         assert_eq!(decode_light_block_spent_ids(&response).unwrap(), vec![100]);
 
         let expected_bits =
@@ -1267,7 +1400,8 @@ mod tests {
             block_hash: BlockHashBytes::from([1u8; 32]),
             previous_block_hash: BlockHashBytes::from([2u8; 32]),
             first_uid: 10,
-            skipped_txs_for_tweaks: vec![],
+            tx_count: 1,
+            skipped_txs_for_tweaks: empty_skipped_txs_for_tweaks_bitmap(1).unwrap(),
             tweaks: vec![TweakEntryInput {
                 output_count: 1,
                 tweak: TxTweak::from([9u8; 33]),
@@ -1305,7 +1439,7 @@ mod tests {
 
         assert_eq!(light_block_output_count(&response).unwrap(), 0);
         assert!(response.tweaks.is_empty());
-        assert_eq!(response.skipped_txs_for_tweaks, vec![0]);
+        assert_eq!(response.skipped_txs_for_tweaks, vec![0b0000_0001]);
         assert_eq!(response.truncated_output_hash_bits, 0);
         assert!(response.truncated_output_hashes.is_empty());
     }

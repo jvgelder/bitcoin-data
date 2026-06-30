@@ -2,8 +2,8 @@ use anyhow::Context;
 use btc_data_light_server::codec::elias_delta::encode_elias_delta_values;
 use btc_data_light_server::index::{
     decode_light_block_spent_ids, decode_stored_light_block, encode_light_block,
-    light_block_output_count, to_packed_bytes, LightBlockInput, StoredBlockResponseFilter,
-    RESPONSE_LABEL_BUDGET_HUNDRED, RESPONSE_LABEL_BUDGET_TWO,
+    light_block_output_count, skipped_txs_for_tweaks_count, to_packed_bytes, LightBlockInput,
+    StoredBlockResponseFilter, RESPONSE_LABEL_BUDGET_HUNDRED, RESPONSE_LABEL_BUDGET_TWO,
 };
 use clap::Parser;
 use std::fs::{self, File, OpenOptions};
@@ -22,6 +22,10 @@ const CSV_HEADER: &[&str] = &[
     "filter_reuse",
     "stored_skipped_tx_count_for_tweaks",
     "response_skipped_tx_count_for_tweaks",
+    "stored_skipped_tx_bitmap_bytes",
+    "response_skipped_tx_bitmap_bytes",
+    "response_skipped_tx_u16_list_bytes",
+    "response_skipped_tx_bitmap_savings_vs_u16_list_bytes",
     "stored_static_skipped_p2tr_output_slots",
     "stored_total_p2tr_output_slot_count",
     "stored_indexed_output_count",
@@ -210,8 +214,14 @@ fn block_stats_row(
     let response_tweaks = response.tweaks.len();
     let stored_spends = stored.spends.len();
     let response_spends = spent_ids.len();
-    let spent_id_list_bytes = response_spends * std::mem::size_of::<u64>();
-    let spent_id_list_u32_bytes = response_spends * std::mem::size_of::<u32>();
+    let stored_skipped_tx_count =
+        skipped_txs_for_tweaks_count(stored.tx_count, &stored.skipped_txs_for_tweaks)?;
+    let response_skipped_tx_count: usize =
+        skipped_txs_for_tweaks_count(response.tx_count, &response.skipped_txs_for_tweaks)? as usize;
+    let response_skipped_tx_u16_list_bytes = response_skipped_tx_count * size_of::<u16>();
+    let response_skipped_tx_bitmap_bytes = response.skipped_txs_for_tweaks.len();
+    let spent_id_list_bytes = response_spends * size_of::<u64>();
+    let spent_id_list_u32_bytes = response_spends * size_of::<u32>();
     let spent_id_stats = spent_id_encoding_stats(&spent_ids)?;
 
     let row = [
@@ -224,8 +234,16 @@ fn block_stats_row(
         optional_u64(filter.cutthrough_start),
         optional_u64(filter.cutthrough_tip),
         filter.filter_reuse.to_string(),
+        stored_skipped_tx_count.to_string(),
+        response_skipped_tx_count.to_string(),
         stored.skipped_txs_for_tweaks.len().to_string(),
-        response.skipped_txs_for_tweaks.len().to_string(),
+        response_skipped_tx_bitmap_bytes.to_string(),
+        response_skipped_tx_u16_list_bytes.to_string(),
+        byte_savings(
+            response_skipped_tx_u16_list_bytes,
+            response_skipped_tx_bitmap_bytes,
+        )
+        .to_string(),
         stored.skipped_outputs.len().to_string(),
         stored_p2tr_output_count.to_string(),
         stored_outputs.to_string(),
