@@ -1125,10 +1125,10 @@ mod tests {
         let mut reference = Sha256::new();
         reference.update(tag_hash);
         reference.update(tag_hash);
-        reference.update(&key);
+        reference.update(key);
         let expected: [u8; 32] = reference.finalize().into();
 
-        assert_eq!(truncated_output_hash_hasher().digest_32(&key), expected);
+        assert_eq!(truncated_output_hash_hasher().digest_32(key), expected);
     }
 
     #[test]
