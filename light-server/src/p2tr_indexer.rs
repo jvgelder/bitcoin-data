@@ -148,6 +148,11 @@ pub struct AppliedBlock {
     /// `light_block` responses from it.
     pub storage_block: StoredLightBlockInput,
     pub stats: BlockScopeStats,
+    /// Every native P2TR output key observed in this block, including outputs
+    /// that are statically omitted from the dense SP output stream. Reuse
+    /// tracking is defined over the full P2TR output-key domain, not only over
+    /// indexed outputs.
+    pub seen_p2tr_keys: Vec<[u8; 32]>,
     pub created_utxos: Vec<CreatedScopedUtxo>,
     pub spent_utxos: Vec<SpentScopedUtxo>,
 }
@@ -330,6 +335,7 @@ impl P2trIndexerState {
         let mut skipped_txs_for_tweaks = empty_skipped_txs_for_tweaks_bitmap(tx_count)?;
         let mut storage_tx_tweaks = Vec::<StoredTweakEntryInput>::new();
         let mut storage_skipped_outputs = Vec::<u16>::new();
+        let mut seen_p2tr_keys_for_commit = Vec::<[u8; 32]>::new();
         let mut stats = BlockScopeStats {
             tx_count,
             ..Default::default()
@@ -377,6 +383,7 @@ impl P2trIndexerState {
                     .ok_or_else(|| anyhow::anyhow!("P2TR output count overflow"))?;
 
                 let p2tr_xonly_key = p2tr_output_identity(output, block.height, tx.tx_index)?;
+                seen_p2tr_keys_for_commit.push(p2tr_xonly_key);
                 tx_has_p2tr_output = true;
                 if output.is_nums {
                     stats.p2tr_nums_count += 1;
@@ -511,6 +518,7 @@ impl P2trIndexerState {
             light_block,
             storage_block,
             stats,
+            seen_p2tr_keys: seen_p2tr_keys_for_commit,
             created_utxos,
             spent_utxos,
         })
