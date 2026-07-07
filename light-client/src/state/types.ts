@@ -65,6 +65,12 @@ export interface WalletSpendableUtxo {
   derivedPrivateKey?: string;
 }
 
+export interface DemoState {
+  enabled: boolean;
+  loadedAt?: string;
+  source?: string;
+}
+
 export interface PendingPaymentRequest {
   address: string;
   amountSat?: number;
@@ -120,6 +126,7 @@ export interface WalletTransaction {
   note?: string;
   rawTxHex?: string;
   rbfChangeOutputIndex?: number;
+  demo?: boolean;
 }
 
 export interface WalletSummaryState {
@@ -149,6 +156,7 @@ export interface LightClientState {
   wallet: WalletSummaryState;
   labels: WalletLabel[];
   transactions: WalletTransaction[];
+  demo: DemoState;
   walletOutputs: WalletOutputState[];
   spendableUtxos: WalletSpendableUtxo[];
   events: ClientEvent[];

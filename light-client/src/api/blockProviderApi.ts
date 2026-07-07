@@ -164,6 +164,26 @@ export interface EsploraTransaction {
   vout?: Array<{ value?: number; scriptpubkey?: string; scriptpubkey_address?: string; scriptpubkey_type?: string }>;
 }
 
+export async function fetchDemoTransactionsWithFallback(
+  providers: BlockProviderConfig[],
+  signal?: AbortSignal,
+): Promise<{ providerName: string; transactions: EsploraTransaction[] }> {
+  const errors: string[] = [];
+  for (const provider of providers) {
+    try {
+      const api = new BlockProviderApi(provider);
+      const tipHeight = await api.getTipHeight(signal);
+      const hash = await api.getBlockHashByHeight(Math.max(0, tipHeight - 6), signal);
+      const transactions = await api.getBlockTransactions(hash, signal);
+      return { providerName: provider.name, transactions };
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') throw error;
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+  throw new Error(`All block providers failed demo transaction fetch: ${errors.join('; ')}`);
+}
+
 export async function fetchFeeEstimatesWithFallback(
   providers: BlockProviderConfig[],
   signal?: AbortSignal,

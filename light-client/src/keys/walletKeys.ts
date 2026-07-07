@@ -12,7 +12,7 @@ export interface WalletKeyMaterial {
   scanPublicKeyXOnly?: string;
   descriptor?: string;
   createdAt: string;
-  source: 'generated' | 'imported';
+  source: 'generated' | 'imported' | 'demo';
 }
 
 interface ImportKeyArgs {
@@ -32,7 +32,7 @@ export function generateFullPrivateKeyMaterial(): WalletKeyMaterial {
   return importWalletKeyMaterial({ privateScanKey, privateSpendKey }, 'generated');
 }
 
-export function importWalletKeyMaterial(args: ImportKeyArgs, source: 'generated' | 'imported' = 'imported'): WalletKeyMaterial {
+export function importWalletKeyMaterial(args: ImportKeyArgs, source: 'generated' | 'imported' | 'demo' = 'imported'): WalletKeyMaterial {
   const privateScanKey = normalizeSecretKey(args.privateScanKey, 'private scan key');
   const scanPublicKey = bytesToHex(getPublicKey(hexToBytes(privateScanKey), true));
 

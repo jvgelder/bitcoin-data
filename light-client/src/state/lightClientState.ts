@@ -96,6 +96,7 @@ export const initialLightClientState: LightClientState = {
   wallet: initialWalletState,
   labels: defaultLabels,
   transactions: [],
+  demo: { enabled: false },
   walletOutputs: [],
   spendableUtxos: [],
   events: [],
@@ -411,6 +412,51 @@ export function setSpendableUtxos(state: LightClientState, spendableUtxos: Walle
     wallet: { ...state.wallet, balanceSat: deriveOpenUtxoBalance(spendableUtxos) },
   };
 }
+
+
+export function setDemoMode(
+  state: LightClientState,
+  enabled: boolean,
+  demoData?: { transactions?: WalletTransaction[]; spendableUtxos?: WalletSpendableUtxo[]; labels?: WalletLabel[]; keyMaterial?: WalletKeyMaterial; source?: string },
+): LightClientState {
+  if (!enabled) {
+    const transactions = state.transactions.filter((tx) => !tx.demo);
+    const spendableUtxos = state.spendableUtxos.filter((utxo) => utxo.source !== 'demo');
+    return {
+      ...state,
+      demo: { enabled: false },
+      transactions,
+      spendableUtxos,
+      walletKey: state.walletKey?.source === 'demo' ? undefined : state.walletKey,
+      wallet: state.demo.enabled && state.wallet.setupKind === 'history-import'
+        ? { ...state.wallet, setupComplete: false, setupKind: undefined, importedHistory: false, balanceSat: deriveOpenUtxoBalance(spendableUtxos) }
+        : { ...state.wallet, balanceSat: deriveOpenUtxoBalance(spendableUtxos) },
+      events: addEvent(state.events, 'warning', 'Demo mode disabled'),
+    };
+  }
+
+  const labels = demoData?.labels?.length ? normalizeLabels([...state.labels, ...demoData.labels]) : state.labels;
+  const demoTransactions = demoData?.transactions ?? [];
+  const nonDemoTransactions = state.transactions.filter((tx) => !tx.demo);
+  const demoUtxos = demoData?.spendableUtxos ?? [];
+  const nonDemoUtxos = state.spendableUtxos.filter((utxo) => utxo.source !== 'demo');
+  const spendableUtxos = [...nonDemoUtxos, ...demoUtxos];
+
+  return {
+    ...state,
+    demo: { enabled: true, loadedAt: new Date().toISOString(), source: demoData?.source ?? 'local demo data' },
+    labels,
+    walletKey: state.walletKey ?? demoData?.keyMaterial,
+    transactions: [...demoTransactions, ...nonDemoTransactions],
+    spendableUtxos,
+    wallet: {
+      ...state.wallet,
+      setupComplete: true,
+      setupKind: state.wallet.setupKind ?? 'history-import',
+      importedHistory: true,
+      balanceSat: deriveOpenUtxoBalance(spendableUtxos),
+    },
+    events: addEvent(state.events, 'success', `Demo mode enabled${demoData?.source ? ` using ${demoData.source}` : ''}`),
   };
 }
 

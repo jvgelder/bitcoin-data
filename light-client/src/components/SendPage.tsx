@@ -182,6 +182,13 @@ export function SendPage({ onDone }: { onDone(): void }) {
     try {
       const plan = createPlan();
       if (!plan) return;
+      if (state.demo.enabled) {
+        const demoTx = createUnsignedDemoRawTransaction(plan);
+        recordSentTransaction(demoTx.txid, plan.feeSat, demoTx.rawTxHex, 'Demo send created locally. No network broadcast was attempted.');
+        setMessage({ tone: 'success', text: `Demo transaction created locally: ${demoTx.txid}` });
+        onDone();
+        return;
+      }
       const rawTxHex = signPsbtLocallyOrThrow(plan);
       const result = await broadcastTransactionWithFallback(blockProviders, rawTxHex);
       recordSentTransaction(result.txid, plan.feeSat, rawTxHex);
@@ -239,6 +246,7 @@ export function SendPage({ onDone }: { onDone(): void }) {
       confirmations: 0,
       rawTxHex,
       rbfChangeOutputIndex: rawTxHex ? 1 : undefined,
+      demo: state.demo.enabled || undefined,
       note: noteOverride ?? payment.message,
     };
     actions.addWalletTransaction(tx);

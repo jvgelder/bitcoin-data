@@ -184,6 +184,21 @@ Receive flow:
 
 The `/change` label is not offered as a receive label. It is reserved for wallet change handling.
 
+## Demo mode
+
+Demo mode can be enabled from the start screen or from Settings. It loads a deterministic demo Silent Payment wallet, example transactions, and fake spendable UTXOs so Send, Receive, PSBT display, label-based coin selection, and transaction detail screens can be exercised before the real scanner/import path has produced wallet-owned UTXOs.
+
+In demo mode:
+
+- the transaction list contains clickable sample transactions;
+- Settings can try to fetch a recent Esplora block sample and turn a few public block outputs into fake wallet UTXOs, falling back to local demo examples;
+- Receive shows a valid demo Silent Payment address for the selected label;
+- Send can create unsigned PSBTs from fake UTXOs grouped by wallet label, including UTXOs derived from the downloaded block sample when available;
+- a synthetic unconfirmed RBF transaction spends one of those fake demo UTXOs;
+- the RBF panel can build a replacement by subtracting extra fee from the change output. Demo RBF replacements are recorded locally and are not broadcast to the network.
+
+Demo UTXOs and demo RBF transactions are not wallet-owned coins and should not be treated as spendable mainnet funds.
+
 ## Send flow
 
 The Send page is split into three modes: Scan, Enter, and Paste.

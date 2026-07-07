@@ -24,6 +24,7 @@ export function Header({ page, onNavigate }: { page: AppPage; onNavigate(page: A
         <div className="mt-4 flex flex-wrap gap-2">
           <Badge tone={tone}>{state.status}</Badge>
           {state.manifest?.network ? <Badge tone="green">{state.manifest.network}</Badge> : null}
+          {state.demo.enabled ? <Badge tone="yellow">demo mode</Badge> : null}
           {state.walletKey ? (
             <Badge tone={state.walletKey.mode === 'full-private' ? 'green' : 'indigo'}>
               {state.walletKey.mode === 'full-private' ? 'full private' : 'watch-only'}

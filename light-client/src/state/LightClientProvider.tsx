@@ -45,6 +45,7 @@ import {
   setServerUrl as setServerUrlState,
   setProviderSettings as setProviderSettingsState,
   setSettings as setSettingsState,
+  setDemoMode as setDemoModeState,
   setTip,
   setSpendableUtxos as setSpendableUtxosState,
   setWalletKey as setWalletKeyState,
@@ -91,6 +92,7 @@ interface LightClientActions {
   upsertLabel(label: Pick<WalletLabel, 'id' | 'path'>): void;
   createNextLabel(path: string[]): void;
   setFiatDisplay(currency: FiatCurrency, fiatRatePerBtc: number): void;
+  setDemoMode(enabled: boolean, demoData?: { transactions?: WalletTransaction[]; spendableUtxos?: WalletSpendableUtxo[]; labels?: WalletLabel[]; keyMaterial?: WalletKeyMaterial; source?: string }): void;
   rescanFromHeight(height: number): void;
 }
 
@@ -353,6 +355,9 @@ export function LightClientProvider({ children }: { children: ReactNode }) {
       },
       setFiatDisplay(currency, fiatRatePerBtc) {
         updateState((current) => setFiatDisplayState(current, currency, fiatRatePerBtc));
+      },
+      setDemoMode(enabled, demoData) {
+        updateState((current) => setDemoModeState(current, enabled, demoData));
       },
       rescanFromHeight(height) {
         updateState((current) => rescanFromHeightState(current, height));

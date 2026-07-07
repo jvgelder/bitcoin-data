@@ -29,6 +29,12 @@ export function Dashboard({ onOpenTransaction, onSend, onReceive }: { onOpenTran
         </div>
       </Card>
 
+      {state.demo.enabled ? (
+        <Card className="border-amber-800 bg-amber-950/20">
+          <div className="text-sm text-amber-100">Demo mode is enabled. Transactions and spendable outputs are examples for testing the UI, PSBT flow, and RBF screens.</div>
+        </Card>
+      ) : null}
+
       <Card title="Recent transactions" subtitle="Rows open a detailed transaction view. Real history will come from confirmed wallet scans/imports.">
         {sortedTransactions.length === 0 ? (
           <EmptyState>No wallet transactions yet. Import existing history or sync after scanner integration.</EmptyState>

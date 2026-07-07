@@ -40,6 +40,19 @@ export function TransactionDetail({ transaction, onBack }: { transaction?: Walle
         throw new Error('This transaction does not have the raw transaction/change-output metadata needed to build an RBF replacement. Recreate a replacement PSBT from the original wallet inputs instead.');
       }
       const replacement = createRbfReplacementFromRawTx(transaction.rawTxHex, transaction.rbfChangeOutputIndex, Number(extraFeeSat));
+      if (transaction.demo) {
+        actions.addWalletTransaction({
+          ...transaction,
+          id: replacement.txid,
+          txid: replacement.txid,
+          feeSat: (transaction.feeSat ?? 0) + replacement.feeDeltaSat,
+          rawTxHex: replacement.rawTxHex,
+          dateTime: new Date().toISOString(),
+          note: `Demo RBF replacement for ${shortHash(transaction.txid)}. Fee increased by ${formatSats(replacement.feeDeltaSat)}. No network broadcast was attempted.`,
+        });
+        setRbfMessage({ tone: 'success', text: `Demo replacement created locally: ${replacement.txid}` });
+        return;
+      }
       setRbfMessage({ tone: 'info', text: `Replacement prepared: ${replacement.txid}. Broadcasting…` });
       const result = await broadcastTransactionWithFallback(blockProviders, replacement.rawTxHex);
       actions.addWalletTransaction({
@@ -62,6 +75,7 @@ export function TransactionDetail({ transaction, onBack }: { transaction?: Walle
       <div className="mb-5 flex flex-wrap items-center gap-2">
         <Badge tone={transaction.direction === 'received' ? 'green' : 'yellow'}>{transaction.direction}</Badge>
         {transaction.confirmations != null ? <Badge>{transaction.confirmations} confirmations</Badge> : null}
+        {transaction.demo ? <Badge tone="yellow">demo</Badge> : null}
         {canRbf ? <Badge tone="blue">RBF candidate</Badge> : null}
       </div>
       <dl className="grid gap-4 text-sm sm:grid-cols-2">

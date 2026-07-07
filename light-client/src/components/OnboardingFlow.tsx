@@ -8,6 +8,7 @@ import {
   type WalletKeyMaterial,
 } from '../keys/walletKeys';
 import { useLightClientActions, useLightClientState } from '../state/LightClientProvider';
+import { buildDemoWalletData } from '../demo/demoWallet';
 import type { BlockProviderConfig } from '../api/blockProviderApi';
 import { enabledProviders } from '../state/lightClientState';
 import { Badge, Button, Card, Field, Input, PrimaryButton, Textarea, Toggle } from './ui';
@@ -26,6 +27,8 @@ export function OnboardingFlow({ onComplete, onImport }: OnboardingFlowProps) {
   const [pendingKey, setPendingKey] = useState<WalletKeyMaterial>();
   const [needsCutthroughChoice, setNeedsCutthroughChoice] = useState(false);
   const [needsOfflineDate, setNeedsOfflineDate] = useState(false);
+  const [demoBusy, setDemoBusy] = useState(false);
+  const [demoMessage, setDemoMessage] = useState<string>();
   const blockProviders = useMemo<BlockProviderConfig[]>(() => enabledProviders(state.providers.blockProviders, state.providers.activeBlockProviderId).map((provider) => ({
     name: provider.name,
     url: provider.url,
@@ -61,6 +64,20 @@ export function OnboardingFlow({ onComplete, onImport }: OnboardingFlowProps) {
   function completeHistoryImport() {
     actions.completeWalletSetup({ setupKind: 'history-import', importedHistory: true });
     onComplete();
+  }
+
+  async function enableDemoMode() {
+    setDemoBusy(true);
+    setDemoMessage(undefined);
+    try {
+      const demoData = await buildDemoWalletData(blockProviders);
+      actions.setDemoMode(true, demoData);
+      onComplete();
+    } catch (error) {
+      setDemoMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDemoBusy(false);
+    }
   }
 
   if (needsCutthroughChoice && pendingKey) {
@@ -104,6 +121,14 @@ export function OnboardingFlow({ onComplete, onImport }: OnboardingFlowProps) {
             onClick={() => setChoice('history')}
           />
         </div>
+      </Card>
+
+      <Card title="Demo mode" subtitle="Open the wallet with example transactions and fake spendable UTXOs for testing send, PSBT, transaction detail, and RBF screens.">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <p className="text-sm text-slate-400">No real keys are needed. Demo data can fetch a few public transactions from your Esplora provider and falls back to local examples.</p>
+          <PrimaryButton disabled={demoBusy} onClick={() => void enableDemoMode()}>Enable demo mode</PrimaryButton>
+        </div>
+        {demoMessage ? <p className="mt-3 text-sm text-rose-200">{demoMessage}</p> : null}
       </Card>
 
       {choice === 'generate' ? <GenerateCard onGenerated={completeGenerated} /> : null}
