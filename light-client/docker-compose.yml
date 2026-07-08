@@ -1,0 +1,39 @@
+# compose.yaml
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dev
+    volumes:
+      # Bind-mount source so edits reflect instantly.
+      # For SELinux hosts, use :Z. On non-SELinux hosts this is harmless in Podman.
+      - .:/app:Z
+      # Keep node_modules inside the container so the host OS never interferes
+      # with pnpm symlinks or platform-specific optional packages.
+      - light_client_node_modules:/app/node_modules
+    ports:
+      # Change LIGHT_CLIENT_HOST_PORT when 5173 is already used on the host.
+      # The container can keep using 5173 unless you specifically need to change it.
+      - "${LIGHT_CLIENT_BIND_ADDRESS:-127.0.0.1}:${LIGHT_CLIENT_HOST_PORT:-5173}:${LIGHT_CLIENT_CONTAINER_PORT:-5173}"
+    environment:
+      # Tell Vite to accept connections from outside the container.
+      - VITE_HOST=0.0.0.0
+      - VITE_PORT=${LIGHT_CLIENT_CONTAINER_PORT:-5173}
+      # The browser talks to /api; Vite proxies that to the light-server.
+      # When light-server runs on the host, Podman containers can usually reach it here.
+      - LIGHT_SERVER_PROXY=${LIGHT_SERVER_PROXY:-http://host.containers.internal:3000}
+      # More reliable file watching on bind mounts.
+      - CHOKIDAR_USEPOLLING=true
+      - WATCHPACK_POLLING=true
+    stdin_open: true
+    tty: true
+    command: >
+      sh -lc "pnpm config set store-dir /app/node_modules/.pnpm-store &&
+      if [ ! -d node_modules/react ]; then
+        if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile; else pnpm install; fi;
+      fi &&
+      pnpm exec vite --host \"$${VITE_HOST:-0.0.0.0}\" --port \"$${VITE_PORT:-5173}\" --strictPort"
+
+volumes:
+  light_client_node_modules:
