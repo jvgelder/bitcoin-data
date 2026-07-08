@@ -7,7 +7,7 @@ use crate::helper::{read_32, read_u32_be, read_u64_be};
 use crate::index::STORAGE_OUTPUT_FLAG_REUSED;
 use crate::p2tr_indexer::{OutPointKey, SpendLookup};
 use crate::types::BlockHashBytes;
-use rocksdb::{Options, WriteBatch, DB};
+use rocksdb::{Direction, IteratorMode, Options, WriteBatch, DB};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -93,6 +93,29 @@ impl RocksIndexStore {
         Ok(found)
     }
 
+    pub fn load_seen_p2tr_keys(&self) -> anyhow::Result<Vec<[u8; 32]>> {
+        let mut seen = Vec::new();
+        for item in self
+            .db
+            .iterator(IteratorMode::From(b"k:", Direction::Forward))
+        {
+            let (key, _value) = item?;
+            if !key.starts_with(b"k:") {
+                break;
+            }
+            anyhow::ensure!(
+                key.len() == 34,
+                "invalid seen P2TR key length {} in index DB",
+                key.len()
+            );
+
+            let mut xonly = [0u8; 32];
+            xonly.copy_from_slice(&key[2..]);
+            seen.push(xonly);
+        }
+        Ok(seen)
+    }
+
     pub fn commit_applied_blocks<'a, I>(
         &self,
         blocks: I,
@@ -120,8 +143,10 @@ impl RocksIndexStore {
                         },
                     }),
                 );
+            }
 
-                let key = seen_key(created.entry.p2tr_xonly_key);
+            for p2tr_key in &block.seen_p2tr_keys {
+                let key = seen_key(*p2tr_key);
                 let next_count = self
                     .db
                     .get(key)?
@@ -129,10 +154,7 @@ impl RocksIndexStore {
                     .transpose()?
                     .unwrap_or(0)
                     .saturating_add(1);
-                batch.put(
-                    seen_key(created.entry.p2tr_xonly_key),
-                    next_count.to_be_bytes(),
-                );
+                batch.put(seen_key(*p2tr_key), next_count.to_be_bytes());
             }
 
             for spent in &block.spent_utxos {

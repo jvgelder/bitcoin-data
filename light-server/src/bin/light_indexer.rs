@@ -6,8 +6,8 @@ use btc_data_core::source::{BlockSource, TipWatcher};
 use btc_data_light_server::index::{encode_stored_light_block, to_packed_bytes};
 use btc_data_light_server::index_store::RocksIndexStore;
 use btc_data_light_server::p2tr_indexer::{
-    BlockScanInput, BlockScopeStats, OutPointKey, P2trIndexerState, TxInputScan, TxOutputScan,
-    TxScanInput,
+    BlockScanInput, BlockScopeStats, OutPointKey, P2trIndexerState, ScopedUtxoEntry, TxInputScan,
+    TxOutputScan, TxScanInput,
 };
 use btc_data_light_server::profile::ArchiveNetwork;
 use btc_data_light_server::script_classify::{classify_script, extract_p2tr_xonly, ScriptKind};
@@ -330,15 +330,27 @@ async fn run_command(
     let initial_next_height = committed_tip
         .map(|height| height + 1)
         .unwrap_or(emit_start_height);
-    let mut state = P2trIndexerState::restore_at_uid(tip.map(|tip| tip.last_uid).unwrap_or(0));
+    let mut restored_seen_p2tr_key_count = 0usize;
+    let mut state = if let Some(tip) = tip {
+        let seen_p2tr_keys = index_store.load_seen_p2tr_keys()?;
+        restored_seen_p2tr_key_count = seen_p2tr_keys.len();
+        P2trIndexerState::restore(
+            tip.last_uid,
+            std::iter::empty::<ScopedUtxoEntry>(),
+            seen_p2tr_keys,
+        )
+    } else {
+        P2trIndexerState::new()
+    };
     println!(
-        "restored indexer state tip={} next_height={} emit_start_height={} last_uid={} fetch_blocks={} flush_blocks={} memory_budget_mb={} archive_dir={} index_db_dir={}",
+        "restored indexer state tip={} next_height={} emit_start_height={} last_uid={} seen_p2tr_keys={} fetch_blocks={} flush_blocks={} memory_budget_mb={} archive_dir={} index_db_dir={}",
         committed_tip
             .map(|h| h.to_string())
             .unwrap_or_else(|| "none".to_string()),
         initial_next_height,
         emit_start_height,
         state.last_uid(),
+        restored_seen_p2tr_key_count,
         catchup_batch_size,
         flush_blocks,
         memory_budget_bytes / 1024 / 1024,
